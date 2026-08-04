@@ -10,6 +10,9 @@ import {
   Agent,
   BundleRef,
   ConnectionRequirement,
+  NetworkGrantMode,
+  NetworkRequest,
+  PolicyContent,
   PolicySummary,
   Revision,
   workspaceLabel,
@@ -26,6 +29,8 @@ import {
   specToDraft,
   draftToInput,
 } from "../../components/WorkspacePicker";
+import { TargetRuleEditor } from "../../components/TargetRuleEditor";
+import { MODE_LABEL, MODE_ORDER, networkOf } from "../../lib/network";
 
 export default function AgentsPage() {
   return (
@@ -270,6 +275,9 @@ function AddRevision({
   const [requirements, setRequirements] = useState<ConnectionRequirement[]>(
     current?.connection_requirements ?? []
   );
+  const [network, setNetwork] = useState<NetworkRequest>(
+    current?.network ?? { mode: "offline", targets: [], duration_secs: null }
+  );
   // Spec A: the revision is where an EXISTING agent changes policy. Options
   // come from the policy summaries; the initial value is the current
   // revision's attachment, resolved id → name once the list loads.
@@ -287,6 +295,27 @@ function AddRevision({
     };
   }, []);
   const effectivePolicyName = policyName ?? currentPolicyName;
+  // The governing ceiling shown beside the declaration. /policies summaries
+  // carry no content, so the selected policy's detail is fetched for its
+  // network.max_mode; a failed read renders "unknown", never a false floor.
+  const [ceiling, setCeiling] = useState<NetworkGrantMode | null>(null);
+  useEffect(() => {
+    const name = policyName ?? currentPolicyName;
+    if (!name) {
+      setCeiling(null);
+      return;
+    }
+    let live = true;
+    apiGetCached<{ content: PolicyContent }>(`/policies/${encodeURIComponent(name)}`, {
+      maxAgeMs: 30_000,
+    })
+      .then((d) => live && setCeiling(networkOf(d.content).max_mode))
+      // A failed read must not assert a ceiling we did not read.
+      .catch(() => live && setCeiling(null));
+    return () => {
+      live = false;
+    };
+  }, [policyName, currentPolicyName]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const dirty =
@@ -296,7 +325,9 @@ function AddRevision({
     (policyName !== null && policyName !== currentPolicyName) ||
     JSON.stringify(workspace) !== JSON.stringify(specToDraft(current?.default_workspace)) ||
     JSON.stringify(pins) !== JSON.stringify(current?.capability_bundles ?? []) ||
-    JSON.stringify(requirements) !== JSON.stringify(current?.connection_requirements ?? []);
+    JSON.stringify(requirements) !== JSON.stringify(current?.connection_requirements ?? []) ||
+    JSON.stringify(network) !==
+      JSON.stringify(current?.network ?? { mode: "offline", targets: [], duration_secs: null });
 
   const submit = async () => {
     setErr("");
@@ -309,6 +340,8 @@ function AddRevision({
       // shown in the picker are attached (§17 #7 — nothing floats, and an
       // existing pin never upgrades unless its version was changed here).
       // Requirements are WYSIWYG as well (sent explicitly, incl. [] to clear).
+      // The network declaration is WYSIWYG too (sent unconditionally); a run
+      // narrows it to the policy ceiling server-side — the browser never judges.
       await apiPost(`/agents/${agentId}/revisions`, {
         harness,
         model,
@@ -319,6 +352,7 @@ function AddRevision({
         default_workspace: draftToInput(workspace),
         capability_bundles: pins.map((p) => `${p.name}@${p.version}`),
         connection_requirements: requirements,
+        network,
       });
       onAdded();
     } catch (e) {
@@ -396,6 +430,41 @@ function AddRevision({
       <WorkspacePicker draft={workspace} onChange={setWorkspace} />
       <BundlePicker pins={pins} onChange={setPins} />
       <RequirementsEditor value={requirements} onChange={setRequirements} />
+      <div className="sectitle">Network access</div>
+      <p className="helper">
+        Governing policy ceiling:{" "}
+        <strong>{ceiling ? MODE_LABEL[ceiling] : "unknown"}</strong>
+        {ceiling ? null : " — could not read the policy; a run will still enforce it."}
+      </p>
+      <label className="field">
+        <span className="lab">Mode</span>
+        <select
+          className="inp"
+          value={network.mode}
+          onChange={(e) => {
+            const mode = e.target.value as NetworkGrantMode;
+            setNetwork({ ...network, mode, targets: mode === "public" ? [] : network.targets });
+          }}
+        >
+          {MODE_ORDER.map((m) => (
+            <option key={m} value={m}>
+              {MODE_LABEL[m]}
+            </option>
+          ))}
+        </select>
+      </label>
+      {network.mode === "approved" && (
+        <TargetRuleEditor
+          value={network.targets}
+          onChange={(targets) => setNetwork({ ...network, targets })}
+        />
+      )}
+      {network.mode === "public" && (
+        <p className="helper">
+          A public declaration carries no targets — core refuses that pairing, because listing
+          targets beside &ldquo;everything&rdquo; reads as a narrowing the datapath would not apply.
+        </p>
+      )}
       {err && <div className="err">{err}</div>}
       <div className="spread" style={{ marginTop: 14 }}>
         <span className="helper">Inherits image · budgets.</span>
