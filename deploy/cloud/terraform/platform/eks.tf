@@ -100,6 +100,9 @@ resource "aws_eks_cluster" "this" {
 # enforcement is OBSERVED, so the async window is contained by the product.
 
 resource "aws_eks_addon" "vpc_cni" {
+  # Absent under var.cni = "cilium" (see cilium.tf): Cilium is then the
+  # primary CNI and the network-policy story moves to the Cilium engine.
+  count        = var.cni == "vpc-cni" ? 1 : 0
   cluster_name = aws_eks_cluster.this.name
   addon_name   = "vpc-cni"
 
