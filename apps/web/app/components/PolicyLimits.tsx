@@ -252,9 +252,14 @@ export function PolicyLimits({
                 disabled={network !== null && !network.supports_egress_grants}
                 onChange={(e) => {
                   const max_mode = e.target.value as NetworkGrantMode;
-                  // A public request must carry NO targets; clearing here keeps the
-                  // ceiling and the catalog from disagreeing on screen.
-                  setNet(max_mode === "public" ? { max_mode, allow: [] } : { max_mode });
+                  // Change ONLY the ceiling — the catalog stays. Core checks an
+                  // approved-mode agent declaration against `policy.allow` on
+                  // every request, even under a `public` ceiling (network.rs
+                  // target-catalog subset), so clearing it would break existing
+                  // approved agents with not_in_catalog denials at run creation.
+                  // (A public REQUEST carries no targets, but that is a request
+                  // rule, not a policy rule.)
+                  setNet({ max_mode });
                 }}
               >
                 {MODE_ORDER.map((m) => (
