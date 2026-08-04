@@ -4,6 +4,24 @@ All notable, user-visible changes to fluidbox are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
+## [0.5.1](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.5.0...v0.5.1) (2026-08-04)
+
+
+### Fixed
+
+* **chart:** the controlled resolver could not exec — grant it NET_BIND_SERVICE ([d5ccd59](https://github.com/hrishikeshdkakkad/fluidbox/commit/d5ccd591ed890952dab59bc5568788b48c092758))
+* **chart:** the controlled resolver could not exec — grant it NET_BIND_SERVICE ([dd1382d](https://github.com/hrishikeshdkakkad/fluidbox/commit/dd1382d050b26cab023e2a1e366a6ef3a18708b8))
+* **network:** a CAS answers "did I win", never "is there work left" ([75d7e61](https://github.com/hrishikeshdkakkad/fluidbox/commit/75d7e612b438f7636d73985afb4e66b935e4eab8))
+* **network:** a CAS loser must distinguish "someone else won" from "resolved away" ([256a723](https://github.com/hrishikeshdkakkad/fluidbox/commit/256a723f7592e3703b844425650b0ace72a18d19))
+* **network:** a DNS deny Cilium cannot express, plus the third review's blockers ([786b86d](https://github.com/hrishikeshdkakkad/fluidbox/commit/786b86dd874279bbcf6b735be76d0ed9a48b6b7e))
+* **network:** close the review's blocking findings ([991deb5](https://github.com/hrishikeshdkakkad/fluidbox/commit/991deb55d9350f25b24d64b8e456980f79f02838))
+* **network:** close the second review's blockers, including a race my own fix added ([494ac12](https://github.com/hrishikeshdkakkad/fluidbox/commit/494ac12e6fd86a8aa30a70a954742c1e32cda622))
+* **network:** disambiguate legacy deny snapshots, and reconcile live grants ([343b60b](https://github.com/hrishikeshdkakkad/fluidbox/commit/343b60bdf355797e0f974b82850dd23fdeb4cf47))
+* **network:** fail closed at the renderer, and align adoption with ownership ([8c226ef](https://github.com/hrishikeshdkakkad/fluidbox/commit/8c226efa653d58bff61cb54e6db77776f4d43b95))
+* **network:** reconcile from the datapath, and bound the schema in both directions ([ea3fec9](https://github.com/hrishikeshdkakkad/fluidbox/commit/ea3fec90e21a41b4de7f3b0f3b67bf3c017f9cc3))
+* **network:** scope DNS lookups to the grant, align the deny wall, correct the order ([a8ae238](https://github.com/hrishikeshdkakkad/fluidbox/commit/a8ae23834a07f297e03f96c88d75e1ac9e68e9d6))
+* **network:** ten security fixes for governed network access (nine review rounds) ([4ee659d](https://github.com/hrishikeshdkakkad/fluidbox/commit/4ee659db032e4ef1b26799574cf113a78ed8af75))
+
 ## [0.5.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.4.0...v0.5.0) (2026-08-04)
 
 
