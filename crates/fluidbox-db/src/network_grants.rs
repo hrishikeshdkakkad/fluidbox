@@ -68,6 +68,26 @@ impl NetworkGrantRow {
     }
 }
 
+/// What a caller that LOST the deny CAS should do, given the grant's committed
+/// state.
+///
+/// Production logic rather than a helper duplicated in a test, because a
+/// duplicate can stay green while the real path regresses — and BOTH directions
+/// of this have been wrong here: returning early on every loss STRANDED a parked
+/// run whose grant had been revoked underneath it, and winding down on every
+/// loss FAILED a run another replica had just legitimately activated.
+///
+/// The CAS establishes who owns the refusal; this classifies what the loser is
+/// looking at.
+pub fn wind_down_on_cas_loss(observed_status: Option<&str>) -> bool {
+    match observed_status {
+        // Another replica activated it; the run is proceeding. Leave it alone.
+        Some("active") => false,
+        // Resolved away, or gone entirely — nothing will ever release this run.
+        _ => true,
+    }
+}
+
 /// The insert payload. Minted by `create_run` so the RunSpec and the row agree
 /// on the digest before either is written.
 #[derive(Debug, Clone)]

@@ -466,14 +466,17 @@ pub async fn refuse_parked_grant(
     reason: &str,
 ) {
     // The CAS moves `pending → denied` and therefore matches NOTHING when the
-    // row is already `revoked` or `denied`. Returning early on that used to skip
-    // the session wind-down entirely — so a run whose grant was taken away
-    // underneath it (the stale-schema sweep, or a crash after the deny but
-    // before finalization) stayed `awaiting_authorization` forever while every
-    // replica retried it every two seconds. The grant CAS and the SESSION's fate
-    // are separate concerns: the CAS decides who ledgers the refusal, but the
-    // wind-down below must happen either way. `finalize_forced` is idempotent,
-    // so a loser repeating it is harmless.
+    // row has already moved on. Losing it does NOT tell you what to do — the
+    // committed state does, and the two failure modes are opposites:
+    //
+    //   * returning early on every loss STRANDED a parked run whose grant had
+    //     been revoked underneath it (nothing ever wound it down);
+    //   * winding down on every loss FAILED a run another replica had just
+    //     legitimately activated.
+    //
+    // So the CAS decides who LEDGERS the refusal, and a re-read decides the
+    // session's fate. `finalize_forced` is idempotent, so repeating it where it
+    // IS warranted is harmless.
     let denied = match fluidbox_db::network_grants::deny_network_grant(
         &state.pool,
         scope,
@@ -502,17 +505,25 @@ pub async fn refuse_parked_grant(
             match fluidbox_db::network_grants::get_network_grant(&state.pool, scope, session_id)
                 .await
             {
-                Ok(Some(g)) if g.status == "active" => {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        "another replica activated this grant; leaving the run alone"
-                    );
-                    return;
+                Ok(observed) => {
+                    let status = observed.as_ref().map(|g| g.status.as_str());
+                    if !fluidbox_db::network_grants::wind_down_on_cas_loss(status) {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            "another replica activated this grant; leaving the run alone"
+                        );
+                        return;
+                    }
+                    None
                 }
-                // Resolved away (or gone entirely — no authority either way):
-                // fall through and wind the session down.
-                Ok(_) => None,
                 Err(e) => {
+                    // Visible rather than only logged: a persistent failure here
+                    // is safe (nothing destructive is guessed) but it does stall
+                    // resolution, and an operator should be able to see it.
+                    state
+                        .metrics
+                        .network_grant_refusals
+                        .inc("cas_reread_failed");
                     tracing::warn!("re-reading the grant for {session_id} failed: {e}");
                     return;
                 }
