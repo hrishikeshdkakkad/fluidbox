@@ -337,6 +337,18 @@ pub trait ExecutionProvider: Send + Sync {
     fn workspace_transport(&self) -> WorkspaceTransport {
         WorkspaceTransport::HostDir
     }
+    /// This provider's network-grant enforcer.
+    ///
+    /// The DEFAULT refuses anything above `offline`, which is what makes the
+    /// run gate fail closed for free: a provider that has not opted in cannot
+    /// accidentally admit a grant it has no way to enforce. Asking the PROVIDER
+    /// rather than the config is deliberate — a deployment configured
+    /// `FLUIDBOX_NETWORK_ENFORCER=auto` on a cluster without Cilium, or
+    /// `=cilium` against the Docker provider, would otherwise admit the grant
+    /// at creation and only discover the truth at provision time.
+    fn network_enforcer(&self) -> &dyn NetworkPolicyProvider {
+        &NoNetworkEnforcer
+    }
     fn runtime_name(&self) -> &'static str;
 }
 
