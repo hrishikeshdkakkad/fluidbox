@@ -77,6 +77,22 @@ fleet would reap its way through the authorization pause.
    caller to pass a request. A subscription or per-run override may only NARROW
    the declaration.
 
+### Upgrading across the deny-snapshot schema (grant schema v1 → v2)
+
+A grant frozen before policy denies were recorded carries an EMPTY deny list
+that means *unknown*, not *none* — nothing in the grant can tell those apart.
+So on upgrade:
+
+- A **`public`** grant at schema v1 is **refused** at provisioning, and any that
+  is already ACTIVE has its enforcement revoked by the sweeper within ~15 s.
+  Those runs lose network; recreate them and resolution freezes a current grant.
+- **`offline`** and **`approved`** grants are unaffected: the former programs
+  nothing, and the latter is a closed allow-list resolution already checked
+  against the live policy.
+
+This is deliberate and fail-closed. The alternative — programming a world-allow
+whose deny set might simply be missing — is the failure this refuses to risk.
+
 ## §3 Reading a refusal
 
 Every refusal is enumerated. `fluidbox_network_grant_refusals_total{reason}`
