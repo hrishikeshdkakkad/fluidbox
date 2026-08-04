@@ -156,7 +156,7 @@ human refusing a grant is the system working.
 | Controlled CoreDNS is down | Resolver outage | Name-based grants stop resolving. `:8788` is unaffected — it is allowed by SERVER POD IDENTITY, not by name — so runs still report. |
 | Egress-gateway node is down | Gateway outage | Egress stops for granted targets. The gateway is SNAT and attribution only, never the boundary; `:8788` is not in that path. |
 | A parked run never releases | Approval unanswered, or the grant lapsed | The approval TTL reaps it; the run fails with the enumerated reason. |
-| A CNP exists for a session with no pod | A leak | Owner-reference GC collects it; the reconcile sweep is the backstop. This matters because Cilium allow rules are ADDITIVE — a surviving policy that later matched a re-created pod would silently reopen traffic. |
+| A CNP exists for a session with no pod | A leak | Owner-reference GC collects it, and a 60 s reconcile lists what is programmed and deletes anything no live grant authorizes. This matters because Cilium allow rules are ADDITIVE — a surviving policy that later matched a re-created pod would silently reopen traffic. **The reconcile can only judge a policy it can attribute to a run:** one whose `fluidbox.dev/session` label is missing or malformed is logged (`no usable session label`) and left alone, because deleting an object of unknown ownership is worse than leaving it. Those need a human. |
 
 ## §7 Residuals — stated, not implied
 

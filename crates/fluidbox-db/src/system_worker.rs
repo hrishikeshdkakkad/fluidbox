@@ -497,8 +497,17 @@ pub async fn runs_without_live_grants(pool: &PgPool, run_ids: &[Uuid]) -> sqlx::
     let mut tx = crate::worker_tx(pool).await?;
     let live: Vec<(Uuid,)> = sqlx::query_as(
         "select g.session_id from session_network_grants g
+           join sessions s on s.id = g.session_id
           where g.session_id = any($1)
             and g.status = 'active'
+            -- An OFFLINE grant programs no policy, so a policy attached to one
+            -- is anomalous by definition and must be collected rather than
+            -- treated as authorized.
+            and g.mode <> 'offline'
+            -- A TERMINAL session authorizes nothing, whatever its row says.
+            -- Terminal cleanup ignores a failed revoke, so without this a
+            -- policy could survive a finished run until the grant expired.
+            and s.status not in ('completed','failed','cancelled','budget_exceeded')
             and (g.expires_at is null or g.expires_at > now())",
     )
     .bind(run_ids)

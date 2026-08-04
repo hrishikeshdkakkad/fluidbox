@@ -465,6 +465,15 @@ pub async fn refuse_parked_grant(
     session_id: Uuid,
     reason: &str,
 ) {
+    // The CAS moves `pending → denied` and therefore matches NOTHING when the
+    // row is already `revoked` or `denied`. Returning early on that used to skip
+    // the session wind-down entirely — so a run whose grant was taken away
+    // underneath it (the stale-schema sweep, or a crash after the deny but
+    // before finalization) stayed `awaiting_authorization` forever while every
+    // replica retried it every two seconds. The grant CAS and the SESSION's fate
+    // are separate concerns: the CAS decides who ledgers the refusal, but the
+    // wind-down below must happen either way. `finalize_forced` is idempotent,
+    // so a loser repeating it is harmless.
     let denied = match fluidbox_db::network_grants::deny_network_grant(
         &state.pool,
         scope,
@@ -473,31 +482,39 @@ pub async fn refuse_parked_grant(
     )
     .await
     {
-        // Lost the CAS — another replica already refused (or released) it.
-        Ok(None) => return,
         Ok(Some(row)) => {
             state.metrics.network_grants.inc("denied");
-            row
+            Some(row)
         }
+        // Already resolved by another replica, or already revoked. Nothing to
+        // ledger — but still wind the session down.
+        Ok(None) => None,
         Err(e) => {
+            // A failed READ is different: we do not know the grant's state, so
+            // leave the session alone and let the next tick retry rather than
+            // finalizing a run that might still be releasable.
             tracing::warn!("denying network grant for {session_id} failed: {e}");
             return;
         }
     };
-    crate::ledger::record(
-        state,
-        scope,
-        session_id,
-        fluidbox_core::event::Actor::System,
-        fluidbox_core::event::EventBody::NetworkGrantRevoked {
-            // The mode that was REFUSED — the reason says it was a refusal.
-            // Reporting "denied" here would lose the one fact the event exists
-            // to record: how much authority was on the table.
-            mode: denied.mode,
-            reason: reason.to_string(),
-        },
-    )
-    .await;
+    // Ledger only on the CAS win, so several replicas cannot each append a
+    // refusal for the same grant.
+    if let Some(row) = denied {
+        crate::ledger::record(
+            state,
+            scope,
+            session_id,
+            fluidbox_core::event::Actor::System,
+            fluidbox_core::event::EventBody::NetworkGrantRevoked {
+                // The mode that was REFUSED — the reason says it was a refusal.
+                // Reporting "denied" here would lose the one fact the event
+                // exists to record: how much authority was on the table.
+                mode: row.mode,
+                reason: reason.to_string(),
+            },
+        )
+        .await;
+    }
     // A parked run has no sandbox and no runner, so there is nothing to
     // quiesce or collect — but it still winds down through the ordinary
     // terminal path, so the audit trail and result delivery behave like every
