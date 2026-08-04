@@ -39,6 +39,19 @@ pub struct K8sConfig {
     /// same image the boot-time certification probe uses —
     /// `FLUIDBOX_NETPOL_PROBE_IMAGE`, one knob for both).
     pub netpol_probe_image: String,
+    /// Namespace of the CONTROLLED resolver (the chart's release namespace),
+    /// which is not the sandbox namespace.
+    pub dns_namespace: String,
+    /// ClusterIP of the controlled resolver. When set, sandbox pods get
+    /// `dnsPolicy: None` pointed at it, so a granted run resolves through the
+    /// forward-only CoreDNS that has no `kubernetes` plugin — and therefore
+    /// cannot resolve in-cluster Service names. Empty = leave the cluster
+    /// default, which is only correct when network grants are disabled.
+    pub sandbox_dns_ip: String,
+    /// `app.kubernetes.io/name` of the controlled resolver.
+    pub dns_app_name: String,
+    /// `app.kubernetes.io/instance` (the Helm release name) of the resolver.
+    pub dns_instance: String,
     /// Mirror of the server's `FLUIDBOX_REQUIRE_ENFORCED_NETPOL` (same env
     /// var, same falsey parse, read in-process from the same environment).
     /// Defense in depth: when enforcement is required, `provision` REFUSES a
@@ -77,8 +90,20 @@ impl K8sConfig {
     /// silently hand every granted run in-cluster service discovery.
     pub fn sandbox_resolver_labels(&self) -> serde_json::Value {
         serde_json::json!({
-            "k8s:io.kubernetes.pod.namespace": self.namespace,
+            // The RELEASE namespace, not the sandbox namespace. These are
+            // different by default (`fluidbox` vs `fluidbox-sandboxes`), and
+            // getting it wrong is silent: the per-run policy's DNS rule then
+            // selects nothing, so every FQDN grant fails to resolve while the
+            // policy still verifies as Valid.
+            "k8s:io.kubernetes.pod.namespace": self.dns_namespace,
             "app.kubernetes.io/component": "sandbox-dns",
+            // Name AND instance too: the component label alone would admit any
+            // pod carrying it — a second Helm release in the same namespace, or
+            // anything else that happens to use the name — as a legitimate
+            // resolver for this deployment's sandboxes. The chart already sets
+            // both labels; not selecting on them was the gap.
+            "app.kubernetes.io/name": self.dns_app_name,
+            "app.kubernetes.io/instance": self.dns_instance,
         })
     }
 
@@ -113,6 +138,17 @@ impl K8sConfig {
             tolerations: parse_tolerations(get("FLUIDBOX_K8S_TOLERATIONS")),
             priority_class_name: get("FLUIDBOX_K8S_PRIORITY_CLASS"),
             image_pull_secrets: parse_list(get("FLUIDBOX_K8S_IMAGE_PULL_SECRETS")),
+            // Falls back to the release namespace, then to the sandbox
+            // namespace — the last is only right for a single-namespace
+            // install, and the chart always sets the explicit value.
+            // The chart always sets this; the fallback is the sandbox
+            // namespace, which is only correct for a single-namespace install.
+            dns_namespace: get("FLUIDBOX_SANDBOX_DNS_NAMESPACE").unwrap_or_else(|| {
+                get("FLUIDBOX_K8S_NAMESPACE").unwrap_or_else(|| "fluidbox-sandboxes".into())
+            }),
+            sandbox_dns_ip: get("FLUIDBOX_SANDBOX_DNS_IP").unwrap_or_default(),
+            dns_app_name: get("FLUIDBOX_SANDBOX_DNS_APP_NAME").unwrap_or_else(|| "fluidbox".into()),
+            dns_instance: get("FLUIDBOX_SANDBOX_DNS_INSTANCE").unwrap_or_else(|| "fluidbox".into()),
             netpol_probe_image: get("FLUIDBOX_NETPOL_PROBE_IMAGE")
                 .unwrap_or_else(|| "busybox:1.36".into()),
             require_enforced_netpol: parse_enforced_flag(get("FLUIDBOX_REQUIRE_ENFORCED_NETPOL")),

@@ -31,7 +31,7 @@
 //! is the belt, that is the braces, and the docs say so rather than implying
 //! this check is stronger than it is.
 
-use crate::netgrant;
+use crate::netgrant::{self, LABEL_SESSION};
 use fluidbox_core::traits::{GrantedNetwork, NetworkPolicyError, NetworkPolicyProvider};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject};
@@ -177,6 +177,28 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
     /// keeps [`NetworkPolicyProvider`] free of Kubernetes concepts, and the pod
     /// provably exists by now because the caller creates it first.
     async fn prepare(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
+        // EXPIRY FENCE. The orchestrator checks the grant once, before workspace
+        // materialization and archive packing — both of which can take minutes.
+        // Without this check the following sequence resurrects dead authority
+        // PERMANENTLY:
+        //
+        //   1. the grant expires while provisioning is still in flight
+        //   2. the expiry sweeper deletes the not-yet-created policy (404 = ok)
+        //   3. it marks the row `revoked`
+        //   4. provisioning continues and creates the policy from the frozen spec
+        //   5. the sweeper never looks at that row again — it is already revoked
+        //
+        // …leaving an allow policy created AFTER expiry and living until
+        // terminal cleanup. The frozen grant carries its own absolute expiry, so
+        // this needs no database read and cannot race the sweeper: a policy is
+        // simply never created for authority that has already lapsed.
+        if granted.grant.is_expired(chrono::Utc::now()) {
+            return Err(NetworkPolicyError::Unverified(format!(
+                "the network grant for run {} expired before enforcement could be \
+                 programmed — refusing to create a policy for lapsed authority",
+                granted.run_id
+            )));
+        }
         if !granted.grant.grants_egress() {
             // Offline is the ABSENCE of an allow, delivered by the chart-static
             // baseline's default-deny. Writing an empty policy would be noise,
@@ -201,7 +223,11 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
             owner_pod_uid: uid,
             owner_pod_name: name.clone(),
         };
-        let Some(policy) = netgrant::build_run_policy(granted, granted.run_id, &ctx) else {
+        // An unrenderable grant is a REFUSAL, not a policy with the unrenderable
+        // part quietly dropped.
+        let Some(policy) = netgrant::build_run_policy(granted, granted.run_id, &ctx)
+            .map_err(NetworkPolicyError::Lowering)?
+        else {
             return Ok(());
         };
         let obj: DynamicObject = serde_json::from_value(policy)
@@ -209,9 +235,52 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
 
         match self.cnps.create(&Default::default(), &obj).await {
             Ok(_) => Ok(()),
-            // Already there: `prepare` is idempotent so a retried provision does
-            // not fail on its own previous success.
-            Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+            // Already there. `prepare` must stay idempotent — a retried
+            // provision cannot fail on its own previous success — but it must
+            // NOT blindly adopt whatever object holds the name: a stale or
+            // foreign policy under the deterministic session name would be
+            // accepted, and `verify` only checks that the NAMED policy is
+            // Valid, so a broader one would sail through.
+            //
+            // The comparison is the RENDERED SPEC, not the grant digest. The
+            // digest commits to the AUTHORIZATION INTENT, not to the object
+            // that enforces it — so a policy rendered from the same grant by an
+            // OLDER build carries an identical digest while permitting more.
+            // Not hypothetical: when DNS lowering was tightened from
+            // `matchPattern: "*"` to the granted names, both renderings shared
+            // a digest, and a digest-only check would have adopted the
+            // permissive one. Byte-comparing the spec is what actually means
+            // "this is the object we would have written".
+            Err(kube::Error::Api(e)) if e.code == 409 => {
+                let existing = self.cnps.get(&name).await.map_err(|e| {
+                    NetworkPolicyError::Write(format!("re-reading the existing policy failed: {e}"))
+                })?;
+                // Adoption requires BOTH the right spec and OUR ownership
+                // label, because `revoke` refuses to delete an object that is
+                // not labelled ours. Adopting on spec alone while deleting only
+                // on label meant an unlabelled-but-matching object was adopted,
+                // the run started under it, and cleanup then declined to remove
+                // it — after which the row was marked revoked, the sweeper
+                // stopped looking, and the policy leaked with the endpoint
+                // still reachable. The two criteria have to be the same one.
+                let labelled_ours = existing
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get(LABEL_SESSION))
+                    .map(|v| v == &granted.run_id.to_string())
+                    .unwrap_or(false);
+                if labelled_ours && existing.data.get("spec") == obj.data.get("spec") {
+                    Ok(())
+                } else {
+                    Err(NetworkPolicyError::Write(format!(
+                        "a different network policy already exists under the name for run {} — \
+                         its spec is not the one this run would write, so it is refused rather \
+                         than adopted",
+                        granted.run_id
+                    )))
+                }
+            }
             Err(e) => Err(NetworkPolicyError::Write(format!(
                 "creating the network policy for run {} failed: {e}",
                 granted.run_id
@@ -223,6 +292,16 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
     /// has an identity for it to bind to. See the module docs for exactly what
     /// this does and does not establish.
     async fn verify(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
+        // The second expiry fence. `verify` runs after `prepare` and before the
+        // Secret that releases the pod, so a grant that lapses in between is
+        // caught here and the run never starts. (The provision path deletes the
+        // pod on a verify failure, and the policy is owned by that pod.)
+        if granted.grant.is_expired(chrono::Utc::now()) {
+            return Err(NetworkPolicyError::Unverified(format!(
+                "the network grant for run {} expired during provisioning",
+                granted.run_id
+            )));
+        }
         let name = Self::object_name(granted);
         let deadline = Instant::now() + Duration::from_secs(self.verify_timeout_secs.max(5));
         // Carried out of the loop so a timeout can say WHICH half never
@@ -311,17 +390,100 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
 
     async fn revoke(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
         let name = Self::object_name(granted);
-        match self.cnps.delete(&name, &DeleteParams::default()).await {
+        // Delete only what belongs to THIS run — two independent checks,
+        // because they answer different questions.
+        //
+        // OWNERSHIP: the object must carry our run's session label. A uid
+        // precondition alone authenticates the object we just read, not that it
+        // is ours; so if `prepare` refused a foreign object under the
+        // deterministic name, terminal cleanup would then delete that very
+        // object — turning a refusal into somebody else's outage.
+        //
+        // ATOMICITY: the uid precondition then makes the API server enforce
+        // that we delete the object we inspected, closing the delete/recreate
+        // window between the read and the delete.
+        let existing = match self.cnps.get_opt(&name).await {
+            Ok(Some(o)) => o,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                return Err(NetworkPolicyError::Write(format!(
+                    "reading the network policy for run {} before delete failed: {e}",
+                    granted.run_id
+                )))
+            }
+        };
+        let ours = existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(LABEL_SESSION))
+            .map(|v| v == &granted.run_id.to_string())
+            .unwrap_or(false);
+        if !ours {
+            tracing::warn!(
+                run_id = %granted.run_id,
+                "a network policy exists under this run's name but is not labelled as ours; \
+                 leaving it alone rather than deleting another owner's object"
+            );
+            return Ok(());
+        }
+        let dp = DeleteParams {
+            preconditions: existing.metadata.uid.map(|u| kube::api::Preconditions {
+                uid: Some(u),
+                resource_version: None,
+            }),
+            ..DeleteParams::default()
+        };
+        match self.cnps.delete(&name, &dp).await {
             Ok(_) => Ok(()),
             // Already gone — owner-reference GC may have collected it first.
             // Idempotence matters: this runs from terminal cleanup, the abandon
             // paths, and the reconcile sweep.
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            // The object was REPLACED between our read and the delete. This is
+            // NOT success: a replacement is still standing, and reporting Ok
+            // would let the caller mark the grant revoked — after which the
+            // expiry sweeper never revisits the row and the replacement leaks
+            // as an additive Cilium allow. Erroring makes the caller retry,
+            // which re-reads and re-evaluates ownership.
+            Err(kube::Error::Api(e)) if e.code == 409 => Err(NetworkPolicyError::Write(format!(
+                "the network policy for run {} was replaced while being deleted; retrying",
+                granted.run_id
+            ))),
             Err(e) => Err(NetworkPolicyError::Write(format!(
                 "deleting the network policy for run {} failed: {e}",
                 granted.run_id
             ))),
         }
+    }
+
+    async fn list_programmed(&self) -> Result<Vec<uuid::Uuid>, NetworkPolicyError> {
+        let lp = kube::api::ListParams::default().labels("fluidbox.dev/managed=true");
+        let list = self.cnps.list(&lp).await.map_err(|e| {
+            NetworkPolicyError::Write(format!("listing network policies failed: {e}"))
+        })?;
+        // A managed policy whose session label is missing or malformed cannot be
+        // mapped to a run, so the reconcile cannot judge it. Dropping those
+        // SILENTLY would make "reconciliation backstops every leaked policy"
+        // false, so they are logged loudly for an operator to look at by hand.
+        let mut out = Vec::new();
+        for o in &list.items {
+            match o
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_SESSION))
+                .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            {
+                Some(id) => out.push(id),
+                None => tracing::warn!(
+                    name = o.metadata.name.as_deref().unwrap_or("<unnamed>"),
+                    "a managed network policy has no usable session label; the reconcile \
+                     cannot attribute it to a run and will not touch it"
+                ),
+            }
+        }
+        Ok(out)
     }
 
     fn enforcer_name(&self) -> &'static str {

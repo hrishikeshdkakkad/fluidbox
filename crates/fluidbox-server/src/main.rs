@@ -58,9 +58,24 @@ async fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn Executio
         )?)),
         "kubernetes" | "k8s" => {
             let k8s_cfg = fluidbox_provider_k8s::config::K8sConfig::from_env();
+            // Resolve the network enforcer at BOOT so `auto` is a concrete
+            // answer before the first run is created, and so an explicit
+            // `cilium` on a cluster without it refuses to boot rather than
+            // admitting grants nothing can deliver.
+            use fluidbox_provider_k8s::NetworkEnforcerMode as Mode;
+            let mode = match cfg.network_enforcer {
+                config::NetworkEnforcer::None => Mode::None,
+                config::NetworkEnforcer::Cilium => Mode::Cilium,
+                config::NetworkEnforcer::Auto => Mode::Auto,
+            };
             Ok(Arc::new(
-                fluidbox_provider_k8s::KubernetesProvider::connect(k8s_cfg, cfg.data_dir.clone())
-                    .await?,
+                fluidbox_provider_k8s::KubernetesProvider::connect(
+                    k8s_cfg,
+                    cfg.data_dir.clone(),
+                    mode,
+                    cfg.netpol_wait_secs,
+                )
+                .await?,
             ))
         }
         other => anyhow::bail!(
@@ -321,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state: state::AppState = Arc::new(AppStateInner {
+        netgrant_reverify_failures: Default::default(),
         tenant_id: seed.tenant_id,
         redactor: fluidbox_core::event::Redactor::default(),
         provider,

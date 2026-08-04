@@ -14,6 +14,9 @@ on:
       - "deploy/helm/**"
       - "deploy/workspaced.Dockerfile"
       - ".github/workflows/k8s.yml"
+      - "crates/fluidbox-core/src/network*.rs"
+      - "crates/fluidbox-server/src/netgrant.rs"
+      - "scripts/netgrant-kind-validation.sh"
       # The chart job asserts the appVersion-binding defaults release.yml
       # relies on — run it when the release pipeline changes too.
       - ".github/workflows/release.yml"

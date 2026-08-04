@@ -151,7 +151,11 @@ pub async fn park_for_authorization(
         Some("network"),
         "once",
         GRANT_TOOL,
-        ttl_secs as i64,
+        // Clamped before the cast: `default_ttl_secs` is an unbounded u64 and
+        // `u64::MAX as i64` is -1, which would mint an already-expired approval
+        // instead of a long one — turning "wait for a human" into "refuse
+        // immediately".
+        ttl_secs.min(MAX_APPROVAL_TTL_SECS) as i64,
     )
     .await?;
     fluidbox_db::network_grants::attach_grant_approval(&state.pool, scope, session_id, approval.id)
@@ -244,6 +248,18 @@ pub fn reverify_before_release(
     if grant.is_expired(ctx.now) {
         return Err(ReleaseRefusal::Expired);
     }
+    // …and it must still OUTLIVE the run it is about to govern. Resolution
+    // guaranteed that at freeze time, but an approval pause spends the grant's
+    // absolute lifetime without spending the run's budget — so a grant sized
+    // exactly to the run can be released with minutes left and be swept away
+    // mid-flight. Refusing here is the same fail-closed choice resolution
+    // makes: never issue authority that will lapse under the work.
+    if let (Some(exp), Some(wall)) = (grant.expires_at, ctx.run_wall_clock_secs) {
+        let remaining = (exp - ctx.now).num_seconds();
+        if remaining < wall as i64 {
+            return Err(ReleaseRefusal::Expired);
+        }
+    }
     // Re-resolve against the CURRENT policy. An unchanged policy short-circuits
     // on the digest; a changed one has to produce at least as much authority as
     // was authorized, or the run is refused.
@@ -259,7 +275,34 @@ pub fn reverify_before_release(
                 // authorized. A narrower one is a refusal, not a downgrade:
                 // silently running with less network than the approver saw is
                 // the failure mode nobody can debug.
+                // Time is an authority dimension too. A policy that cut
+                // `max_grant_secs` while the run was parked permits LESS than
+                // was authorized, even when the mode and targets are identical
+                // — activating the original grant would hand it the full
+                // original lifetime under a policy that no longer allows it.
+                let now_shorter = match (now_grant.expires_at, grant.expires_at) {
+                    (Some(now_exp), Some(frozen_exp)) => now_exp < frozen_exp,
+                    // A policy that would no longer bound the grant at all is
+                    // not narrower; a frozen grant without an expiry is
+                    // malformed and `is_expired` already refused it above.
+                    _ => false,
+                };
+                // A deny ADDED while the run was parked permits less than was
+                // authorized, and the frozen grant carries the OLD deny set —
+                // so activating it would run under denies the operator has
+                // since revoked their consent to.
+                // "Grew" means the current policy denies something the frozen one
+                // did NOT — judged by COVERAGE, not exact equality. Equality made
+                // a strictly NARROWER replacement (`203.0.113.0/24` →
+                // `203.0.113.7/32`) read as growth and refuse a release that was
+                // plainly safe; case and port-splitting differences did the same.
+                let denies_grew = now_grant
+                    .denied
+                    .iter()
+                    .any(|d| !grant.denied.iter().any(|frozen| frozen.covers(d)));
                 if now_grant.mode < grant.mode
+                    || now_shorter
+                    || denies_grew
                     || !grant.targets.iter().all(|t| {
                         now_grant
                             .targets
@@ -277,6 +320,16 @@ pub fn reverify_before_release(
     Ok(grant)
 }
 
+/// How many consecutive re-verification failures turn a parked run into a
+/// refusal. Sized so a transient database blip (the gate ticks every 2 s) never
+/// reaches it, while a permanent failure resolves in about a minute instead of
+/// never.
+const REVERIFY_MAX_ATTEMPTS: u32 = 30;
+
+/// Ceiling on an authorization pause, applied before any `as i64` cast. A week
+/// is far beyond any sensible approval window and keeps the arithmetic in range.
+const MAX_APPROVAL_TTL_SECS: u64 = 7 * 24 * 3600;
+
 /// A human authorized the grant: re-verify, activate, and release provisioning.
 ///
 /// Everything here is CAS-guarded, so several replicas waking on the same
@@ -293,13 +346,39 @@ pub async fn release_authorized_grant(state: &AppState, scope: TenantScope, sess
     let refusal = match reverify_context(state, scope, session_id, &row).await {
         Ok(None) => None,
         Ok(Some(r)) => Some(r),
-        // A transient failure loading the world leaves the run parked; the next
-        // tick retries. Never release on a read we could not complete.
+        // A failure loading the world leaves the run parked and the next tick
+        // retries — never release on a read we could not complete. But a
+        // PERMANENT failure (a deleted policy, content that no longer parses)
+        // would retry every two seconds forever, leaving an approved run wedged
+        // with nothing in the audit trail explaining why. After a bounded
+        // number of attempts it becomes a refusal, which is visible, terminal,
+        // and still fail-closed.
         Err(e) => {
-            tracing::warn!("network grant re-verification for {session_id} failed: {e}");
+            let attempts = state.netgrant_reverify_failures.bump(session_id);
+            tracing::warn!(
+                "network grant re-verification for {session_id} failed (attempt {attempts}): {e}"
+            );
+            if attempts >= REVERIFY_MAX_ATTEMPTS {
+                state.netgrant_reverify_failures.clear(session_id);
+                refuse_parked_grant(
+                    state,
+                    scope,
+                    session_id,
+                    &format!(
+                        "the governing policy could not be re-read after {attempts} attempts \
+                         ({e}); refusing rather than leaving the run parked indefinitely"
+                    ),
+                )
+                .await;
+            }
             return;
         }
     };
+    // The re-verification completed, whatever it decided — so the failure streak
+    // is over. Clearing here (not only at the threshold) is what makes the
+    // counter CONSECUTIVE rather than cumulative, and what stops it retaining an
+    // entry for every session that ever had one transient blip.
+    state.netgrant_reverify_failures.clear(session_id);
     if let Some(refusal) = refusal {
         state.metrics.network_grant_refusals.inc(refusal.code());
         refuse_parked_grant(state, scope, session_id, &refusal.message()).await;
@@ -346,18 +425,21 @@ async fn reverify_context(
         serde_json::from_value(session.run_spec.clone()).map_err(|e| e.to_string())?;
     // The CURRENT policy, not the frozen snapshot: the point of the re-check is
     // to notice that the world moved.
-    let current = match fluidbox_db::latest_policy_version(&state.pool, scope, spec.policy_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        Some(v) => {
-            serde_json::from_value::<fluidbox_core::policy::Policy>(v.content).unwrap_or(
-                // A policy that no longer parses cannot authorize anything.
-                spec.policy_snapshot.clone(),
-            )
-        }
-        None => spec.policy_snapshot.clone(),
-    };
+    // The CURRENT policy, not the frozen snapshot: the point of the re-check is
+    // to notice that the world moved. An unreadable or missing one REFUSES —
+    // falling back to the frozen policy would release under exactly the stale
+    // authority this check exists to catch, and during a rolling deploy an
+    // older replica that cannot parse a newer policy schema would do so
+    // routinely.
+    let current: fluidbox_core::policy::Policy =
+        match fluidbox_db::latest_policy_version(&state.pool, scope, spec.policy_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Some(v) => serde_json::from_value(v.content)
+                .map_err(|e| format!("the current policy could not be read: {e}"))?,
+            None => return Err("the governing policy has no versions".into()),
+        };
     // The request that produced this grant, reconstructed from the frozen
     // authority itself: re-resolution must be asked the same question the
     // approver answered.
@@ -383,6 +465,18 @@ pub async fn refuse_parked_grant(
     session_id: Uuid,
     reason: &str,
 ) {
+    // The CAS moves `pending → denied` and therefore matches NOTHING when the
+    // row has already moved on. Losing it does NOT tell you what to do — the
+    // committed state does, and the two failure modes are opposites:
+    //
+    //   * returning early on every loss STRANDED a parked run whose grant had
+    //     been revoked underneath it (nothing ever wound it down);
+    //   * winding down on every loss FAILED a run another replica had just
+    //     legitimately activated.
+    //
+    // So the CAS decides who LEDGERS the refusal, and a re-read decides the
+    // session's fate. `finalize_forced` is idempotent, so repeating it where it
+    // IS warranted is harmless.
     let denied = match fluidbox_db::network_grants::deny_network_grant(
         &state.pool,
         scope,
@@ -391,36 +485,102 @@ pub async fn refuse_parked_grant(
     )
     .await
     {
-        // Lost the CAS — another replica already refused (or released) it.
-        Ok(None) => return,
         Ok(Some(row)) => {
             state.metrics.network_grants.inc("denied");
-            row
+            Some(row)
+        }
+        // We lost the CAS. That is NOT one situation, and treating it as one is
+        // a bug in both directions:
+        //
+        //   * `denied`/`revoked` — the grant is resolved away, nothing will ever
+        //     release this run, so it must be wound down or it is stranded.
+        //   * `active` — ANOTHER REPLICA ACTIVATED IT and the run is legitimately
+        //     proceeding. Winding it down here would durably fail a run that was
+        //     authorized, which is exactly what a naive "always finalize" does
+        //     under the supported multi-replica topology.
+        //
+        // So re-read and decide. A read failure leaves it alone: not knowing the
+        // state is different from knowing it is resolved.
+        Ok(None) => {
+            match fluidbox_db::network_grants::get_network_grant(&state.pool, scope, session_id)
+                .await
+            {
+                Ok(observed) => {
+                    let status = observed.as_ref().map(|g| g.status.as_str());
+                    if !fluidbox_db::network_grants::wind_down_on_cas_loss(status) {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            "another replica activated this grant; leaving the run alone"
+                        );
+                        return;
+                    }
+                    None
+                }
+                Err(e) => {
+                    // Visible rather than only logged: a persistent failure here
+                    // is safe (nothing destructive is guessed) but it does stall
+                    // resolution, and an operator should be able to see it.
+                    state
+                        .metrics
+                        .network_grant_refusals
+                        .inc("cas_reread_failed");
+                    tracing::warn!("re-reading the grant for {session_id} failed: {e}");
+                    return;
+                }
+            }
         }
         Err(e) => {
+            // A failed READ is different: we do not know the grant's state, so
+            // leave the session alone and let the next tick retry rather than
+            // finalizing a run that might still be releasable.
             tracing::warn!("denying network grant for {session_id} failed: {e}");
             return;
         }
     };
-    crate::ledger::record(
-        state,
-        scope,
-        session_id,
-        fluidbox_core::event::Actor::System,
-        fluidbox_core::event::EventBody::NetworkGrantRevoked {
-            // The mode that was REFUSED — the reason says it was a refusal.
-            // Reporting "denied" here would lose the one fact the event exists
-            // to record: how much authority was on the table.
-            mode: denied.mode,
-            reason: reason.to_string(),
-        },
-    )
-    .await;
+    // Ledger only on the CAS win, so several replicas cannot each append a
+    // refusal for the same grant.
+    if let Some(row) = denied {
+        crate::ledger::record(
+            state,
+            scope,
+            session_id,
+            fluidbox_core::event::Actor::System,
+            fluidbox_core::event::EventBody::NetworkGrantRevoked {
+                // The mode that was REFUSED — the reason says it was a refusal.
+                // Reporting "denied" here would lose the one fact the event
+                // exists to record: how much authority was on the table.
+                mode: row.mode,
+                reason: reason.to_string(),
+            },
+        )
+        .await;
+    }
     // A parked run has no sandbox and no runner, so there is nothing to
     // quiesce or collect — but it still winds down through the ordinary
     // terminal path, so the audit trail and result delivery behave like every
     // other refused run.
     crate::orchestrator::finalize_forced(state, session_id, "failed", reason).await;
+}
+
+/// Tear down the DATAPATH objects for a run's grant, then mark the row revoked.
+///
+/// Order matters and it is the opposite of what the DB-first version did:
+/// containment first, bookkeeping second. A row that says `revoked` while the
+/// CiliumNetworkPolicy still exists is not revocation — the run keeps its
+/// reach. A provider failure therefore does NOT mark the row revoked, so the
+/// sweep retries rather than recording a teardown that did not happen.
+pub async fn revoke_enforcement(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: Uuid,
+    reason: &str,
+) -> bool {
+    if let Err(e) = state.provider.revoke_network_policy(session_id).await {
+        tracing::warn!("tearing down the network policy for {session_id} failed: {e}");
+        return false;
+    }
+    revoke(state, scope, session_id, reason).await;
+    true
 }
 
 /// Surrender a run's network authority. Idempotent by CAS, so it is safe from
@@ -699,6 +859,99 @@ mod tests {
             reverify_before_release(&future, &policy, &approved_request(), &ctx()),
             Err(ReleaseRefusal::UnknownSchema)
         );
+    }
+
+    /// A policy that cut the grant DURATION while the run was parked permits
+    /// less than was authorized, even with an identical mode and targets.
+    /// Release used to compare only mode and targets, so the original grant —
+    /// with its full original lifetime — was activated under a policy that no
+    /// longer allowed it.
+    /// A deny ADDED while the run was parked permits less than was authorized,
+    /// and the frozen grant carries the OLD deny set — so releasing it would
+    /// run under denies the operator has since withdrawn consent to.
+    #[test]
+    fn a_policy_that_adds_a_deny_refuses_release() {
+        let policy = policy_with(NetworkPolicy {
+            require_approval: true,
+            ..open_policy().network
+        });
+        let resolved = resolve_for_run(&approved_request(), &policy, &ctx()).unwrap();
+        let row = pending_row(&resolved.grant);
+        let with_new_deny = policy_with(NetworkPolicy {
+            deny: vec![TargetRule::cidr(
+                "203.0.113.0/24".parse().unwrap(),
+                vec![PortSpec::single(443)],
+                L4Protocol::Tcp,
+            )],
+            ..policy.network.clone()
+        });
+        assert!(matches!(
+            reverify_before_release(&row, &with_new_deny, &approved_request(), &ctx()),
+            Err(ReleaseRefusal::PolicyMoved { .. })
+        ));
+        // FALSE-GREEN GUARD: an unchanged deny set still releases.
+        assert!(reverify_before_release(&row, &policy, &approved_request(), &ctx()).is_ok());
+    }
+
+    /// The grant must still OUTLIVE the run at release, not merely be unexpired.
+    /// An approval pause spends the grant's absolute lifetime without spending
+    /// the run's budget, so a grant sized exactly to the run can be released
+    /// with minutes left and then be swept away mid-flight.
+    #[test]
+    fn a_grant_too_short_for_the_remaining_run_refuses_release() {
+        let policy = policy_with(NetworkPolicy {
+            require_approval: true,
+            max_grant_secs: Some(1800),
+            ..open_policy().network
+        });
+        let resolved = resolve_for_run(&approved_request(), &policy, &ctx()).unwrap();
+        let row = pending_row(&resolved.grant);
+        // A long pause: most of the grant's life is gone, but it has not lapsed.
+        let late = ResolutionContext {
+            now: ctx().now + Duration::seconds(1500),
+            run_wall_clock_secs: Some(1800),
+            ..ctx()
+        };
+        assert!(!resolved.grant.is_expired(late.now), "not yet expired…");
+        assert_eq!(
+            reverify_before_release(&row, &policy, &approved_request(), &late),
+            Err(ReleaseRefusal::Expired),
+            "…but too short to cover the run it would govern"
+        );
+        // A short pause still releases.
+        let prompt = ResolutionContext {
+            now: ctx().now + Duration::seconds(10),
+            run_wall_clock_secs: Some(1500),
+            ..ctx()
+        };
+        assert!(reverify_before_release(&row, &policy, &approved_request(), &prompt).is_ok());
+    }
+
+    #[test]
+    fn a_policy_that_shortens_the_grant_refuses_release() {
+        let policy = policy_with(NetworkPolicy {
+            require_approval: true,
+            max_grant_secs: Some(7200),
+            ..open_policy().network
+        });
+        let resolved = resolve_for_run(&approved_request(), &policy, &ctx()).unwrap();
+        let row = pending_row(&resolved.grant);
+        // Same mode, same targets, far shorter ceiling.
+        let shortened = policy_with(NetworkPolicy {
+            max_grant_secs: Some(300),
+            ..policy.network.clone()
+        });
+        assert!(matches!(
+            reverify_before_release(&row, &shortened, &approved_request(), &ctx()),
+            Err(ReleaseRefusal::PolicyMoved { .. })
+        ));
+        // FALSE-GREEN GUARD: a policy that LENGTHENS it still releases, so this
+        // cannot pass by refusing every duration change.
+        let lengthened = policy_with(NetworkPolicy {
+            max_grant_secs: Some(99_999),
+            ..policy.network.clone()
+        });
+        assert!(reverify_before_release(&row, &lengthened, &approved_request(), &ctx()).is_ok());
     }
 
     #[test]

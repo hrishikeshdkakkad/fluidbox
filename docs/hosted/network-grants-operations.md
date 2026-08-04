@@ -41,6 +41,10 @@ fleet would reap its way through the authorization pause.
    ```yaml
    networkGrants:
      enabled: true
+     # REQUIRED: sandbox pods use `dnsPolicy: None`, whose nameservers must be
+     # IPs. Pick a free address in your Service CIDR; the chart pins the
+     # resolver Service to it. Omitting it fails the render, by design.
+     dnsClusterIP: 10.96.0.53
      clusterCIDRs: [10.0.0.0/8, 172.16.0.0/12]      # your pod/service/node ranges
      deploymentPublicCIDRs: [203.0.113.10/32]        # your LB / Ingress addresses
      upstreamResolvers: [1.1.1.1, 8.8.8.8]
@@ -73,6 +77,22 @@ fleet would reap its way through the authorization pause.
    caller to pass a request. A subscription or per-run override may only NARROW
    the declaration.
 
+### Upgrading across the deny-snapshot schema (grant schema v1 → v2)
+
+A grant frozen before policy denies were recorded carries an EMPTY deny list
+that means *unknown*, not *none* — nothing in the grant can tell those apart.
+So on upgrade:
+
+- A **`public`** grant at schema v1 is **refused** at provisioning, and any that
+  is already ACTIVE has its enforcement revoked by the sweeper within ~15 s.
+  Those runs lose network; recreate them and resolution freezes a current grant.
+- **`offline`** and **`approved`** grants are unaffected: the former programs
+  nothing, and the latter is a closed allow-list resolution already checked
+  against the live policy.
+
+This is deliberate and fail-closed. The alternative — programming a world-allow
+whose deny set might simply be missing — is the failure this refuses to risk.
+
 ## §3 Reading a refusal
 
 Every refusal is enumerated. `fluidbox_network_grant_refusals_total{reason}`
@@ -82,6 +102,7 @@ counts them, and the API returns the same code's message.
 |---|---|---|
 | `unenforceable` | No enforcer configured or detected. | §2 step 3, or run the agent offline. |
 | `mode_ceiling` | The request exceeds `network.max_mode`. | Raise the policy ceiling, or narrow the agent. |
+| `unenforceable_deny` | The policy has a NAME-based deny and the run asked for `public`. Cilium's `egressDeny` has no FQDN selector, so that deny cannot be programmed — issuing the grant would allow the world with the deny silently absent. | Express the deny as a **CIDR** to have it enforced. `approved` is narrower (resolution refuses to *grant* a denied name) but see the residual below — it does not enforce the deny at the datapath either. |
 | `not_in_catalog` | A target is outside `network.allow`. | Add it to the policy, or drop it from the agent. |
 | `policy_deny` | An explicit `network.deny` rule covers it. | Intended; the deny is doing its job. |
 | `blocked_range` | A CIDR target reaches a structurally blocked class (metadata, RFC1918, loopback…). | Never grant these. The datapath denies them regardless. |
@@ -135,14 +156,33 @@ human refusing a grant is the system working.
 | Controlled CoreDNS is down | Resolver outage | Name-based grants stop resolving. `:8788` is unaffected — it is allowed by SERVER POD IDENTITY, not by name — so runs still report. |
 | Egress-gateway node is down | Gateway outage | Egress stops for granted targets. The gateway is SNAT and attribution only, never the boundary; `:8788` is not in that path. |
 | A parked run never releases | Approval unanswered, or the grant lapsed | The approval TTL reaps it; the run fails with the enumerated reason. |
-| A CNP exists for a session with no pod | A leak | Owner-reference GC collects it; the reconcile sweep is the backstop. This matters because Cilium allow rules are ADDITIVE — a surviving policy that later matched a re-created pod would silently reopen traffic. |
+| A CNP exists for a session with no pod | A leak | Owner-reference GC collects it, and a 60 s reconcile lists what is programmed and deletes anything no live grant authorizes. This matters because Cilium allow rules are ADDITIVE — a surviving policy that later matched a re-created pod would silently reopen traffic. **The reconcile can only judge a policy it can attribute to a run:** one whose `fluidbox.dev/session` label is missing or malformed is logged (`no usable session label`) and left alone, because deleting an object of unknown ownership is worse than leaving it. Those need a human. |
 
 ## §7 Residuals — stated, not implied
 
 - **An FQDN grant enforces as the RESOLVED ADDRESS SET, not as a per-connection
   binding to a DNS answer.** A run granted `pypi.org` can reach `pypi.org`'s
-  current addresses by raw IP. It cannot reach anything else. This is the same
-  fact as the DNS-rebinding window, seen from the other side.
+  current addresses by raw IP. This is the same fact as the DNS-rebinding
+  window, seen from the other side.
+- **A NAME-based deny is never enforced in the datapath — under ANY mode.**
+  Cilium's `egressDeny` has no FQDN selector (verified against the 1.19.6 CRD;
+  Cilium declined the feature in cilium#35494 because such a deny would fail
+  open for names the proxy has not resolved). Under `public` the run is refused
+  outright. Under `approved` the deny still does real work — resolution will not
+  *grant* a denied name — but it is a grant-time control, not a packet-level
+  one, and the residual below is why that distinction matters.
+- **Consequently, a co-hosted virtual service behind a granted address is
+  reachable.** If `pypi.org` shares an address with other sites (a CDN or shared
+  reverse proxy), the datapath admits that address on that port and cannot tell
+  which `Host`/SNI the workload then asks for. A grant is therefore
+  "address × port", not "service identity". Grant names whose addresses you are
+  willing to have reached in full.
+- **An `approved` grant may look up only the names it was granted.** This is
+  enforced, not advisory: an unrestricted DNS rule would be an exfiltration
+  channel on its own (encode data into a lookup for an attacker-controlled
+  domain and their nameserver receives it, with no connection to block).
+  `public` keeps an unrestricted lookup because it may already reach anything
+  the wall permits.
 - **Cross-run isolation depends on the per-run policy's selector.** It carries
   all three run identity labels; a widened selector would pool concurrent runs'
   granted addresses into one reachable set. There is a unit test pinning it.
@@ -153,3 +193,18 @@ human refusing a grant is the system working.
   different sources and different failure modes.
 - **The Docker `host-dev` profile is not a boundary** and never was. Docker
   enforces `offline` only, under `hardened`.
+- **A policy edit that only REPHRASES a deny can refuse a parked release.** The
+  comparison at release is representation-sensitive: denying ports 443 and 444
+  as two rules, then rewriting them as one `443-444` range, reads as "the deny
+  set grew" even though it did not. The direction is safe (it can never let a
+  LARGER deny set through unnoticed) but it costs a re-created run. Rephrase
+  denies when nothing is parked.
+- **The re-verification failure streak is per-replica.** A parked run's retry
+  count lives in one process, so a restart resets it and two replicas count
+  independently. Consequence: the bound on how long a permanently-unreadable
+  policy keeps a run parked is per-replica, not deployment-wide.
+- **Unknown fields INSIDE a target rule are ignored when authoring.** Strictness
+  stops at the `network:` section boundary: `TargetRule` and `PortSpec` are
+  shared with the STORED representation, and making them strict would strand
+  policies already governing runs. A typo in a port or pattern field is
+  therefore silently dropped — check a rule reads as you intended after saving.

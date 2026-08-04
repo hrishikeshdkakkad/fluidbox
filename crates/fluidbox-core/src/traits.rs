@@ -138,6 +138,16 @@ pub trait NetworkPolicyProvider: Send + Sync {
     /// Tear the grant's objects down. MUST be idempotent — it is called from
     /// terminal cleanup, the abandon paths, and the reconcile sweep.
     async fn revoke(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError>;
+    /// Every run id this enforcer currently has a policy programmed for.
+    ///
+    /// The reconcile input. Without it, a policy can only be found by the run
+    /// that created it — so one written by a replica the control plane has since
+    /// lost, or by an older binary during a rolling upgrade, is invisible to
+    /// every sweep and survives on its own. Default empty: an enforcer that
+    /// programs nothing has nothing to reconcile.
+    async fn list_programmed(&self) -> Result<Vec<Uuid>, NetworkPolicyError> {
+        Ok(Vec::new())
+    }
     /// Human-readable enforcer name for boot logging and diagnostics.
     fn enforcer_name(&self) -> &'static str;
     /// Can this enforcer deliver anything above `offline`? Feeds the fail-closed
@@ -348,6 +358,14 @@ pub trait ExecutionProvider: Send + Sync {
     /// at creation and only discover the truth at provision time.
     fn network_enforcer(&self) -> &dyn NetworkPolicyProvider {
         &NoNetworkEnforcer
+    }
+    /// Tear down the datapath objects for one run's grant, by run id.
+    ///
+    /// Separate from `NetworkPolicyProvider::revoke` because callers that need
+    /// this — the expired-grant sweep, forced wind-down — hold a session id and
+    /// no grant. Idempotent: a run with nothing programmed is success.
+    async fn revoke_network_policy(&self, _run_id: Uuid) -> Result<(), ProviderError> {
+        Ok(())
     }
     fn runtime_name(&self) -> &'static str;
 }
