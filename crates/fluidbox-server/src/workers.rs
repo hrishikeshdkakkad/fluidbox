@@ -126,6 +126,7 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(approval_expiry(state.clone()));
     tokio::spawn(network_grant_gate(state.clone()));
     tokio::spawn(network_grant_expiry(state.clone()));
+    tokio::spawn(network_policy_reconcile(state.clone()));
     // Cross-replica approval wakeups (Gap 13): every replica wakes its OWN
     // waiters off the shared NOTIFY channel.
     spawn_approval_wakeups(state.clone());
@@ -836,6 +837,56 @@ async fn network_grant_expiry(state: AppState) {
     }
 }
 
+/// Delete datapath policies that no live grant authorizes.
+///
+/// The sweeps above find a policy only THROUGH its grant row, which leaves two
+/// real gaps. A rolling upgrade can have an OLD replica create a policy after a
+/// NEW replica has already marked that grant revoked — after which no
+/// grant-driven sweep ever looks at it again. And a policy written by a replica
+/// the control plane has since lost is invisible the same way.
+///
+/// This closes both by starting from the DATAPATH instead: list what is actually
+/// programmed, ask which of those runs still have a grant in force, and delete
+/// the rest. It is the reconcile the design called for and is deliberately
+/// independent of who created a policy or when.
+async fn network_policy_reconcile(state: AppState) {
+    let mut tick = periodic(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let enforcer = state.provider.network_enforcer();
+        if !enforcer.supports_egress_grants() {
+            continue;
+        }
+        let programmed = match enforcer.list_programmed().await {
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!("listing programmed network policies failed: {e}");
+                continue;
+            }
+        };
+        let orphans =
+            match fluidbox_db::system_worker::runs_without_live_grants(&state.pool, &programmed)
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!("reconciling network policies failed: {e}");
+                    continue;
+                }
+            };
+        for run_id in orphans {
+            tracing::warn!(
+                run_id = %run_id,
+                "a network policy exists for a run with no grant in force; deleting it"
+            );
+            if let Err(e) = state.provider.revoke_network_policy(run_id).await {
+                tracing::warn!("deleting the orphaned network policy for {run_id} failed: {e}");
+            }
+        }
+    }
+}
+
 /// Release (or refuse) runs parked on a network-grant authorization.
 ///
 /// STATE-DRIVEN rather than a special case in the approval decision handler,
@@ -867,6 +918,20 @@ async fn network_grant_gate(state: AppState) {
             // the pause itself, and its own grant gate re-checks authority.
             if p.grant_status == "active" {
                 crate::orchestrator::spawn_run(state.clone(), p.session_id);
+                continue;
+            }
+            // The grant was taken away while the run was parked — revoked by
+            // the stale-schema sweep, or denied. There is nothing left to
+            // release, so resolve the session instead of leaving it parked
+            // forever with no explanation in its timeline.
+            if p.grant_status == "revoked" || p.grant_status == "denied" {
+                crate::netgrant::refuse_parked_grant(
+                    &state,
+                    scope,
+                    p.session_id,
+                    "the network grant was revoked before this run could be released",
+                )
+                .await;
                 continue;
             }
             match p.approval_status.as_deref() {
