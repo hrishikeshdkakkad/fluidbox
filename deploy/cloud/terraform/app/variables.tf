@@ -9,9 +9,19 @@ variable "deployer_role_arn" {
 }
 
 variable "chart_version" {
-  description = "The released fluidbox chart (OCI, ghcr) — UNCHANGED by M1. Images default to the chart appVersion (multi-arch on GHCR)."
+  description = "The released fluidbox chart (OCI, ghcr) — UNCHANGED by M1. Images default to the chart appVersion (multi-arch on GHCR). 0.5.0 is the first release carrying the network-grants machinery (#121) AND the Cilium enforcer (#122); 0.4.0 predates both, so the netgrant templates and FLUIDBOX_NETWORK_ENFORCER do not exist below it."
   type        = string
-  default     = "0.4.0"
+  default     = "0.5.1"
+}
+
+variable "network_enforcer" {
+  description = "FLUIDBOX_NETWORK_ENFORCER — 'none' (offline-only; any wider grant refused at create time) or 'cilium'. Requires var.cni = 'cilium' on the platform stack: the enforcer probes cilium.io/v2 with the server's own RBAC and a boot with an explicit 'cilium' on a cluster that does not serve it is a REFUSAL, not a downgrade."
+  type        = string
+  default     = "none"
+  validation {
+    condition     = contains(["none", "cilium"], var.network_enforcer)
+    error_message = "network_enforcer must be 'none' or 'cilium'."
+  }
 }
 
 variable "public_url" {

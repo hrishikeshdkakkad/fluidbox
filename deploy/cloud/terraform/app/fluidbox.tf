@@ -15,6 +15,10 @@ locals {
       { name = "FLUIDBOX_LLM_TENANT_MAX_BUDGET", value = var.llm_tenant_max_budget },
       { name = "FLUIDBOX_LLM_TENANT_BUDGET_DURATION", value = var.llm_tenant_budget_duration },
       { name = "FLUIDBOX_DEFAULT_MODEL", value = var.default_model },
+      # Governed sandbox network access. 'none' keeps every run offline-only
+      # (and REFUSES a wider grant at create time); 'cilium' is only bootable
+      # on a Cilium cluster — see var.network_enforcer and platform/cilium.tf.
+      { name = "FLUIDBOX_NETWORK_ENFORCER", value = var.network_enforcer },
     ],
     var.require_sso ? [{ name = "FLUIDBOX_REQUIRE_SSO", value = "1" }] : [],
   )
