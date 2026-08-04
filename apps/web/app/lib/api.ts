@@ -248,6 +248,9 @@ export interface Revision {
    *  declares — *what* it needs per slot, never *whose* credential. Resolved
    *  per-run into bindings. Defaults to [] on pre-Phase-C revisions. */
   connection_requirements?: ConnectionRequirement[];
+  /** The sandbox network grant this revision declares — a run narrows it to
+   *  its policy ceiling. Absent on revisions predating network grants. */
+  network?: NetworkRequest | null;
   created_at: string;
 }
 
@@ -937,6 +940,45 @@ export interface PolicyContent {
   approvals: ApprovalSettings;
   autonomy: AutonomySettings;
   tools: ToolRule[];
+  /** Absent on any policy that never configured egress — see networkOf(). */
+  network?: NetworkPolicy;
+}
+
+// ─── Sandbox network grants ───────────────────────────────────────────────
+// Structural mirrors of fluidbox-core::network. `kind` is a serde tag, not a
+// convenience: TargetRule and FqdnPattern are tagged enums server-side.
+
+export type NetworkGrantMode = "offline" | "approved" | "public";
+export type L4Protocol = "tcp" | "udp";
+
+export interface PortSpec {
+  from: number;
+  to: number;
+}
+
+export type FqdnPattern =
+  | { kind: "exact"; name: string }
+  | { kind: "wildcard"; suffix: string };
+
+export type TargetRule =
+  | { kind: "dns"; pattern: FqdnPattern; ports: PortSpec[]; protocol: L4Protocol }
+  | { kind: "cidr"; cidr: string; ports: PortSpec[]; protocol: L4Protocol };
+
+/** The `network:` section of a policy — the CEILING, never the grant. */
+export interface NetworkPolicy {
+  max_mode: NetworkGrantMode;
+  allow: TargetRule[];
+  deny: TargetRule[];
+  require_approval: boolean;
+  allow_public_with_brokered: boolean;
+  max_grant_secs: number | null;
+}
+
+/** What an agent revision DECLARES, or a run narrows it to. */
+export interface NetworkRequest {
+  mode: NetworkGrantMode;
+  targets: TargetRule[];
+  duration_secs: number | null;
 }
 
 /** One version's metadata (GET /policies/{name} `versions`; content via the
