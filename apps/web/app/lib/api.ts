@@ -642,6 +642,15 @@ export interface HarnessInfo {
   models: HarnessModel[];
 }
 
+/** The deployment's RESOLVED network posture, from GET /harnesses. It comes
+ *  from the PROVIDER, not config, so `supports_egress_grants: false` means the
+ *  running deployment has no enforcer — a ceiling above Offline would be refused
+ *  at run creation. The dashboard uses it to disable what it cannot enforce. */
+export interface DeploymentNetwork {
+  enforcer: string;
+  supports_egress_grants: boolean;
+}
+
 /** Where a LEGACY (hand-pasted) github_app connection receives provider
  *  webhooks. Seamless connections receive events on their registration's
  *  app-level ingress instead — shown on the registration card. */

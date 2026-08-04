@@ -23,6 +23,7 @@ import {
 } from "../lib/api";
 import { coerceCap, coerceTtlSecs } from "../lib/policy-caps";
 import { MODE_HINT, MODE_LABEL, MODE_ORDER, networkOf } from "../lib/network";
+import { useHarnesses } from "../lib/harnesses";
 import { VERB } from "./PermissionMatrix";
 import { TargetRuleEditor } from "./TargetRuleEditor";
 
@@ -143,6 +144,12 @@ export function PolicyLimits({
 }) {
   const set = (patch: Partial<PolicyContent>) => onChange({ ...content, ...patch });
   const { budgets, approvals, autonomy, egress, defaults } = content;
+  // The deployment's RESOLVED network posture (GET /harnesses). Called at the
+  // component top level — the rules of hooks forbid it inside the IIFE below.
+  // null = an older server that does not report it, or a catalog that failed to
+  // load; the ceiling then stays editable (today's behaviour). A live enforcer
+  // that reports no egress support disables what a run could never be granted.
+  const { network } = useHarnesses();
 
   return (
     <>
@@ -242,6 +249,7 @@ export function PolicyLimits({
               <select
                 className="inp"
                 value={net.max_mode}
+                disabled={network !== null && !network.supports_egress_grants}
                 onChange={(e) => {
                   const max_mode = e.target.value as NetworkGrantMode;
                   // A public request must carry NO targets; clearing here keeps the
@@ -256,6 +264,13 @@ export function PolicyLimits({
                 ))}
               </select>
             </label>
+            {network !== null && !network.supports_egress_grants && (
+              <p className="helper warn">
+                This deployment has no network enforcer ({network.enforcer}), so any ceiling above
+                Offline would be refused when a run is created. Install Cilium and set
+                FLUIDBOX_NETWORK_ENFORCER to enable it.
+              </p>
+            )}
             <p className="helper">{MODE_HINT[net.max_mode]}</p>
 
             {net.max_mode === "public" && (
