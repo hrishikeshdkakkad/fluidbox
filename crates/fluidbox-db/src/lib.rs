@@ -1965,18 +1965,33 @@ pub async fn revoke_connection(
     id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let out = revoke_connection_in_tx(&mut *tx, scope, id).await?;
+    tx.commit().await?;
+    Ok(out)
+}
 
-    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+/// Executor-generic twin of [`revoke_connection`] for a caller already holding
+/// a `scoped_tx` + the (tenant, installation) advisory lock (issue #16): the
+/// per-installation revoke runs THROUGH that tx so it serializes against a
+/// concurrent approve/import on the same installation. The caller's `scoped_tx`
+/// has already set the RLS GUC — do NOT call this on a raw pool connection.
+pub async fn revoke_connection_in_tx<'e, E>(
+    exec: E,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<IntegrationConnectionRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = 'revoked', updated_at = now()
          where id = $1 and status <> 'revoked' and tenant_id = $2
          returning {CONNECTION_COLS}"
     )))
     .bind(id)
     .bind(scope.tenant_id())
-    .fetch_optional(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(__rls_out)
+    .fetch_optional(exec)
+    .await
 }
 
 /// List connections through a visibility lens (design :274-296): `All` returns
@@ -3456,6 +3471,13 @@ pub async fn revoke_github_app_registration(
     id: Uuid,
 ) -> sqlx::Result<Option<Vec<Uuid>>> {
     let mut tx = scoped_tx(pool, scope).await?;
+    // issue #16: hold the registration advisory lock across the CAS + child
+    // cascade so a concurrent import/approve on any of this registration's
+    // installations (which takes the SAME lock, above the installation lock in
+    // the fixed order) cannot commit a live child under the registration we are
+    // revoking. Closes the "import landing just after a registration revoke"
+    // write skew (design §7.5); releases on commit/rollback.
+    acquire_github_app_registration_lock(&mut tx, id).await?;
     let reg = sqlx::query(
         "update github_app_registrations set status = 'revoked', updated_at = now()
          where id = $1 and status <> 'revoked' and tenant_id = $2",
@@ -3645,6 +3667,100 @@ pub async fn claim_github_app_flow(
     Ok(r.rows_affected() == 1)
 }
 
+// ─── GitHub App lifecycle advisory locks (issue #16) ────────────────────────
+//
+// The GitHub App lifecycle (setup/sync import, approve, per-installation and
+// registration revoke, webhook lifecycle) runs read-check-write sequences that,
+// before these locks, could interleave at sub-statement granularity under READ
+// COMMITTED (design 2026-07-11-github-seamless-connect-design.md §7.5): a fresh
+// import landing just after a registration revoke, or two imports of the same
+// installation racing an insert. Two lock domains, taken in a FIXED order to
+// avoid deadlock, REGISTRATION before INSTALLATION wherever both are held:
+//   * installation lock: serializes apply/approve/lifecycle/connection-revoke
+//     for ONE (tenant, installation).
+//   * registration lock: serializes the registration-wide revoke cascade
+//     against apply/approve. This is what closes the import-vs-registration-
+//     revoke write skew; the installation lock alone cannot, because the
+//     cascade touches every installation and takes no per-installation lock.
+
+/// Stable 64-bit advisory-lock key for a GitHub installation within a tenant,
+/// mirroring [`registration_lock_key`]'s sha256-fold over `tenant‖NUL‖id` (the
+/// NUL separator keeps `a‖bc` distinct from `ab‖c`).
+pub fn installation_lock_key(tenant: Uuid, installation_id: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(tenant.as_bytes());
+    h.update([0u8]);
+    h.update(installation_id.as_bytes());
+    let d = h.finalize();
+    i64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
+}
+
+/// Take a transaction-scoped advisory lock on (tenant, installation), serializing
+/// the per-installation lifecycle writes so a read-check-write sequence can no
+/// longer interleave with another actor on the same installation. Releases when
+/// `tx` commits or drops. Held BELOW the registration lock in the fixed order.
+pub async fn acquire_installation_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    installation_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(installation_lock_key(tenant, installation_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Stable 64-bit advisory-lock key for a GitHub App registration. Uses a sha256
+/// fold over the FULL uuid (like [`registration_lock_key`] / [`installation_lock_key`])
+/// rather than [`oauth_lock_key`]'s leading-8-byte fold: registration ids are
+/// UUIDv7, whose leading bytes are a millisecond timestamp, so folding the head
+/// would make two registrations created in the same millisecond share a key and
+/// needlessly serialize their unrelated lifecycles. Hashing the full id spreads
+/// the key across the whole space.
+pub fn github_app_registration_lock_key(registration_id: Uuid) -> i64 {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(registration_id.as_bytes());
+    i64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
+}
+
+/// Take a transaction-scoped advisory lock on a GitHub App registration,
+/// serializing the registration-wide revoke cascade against the per-installation
+/// import/approve paths. Held ABOVE the installation lock in the fixed order.
+pub async fn acquire_github_app_registration_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    registration_id: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(github_app_registration_lock_key(registration_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Read a GitHub App registration's current status THROUGH the caller's tx, used
+/// under the registration advisory lock to re-check freshness before an
+/// import/approve commits a live child under it. The caller's `scoped_tx` has
+/// already set the RLS GUC.
+pub async fn github_app_registration_status_in_tx<'e, E>(
+    exec: E,
+    scope: TenantScope,
+    id: Uuid,
+) -> sqlx::Result<Option<String>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<(String,)> = sqlx::query_as(
+        "select status from github_app_registrations where id = $1 and tenant_id = $2",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .fetch_optional(exec)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
 /// Insert a seamless installation connection ONLY if the installation has
 /// never had a row of ANY status — the check rides inside the statement, so
 /// an insert can never land just after a concurrent revoke (F‑6: revoked
@@ -3662,8 +3778,39 @@ pub async fn create_github_app_connection_if_absent(
     registration_id: Uuid,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let out = create_github_app_connection_if_absent_in_tx(
+        &mut *tx,
+        scope,
+        installation_id,
+        display_name,
+        metadata,
+        status,
+        registration_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
 
-    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+/// Executor-generic twin for a caller already holding a `scoped_tx` + the
+/// (tenant, installation) [+ registration] advisory locks (issue #16). Under
+/// those locks the `where not exists` insert can no longer race a concurrent
+/// import, and the caller has re-checked the registration status through the
+/// same tx, so an insert can never land under a just-revoked registration.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_github_app_connection_if_absent_in_tx<'e, E>(
+    exec: E,
+    scope: TenantScope,
+    installation_id: &str,
+    display_name: &str,
+    metadata: &Value,
+    status: &str,
+    registration_id: Uuid,
+) -> sqlx::Result<Option<IntegrationConnectionRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         // github_app connections are ALWAYS organization-owned (system custody
         // via the registration) — owner_type is stamped explicitly, never a
         // per-user personal connection.
@@ -3686,10 +3833,8 @@ pub async fn create_github_app_connection_if_absent(
     .bind(metadata)
     .bind(status)
     .bind(registration_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(__rls_out)
+    .fetch_optional(exec)
+    .await
 }
 
 /// The single live connection row for a GitHub installation, preferring a
@@ -3701,8 +3846,23 @@ pub async fn get_github_app_connection_by_installation(
     installation_id: &str,
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let out =
+        get_github_app_connection_by_installation_in_tx(&mut *tx, scope, installation_id).await?;
+    tx.commit().await?;
+    Ok(out)
+}
 
-    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+/// Executor-generic twin for a caller holding the installation advisory lock
+/// (issue #16): the authoritative re-read runs THROUGH the locked tx.
+pub async fn get_github_app_connection_by_installation_in_tx<'e, E>(
+    exec: E,
+    scope: TenantScope,
+    installation_id: &str,
+) -> sqlx::Result<Option<IntegrationConnectionRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "select {CONNECTION_COLS} from integration_connections
          where tenant_id = $1 and provider = 'github_app' and external_account_id = $2
          order by (status <> 'revoked') desc, created_at desc
@@ -3710,10 +3870,8 @@ pub async fn get_github_app_connection_by_installation(
     )))
     .bind(scope.tenant_id())
     .bind(installation_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(__rls_out)
+    .fetch_optional(exec)
+    .await
 }
 
 /// Guarded status transition: only fires when the current status is one of
@@ -3726,9 +3884,27 @@ pub async fn set_connection_status(
     allowed_from: &[&str],
 ) -> sqlx::Result<Option<IntegrationConnectionRow>> {
     let mut tx = scoped_tx(pool, scope).await?;
+    let out = set_connection_status_in_tx(&mut *tx, scope, id, status, allowed_from).await?;
+    tx.commit().await?;
+    Ok(out)
+}
 
+/// Executor-generic twin of [`set_connection_status`] for a caller holding a
+/// `scoped_tx` + the (tenant, installation) advisory lock (issue #16): the
+/// guarded CAS runs THROUGH that tx so it serializes against a concurrent
+/// approve/import/lifecycle on the same installation.
+pub async fn set_connection_status_in_tx<'e, E>(
+    exec: E,
+    scope: TenantScope,
+    id: Uuid,
+    status: &str,
+    allowed_from: &[&str],
+) -> sqlx::Result<Option<IntegrationConnectionRow>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let from: Vec<String> = allowed_from.iter().map(|s| s.to_string()).collect();
-    let __rls_out = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "update integration_connections set status = $2, updated_at = now()
          where id = $1 and status = any($3) and tenant_id = $4
          returning {CONNECTION_COLS}"
@@ -3737,10 +3913,8 @@ pub async fn set_connection_status(
     .bind(status)
     .bind(&from)
     .bind(scope.tenant_id())
-    .fetch_optional(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(__rls_out)
+    .fetch_optional(exec)
+    .await
 }
 
 /// Refresh the display metadata a setup/sync re-verification produced.
@@ -3752,7 +3926,23 @@ pub async fn refresh_connection_metadata(
     metadata: &Value,
 ) -> sqlx::Result<()> {
     let mut tx = scoped_tx(pool, scope).await?;
+    refresh_connection_metadata_in_tx(&mut *tx, scope, id, display_name, metadata).await?;
+    tx.commit().await?;
+    Ok(())
+}
 
+/// Executor-generic twin for a caller holding the installation advisory lock
+/// (issue #16): the metadata refresh runs THROUGH the locked tx.
+pub async fn refresh_connection_metadata_in_tx<'e, E>(
+    exec: E,
+    scope: TenantScope,
+    id: Uuid,
+    display_name: &str,
+    metadata: &Value,
+) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query(
         "update integration_connections
          set display_name = $2, metadata = $3, updated_at = now()
@@ -3762,9 +3952,8 @@ pub async fn refresh_connection_metadata(
     .bind(display_name)
     .bind(metadata)
     .bind(scope.tenant_id())
-    .execute(&mut *tx)
+    .execute(exec)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -14903,6 +15092,227 @@ mod tests {
             .unwrap();
         assert!(freed, "the lock is free after tx1 released");
         tx3.rollback().await.unwrap();
+    }
+
+    // ─── GitHub App lifecycle advisory locks (issue #16) ─────────────────────
+
+    // The (tenant, installation) advisory lock serializes the per-installation
+    // lifecycle writes: while one tx holds a key, a second cannot take the SAME
+    // key but CAN take a different one; it frees on transaction end.
+    #[tokio::test]
+    async fn installation_lock_serializes_same_key() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let tenant = Uuid::now_v7();
+        let key = installation_lock_key(tenant, "123");
+        assert_ne!(
+            key,
+            installation_lock_key(tenant, "124"),
+            "distinct installations fold to distinct keys"
+        );
+        assert_ne!(
+            key,
+            installation_lock_key(Uuid::now_v7(), "123"),
+            "the same installation id under a different tenant is a different key"
+        );
+
+        let mut tx1 = pool.begin().await.unwrap();
+        acquire_installation_lock(&mut tx1, tenant, "123")
+            .await
+            .unwrap();
+        let mut c2 = pool.acquire().await.unwrap();
+        let (same,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *c2)
+            .await
+            .unwrap();
+        assert!(!same, "same (tenant, installation) key is held by tx1");
+        let (other,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(installation_lock_key(tenant, "124"))
+            .fetch_one(&mut *c2)
+            .await
+            .unwrap();
+        assert!(other, "a different installation key is independent");
+        drop(c2);
+        tx1.rollback().await.unwrap();
+        let mut tx3 = pool.begin().await.unwrap();
+        let (freed,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *tx3)
+            .await
+            .unwrap();
+        assert!(freed, "the lock is free after tx1 released");
+        tx3.rollback().await.unwrap();
+    }
+
+    #[test]
+    fn github_app_registration_lock_key_is_stable_and_distinct() {
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        assert_eq!(
+            github_app_registration_lock_key(a),
+            github_app_registration_lock_key(a),
+            "stable for one registration"
+        );
+        assert_ne!(
+            github_app_registration_lock_key(a),
+            github_app_registration_lock_key(b),
+            "distinct registrations fold to distinct keys"
+        );
+    }
+
+    // A fresh tenant + an ACTIVE github_app registration. Activation proper needs
+    // sealed key material we don't exercise here, so the status is flipped
+    // directly on the RLS-bypassing test pool.
+    async fn active_gh_reg(pool: &PgPool) -> (TenantScope, Uuid) {
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = identity::create_org(pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+        let reg = create_github_app_registration(pool, scope, "org", Some("acme"))
+            .await
+            .unwrap();
+        sqlx::query("update github_app_registrations set status = 'active' where id = $1")
+            .bind(reg.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        (scope, reg.id)
+    }
+
+    // Mirrors apply_verified_installation's locked import critical section: one
+    // scoped_tx holds the registration + installation locks, re-checks the
+    // registration status, and only inserts if it is still live. Returns the new
+    // row, or None when the import was refused (registration revoked) or a row
+    // already existed.
+    async fn locked_import(
+        pool: &PgPool,
+        scope: TenantScope,
+        reg_id: Uuid,
+        installation_id: &str,
+    ) -> Option<IntegrationConnectionRow> {
+        let mut tx = scoped_tx(pool, scope).await.unwrap();
+        acquire_github_app_registration_lock(&mut tx, reg_id)
+            .await
+            .unwrap();
+        acquire_installation_lock(&mut tx, scope.tenant_id(), installation_id)
+            .await
+            .unwrap();
+        let status = github_app_registration_status_in_tx(&mut *tx, scope, reg_id)
+            .await
+            .unwrap();
+        if matches!(status.as_deref(), Some("revoked") | None) {
+            // Refuse: dropping tx rolls back, releasing both locks.
+            return None;
+        }
+        let created = create_github_app_connection_if_absent_in_tx(
+            &mut *tx,
+            scope,
+            installation_id,
+            "acme/repo",
+            &serde_json::json!({}),
+            "active",
+            reg_id,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        created
+    }
+
+    async fn live_children_under_revoked_registration(pool: &PgPool, reg_id: Uuid) -> i64 {
+        let (n,): (i64,) = sqlx::query_as(
+            "select count(*) from integration_connections c
+               join github_app_registrations r on r.id = c.registration_id
+              where r.id = $1 and r.status = 'revoked' and c.status <> 'revoked'",
+        )
+        .bind(reg_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        n
+    }
+
+    // Order A: a registration revoke commits first; a later import must observe
+    // the revoked status under the shared registration lock and refuse, so no
+    // live child is created under the revoked registration.
+    #[tokio::test]
+    async fn github_app_import_refused_after_registration_revoke() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (scope, reg_id) = active_gh_reg(&pool).await;
+
+        revoke_github_app_registration(&pool, scope, reg_id)
+            .await
+            .unwrap();
+        let created = locked_import(&pool, scope, reg_id, "77").await;
+        assert!(
+            created.is_none(),
+            "import must be refused under a revoked registration"
+        );
+        assert_eq!(
+            live_children_under_revoked_registration(&pool, reg_id).await,
+            0,
+            "no live connection may exist under a revoked registration"
+        );
+    }
+
+    // Order B + the concurrent race: an import that commits first is caught by
+    // the revoke cascade; and running import against revoke concurrently (both
+    // taking the shared registration lock) converges on the same invariant in
+    // either interleaving.
+    #[tokio::test]
+    async fn github_app_registration_revoke_wins_over_concurrent_import() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+
+        // Order B (sequential): import first, then revoke cascades over it.
+        let (scope, reg_id) = active_gh_reg(&pool).await;
+        let created = locked_import(&pool, scope, reg_id, "88").await;
+        assert!(
+            created.is_some(),
+            "an import under an active registration creates a live row"
+        );
+        revoke_github_app_registration(&pool, scope, reg_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            live_children_under_revoked_registration(&pool, reg_id).await,
+            0,
+            "the revoke cascade caught the imported connection"
+        );
+
+        // Concurrent: race import against revoke on fresh registrations; the
+        // shared registration lock serializes them, so whichever wins, no live
+        // child survives under a revoked registration.
+        for i in 0..8u32 {
+            let (scope, reg_id) = active_gh_reg(&pool).await;
+            let iid = format!("c{i}");
+            let (p1, p2) = (pool.clone(), pool.clone());
+            let iid1 = iid.clone();
+            let importer =
+                tokio::spawn(async move { locked_import(&p1, scope, reg_id, &iid1).await });
+            let revoker = tokio::spawn(async move {
+                revoke_github_app_registration(&p2, scope, reg_id)
+                    .await
+                    .unwrap()
+            });
+            let _ = importer.await.unwrap();
+            let _ = revoker.await.unwrap();
+            assert_eq!(
+                live_children_under_revoked_registration(&pool, reg_id).await,
+                0,
+                "iteration {i}: no live child may survive under a revoked registration"
+            );
+        }
     }
 
     // ─── Connector OAuth flows (Phase D Task 4, #32 — invariant 20) ──────────

@@ -595,9 +595,28 @@ pub async fn revoke(
     // Personal ⇒ owner-only (else 404); organization ⇒ admin/owner.
     let conn = connection_for_mutation(&state, &principal, id, "revoking").await?;
     let scope = principal.scope();
-    let row = fluidbox_db::revoke_connection(&state.pool, scope, conn.id)
-        .await?
-        .ok_or_else(|| ApiError::Conflict("connection is already revoked".into()))?;
+    // issue #16: revoking a github_app connection is a per-(tenant, installation)
+    // lifecycle write, so it takes the same advisory locks as apply/approve
+    // (fixed order: registration ABOVE installation) to serialize against a
+    // concurrent import/approve reviving the row. Other providers keep the plain
+    // single-statement revoke.
+    let revoked = match (conn.provider.as_str(), conn.registration_id) {
+        ("github_app", Some(reg_id)) => {
+            let mut tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+            fluidbox_db::acquire_github_app_registration_lock(&mut tx, reg_id).await?;
+            fluidbox_db::acquire_installation_lock(
+                &mut tx,
+                scope.tenant_id(),
+                &conn.external_account_id,
+            )
+            .await?;
+            let out = fluidbox_db::revoke_connection_in_tx(&mut *tx, scope, conn.id).await?;
+            tx.commit().await?;
+            out
+        }
+        _ => fluidbox_db::revoke_connection(&state.pool, scope, conn.id).await?,
+    };
+    let row = revoked.ok_or_else(|| ApiError::Conflict("connection is already revoked".into()))?;
     state.metrics.connection_revocations.inc();
     // A cached installation/access token must not outlive the revocation.
     crate::oauth::invalidate_access(&state, row.id).await;
@@ -675,66 +694,77 @@ pub async fn approve(
     let login = inst["account"]["login"].as_str().unwrap_or("unknown");
     let suspended = inst["suspended_at"].is_string();
     let to = if suspended { "suspended" } else { "active" };
-    let row = match fluidbox_db::set_connection_status(
-        &state.pool,
+    // issue #16: take the registration + installation advisory locks (fixed
+    // order: registration ABOVE installation) and do the authoritative re-read +
+    // transition inside ONE scoped_tx. The registration lock is the same one
+    // revoke_github_app_registration holds, so a revoke can no longer interleave
+    // with this approve — which is what lets us drop the old compensating
+    // re-read/revert (design §7.5). The installation lock serializes against a
+    // concurrent import/lifecycle/connection-revoke on the same installation, so
+    // the reads above are advisory and this section is authoritative. The HTTP
+    // re-verify stays OUTSIDE the lock (above), so no pooled connection is held
+    // across a GitHub round-trip.
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    fluidbox_db::acquire_github_app_registration_lock(&mut tx, reg.id).await?;
+    fluidbox_db::acquire_installation_lock(&mut tx, scope.tenant_id(), &conn.external_account_id)
+        .await?;
+    // The registration must still be active under the lock: a revoke that
+    // committed before we acquired the lock is now visible, so refuse rather
+    // than activating a connection under a revoked registration.
+    if !matches!(
+        fluidbox_db::github_app_registration_status_in_tx(&mut *tx, scope, reg.id)
+            .await?
+            .as_deref(),
+        Some("active")
+    ) {
+        return Err(ApiError::Conflict(
+            "the github app registration was revoked during approval".into(),
+        ));
+    }
+    // Authoritative re-check of the collision the preflight flagged (now under
+    // the installation lock, so no other live row can appear): reviving a
+    // revoked row must not collide with a DIFFERENT live row.
+    if let Some(other) = fluidbox_db::get_github_app_connection_by_installation_in_tx(
+        &mut *tx,
+        scope,
+        &conn.external_account_id,
+    )
+    .await?
+    .filter(|c| c.id != conn.id && c.status != "revoked")
+    {
+        return Err(ApiError::Conflict(format!(
+            "installation {} is already live on connection {} — revoke that one first",
+            conn.external_account_id, other.id
+        )));
+    }
+    fluidbox_db::set_connection_status_in_tx(
+        &mut *tx,
         scope,
         conn.id,
         to,
         &["pending", "revoked", "suspended", "error"],
     )
-    .await
-    {
-        Ok(row) => row,
-        // Race-safe fallback for the preflight above.
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return Err(ApiError::Conflict(
-                "another live connection claimed this installation — revoke it first".into(),
-            ))
-        }
-        Err(e) => return Err(e.into()),
-    }
+    .await?
     .ok_or_else(|| ApiError::Conflict("connection changed state underneath".into()))?;
     // After the transition — the refresh skips revoked rows by design.
-    fluidbox_db::refresh_connection_metadata(
-        &state.pool,
+    fluidbox_db::refresh_connection_metadata_in_tx(
+        &mut *tx,
         scope,
-        row.id,
+        conn.id,
         &crate::github_app::installation_display(&reg, login),
         &crate::github_app::installation_metadata(&reg, &conn.external_account_id, login),
     )
     .await?;
+    let row = fluidbox_db::get_connection(&mut *tx, scope, conn.id)
+        .await?
+        .ok_or_else(|| ApiError::Conflict("connection changed state underneath".into()))?;
+    tx.commit().await?;
     // Reactivating a github_app connection does NOT bump the authorization
     // generation (unlike an OAuth reconnect): the installation id is a
     // positively proven stable identity, so the logical account is unchanged and
     // in-flight bindings stay valid. Only the cached installation token is
     // evicted so a re-mint picks up the reconciled state.
     crate::oauth::invalidate_access(&state, conn.id).await;
-    // Compensating check: a registration revoke racing this approve must
-    // win. Re-read AFTER our transition — if the registration flipped, the
-    // cascade either already caught our row (later writer) or we revert it
-    // here (we were the later writer). Either interleaving converges on
-    // revoked.
-    let reg_now = fluidbox_db::get_github_app_registration(&state.pool, scope, reg.id).await?;
-    if reg_now.map(|r| r.status != "active").unwrap_or(true) {
-        fluidbox_db::set_connection_status(
-            &state.pool,
-            scope,
-            conn.id,
-            "revoked",
-            &["active", "suspended"],
-        )
-        .await
-        .ok();
-        crate::oauth::invalidate_access(&state, conn.id).await;
-        return Err(ApiError::Conflict(
-            "the github app registration was revoked during approval".into(),
-        ));
-    }
-    let mut reload_tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
-    let row = fluidbox_db::get_connection(&mut *reload_tx, scope, row.id)
-        .await?
-        .ok_or_else(|| ApiError::Conflict("connection changed state underneath".into()))?;
-    reload_tx.commit().await?;
     Ok(Json(json!({ "connection": row })))
 }
 

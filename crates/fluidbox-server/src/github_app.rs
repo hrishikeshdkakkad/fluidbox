@@ -367,28 +367,6 @@ pub(crate) fn installation_metadata(
     })
 }
 
-/// Upsert the ONE live connection row for a verified installation.
-/// Scoped one-shot connection read for the reconcile paths. `get_connection` is
-/// executor-generic (Task 6), so under FORCE RLS its caller must supply a GUC'd
-/// executor; the tenant is known here (the registration/row scope), so open+commit
-/// a `scoped_tx`. Keeps the three reconcile reads from repeating the tx boilerplate.
-async fn reconcile_get_connection(
-    state: &AppState,
-    scope: fluidbox_db::TenantScope,
-    id: Uuid,
-) -> Result<Option<IntegrationConnectionRow>, String> {
-    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
-        .await
-        .map_err(|e| format!("connection lookup failed: {e}"))?;
-    let row = fluidbox_db::get_connection(&mut *tx, scope, id)
-        .await
-        .map_err(|e| format!("connection lookup failed: {e}"))?;
-    tx.commit()
-        .await
-        .map_err(|e| format!("connection lookup failed: {e}"))?;
-    Ok(row)
-}
-
 /// `activate` distinguishes admin-intent paths (setup with a valid flow,
 /// sync) from discovery (installation.created webhook → pending). Revoked
 /// rows are never revived here — that is the explicit approve path — and a
@@ -415,77 +393,109 @@ async fn apply_verified_installation(
     // connection mutation here (works for both admin setup and unauthenticated
     // webhook/discovery callers, which resolve the registration first).
     let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
-    // Two attempts: losing the unique-index insert race re-enters the
-    // existing-row path so the surviving row still gets FULL custody
-    // validation and the caller's desired transition (e.g. a webhook's
-    // pending insert landing just before an admin setup's activate).
-    for attempt in 0..2 {
-        let existing = fluidbox_db::get_github_app_connection_by_installation(
-            &state.pool,
-            scope,
-            installation_id,
-        )
+    // issue #16: one scoped_tx holds the registration + installation advisory
+    // locks (fixed order: registration ABOVE installation) across the whole
+    // read-check-write. The installation lock makes the insert race impossible
+    // (so the old 0..2 retry loop is gone), and the registration lock — the same
+    // one revoke_github_app_registration takes — plus the in-tx registration
+    // re-check below stop a live child landing under a just-revoked registration
+    // (the "import landing just after a registration revoke" skew, design §7.5).
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope)
         .await
         .map_err(|e| format!("connection lookup failed: {e}"))?;
-        if let Some(row) = existing {
-            if row.status == "revoked" {
-                return Err(
-                    "this installation was revoked in fluidbox — revive it from the dashboard (approve), or uninstall and reinstall on GitHub".into(),
-                );
-            }
-            if row.registration_id != Some(reg.id) {
-                return Err(
-                    "this installation is already connected through another fluidbox connection"
-                        .into(),
-                );
-            }
-            fluidbox_db::refresh_connection_metadata(
-                &state.pool,
-                scope,
-                row.id,
-                &display,
-                &metadata,
-            )
-            .await
-            .map_err(|e| format!("metadata refresh failed: {e}"))?;
-            // Unfiltered reads by design: github_app lifecycle reconciliation is
-            // driven by a verified webhook / registration JWT (no request
-            // principal), and github_app connections are always org-owned — no
-            // owner-visibility filter applies.
-            let updated = if row.status == desired {
-                reconcile_get_connection(state, scope, row.id).await?
-            } else {
-                let from: &[&str] = match desired {
-                    // Discovery never demotes an already-live row.
-                    "pending" => &[],
-                    "suspended" => &["active", "pending", "error"],
-                    _ => &["pending", "suspended", "error"],
-                };
-                if from.is_empty() {
-                    reconcile_get_connection(state, scope, row.id).await?
-                } else {
-                    fluidbox_db::set_connection_status(&state.pool, scope, row.id, desired, from)
-                        .await
-                        .map_err(|e| format!("status transition failed: {e}"))?
-                        .or(reconcile_get_connection(state, scope, row.id).await?)
-                }
-            };
-            if desired == "suspended" {
-                // Suspend/unsuspend reconciliation evicts the cached installation
-                // token but does NOT bump the authorization generation: the
-                // installation id is a positively proven stable identity, so the
-                // logical account is unchanged and in-flight bindings stay valid
-                // (unlike an OAuth reconnect, which may change the account).
-                crate::oauth::invalidate_access(state, row.id).await;
-            }
-            return updated.ok_or_else(|| "connection changed state underneath".into());
+    fluidbox_db::acquire_github_app_registration_lock(&mut tx, reg.id)
+        .await
+        .map_err(|e| format!("registration lock failed: {e}"))?;
+    fluidbox_db::acquire_installation_lock(&mut tx, reg.tenant_id, installation_id)
+        .await
+        .map_err(|e| format!("installation lock failed: {e}"))?;
+
+    // Re-read the registration status THROUGH the locked tx: a revoke that
+    // committed before we took the registration lock is now visible, so refuse
+    // rather than reviving/creating a live child under a revoked registration.
+    let reg_status = fluidbox_db::github_app_registration_status_in_tx(&mut *tx, scope, reg.id)
+        .await
+        .map_err(|e| format!("registration lookup failed: {e}"))?;
+    if matches!(reg_status.as_deref(), Some("revoked") | None) {
+        return Err(
+            "this GitHub App registration was revoked in fluidbox — reconnect it from the dashboard".into(),
+        );
+    }
+
+    // Unfiltered reads by design: github_app lifecycle reconciliation is driven
+    // by a verified webhook / registration JWT (no request principal), and
+    // github_app connections are always org-owned — no owner-visibility filter.
+    let existing = fluidbox_db::get_github_app_connection_by_installation_in_tx(
+        &mut *tx,
+        scope,
+        installation_id,
+    )
+    .await
+    .map_err(|e| format!("connection lookup failed: {e}"))?;
+    let (result_row, evict_conn): (IntegrationConnectionRow, Option<Uuid>) = if let Some(row) =
+        existing
+    {
+        if row.status == "revoked" {
+            return Err(
+                "this installation was revoked in fluidbox — revive it from the dashboard (approve), or uninstall and reinstall on GitHub".into(),
+            );
         }
-        // The never-existed check rides INSIDE the insert statement, so a
-        // fresh row can never land just behind a concurrent revoke (F‑6:
-        // revoked rows revive only via approve). None ⇒ some row appeared
-        // (any status) — loop back through the existing-row path above.
-        match fluidbox_db::create_github_app_connection_if_absent(
-            &state.pool,
+        if row.registration_id != Some(reg.id) {
+            return Err(
+                "this installation is already connected through another fluidbox connection".into(),
+            );
+        }
+        fluidbox_db::refresh_connection_metadata_in_tx(
+            &mut *tx, scope, row.id, &display, &metadata,
+        )
+        .await
+        .map_err(|e| format!("metadata refresh failed: {e}"))?;
+        let updated = if row.status == desired {
+            fluidbox_db::get_connection(&mut *tx, scope, row.id)
+                .await
+                .map_err(|e| format!("connection lookup failed: {e}"))?
+        } else {
+            let from: &[&str] = match desired {
+                // Discovery never demotes an already-live row.
+                "pending" => &[],
+                "suspended" => &["active", "pending", "error"],
+                _ => &["pending", "suspended", "error"],
+            };
+            if from.is_empty() {
+                fluidbox_db::get_connection(&mut *tx, scope, row.id)
+                    .await
+                    .map_err(|e| format!("connection lookup failed: {e}"))?
+            } else {
+                match fluidbox_db::set_connection_status_in_tx(
+                    &mut *tx, scope, row.id, desired, from,
+                )
+                .await
+                .map_err(|e| format!("status transition failed: {e}"))?
+                {
+                    Some(r) => Some(r),
+                    None => fluidbox_db::get_connection(&mut *tx, scope, row.id)
+                        .await
+                        .map_err(|e| format!("connection lookup failed: {e}"))?,
+                }
+            }
+        };
+        let updated = updated.ok_or_else(|| "connection changed state underneath".to_string())?;
+        // Suspend/unsuspend reconciliation evicts the cached installation token
+        // but does NOT bump the authorization generation: the installation id is
+        // a positively proven stable identity, so the logical account is
+        // unchanged and in-flight bindings stay valid (unlike an OAuth reconnect,
+        // which may change the account). Evicted AFTER commit, below.
+        let evict = if desired == "suspended" {
+            Some(row.id)
+        } else {
+            None
+        };
+        (updated, evict)
+    } else {
+        // No row and we hold the installation lock, so the insert cannot race a
+        // concurrent import; it returns the new row directly.
+        let created = fluidbox_db::create_github_app_connection_if_absent_in_tx(
+            &mut *tx,
             scope,
             installation_id,
             &display,
@@ -494,15 +504,17 @@ async fn apply_verified_installation(
             reg.id,
         )
         .await
-        {
-            Ok(Some(row)) => return Ok(row),
-            Ok(None) if attempt == 0 => continue,
-            Ok(None) => {}
-            Err(sqlx::Error::Database(e)) if e.is_unique_violation() && attempt == 0 => continue,
-            Err(e) => return Err(format!("connection create failed: {e}")),
-        }
+        .map_err(|e| format!("connection create failed: {e}"))?
+        .ok_or_else(|| "connection race did not settle — retry".to_string())?;
+        (created, None)
+    };
+    tx.commit()
+        .await
+        .map_err(|e| format!("connection commit failed: {e}"))?;
+    if let Some(id) = evict_conn {
+        crate::oauth::invalidate_access(state, id).await;
     }
-    Err("connection race did not settle — retry".into())
+    Ok(result_row)
 }
 
 // ─── Admin API ────────────────────────────────────────────────────────────
@@ -1361,6 +1373,28 @@ pub async fn app_ingress(
     }
 }
 
+/// A guarded status CAS for the webhook lifecycle handler, taken UNDER the
+/// (tenant, installation) advisory lock (issue #16) so it serializes against a
+/// concurrent import/approve on the same installation. The top-of-handler read
+/// stays advisory; this guarded CAS (its `allowed_from` set) is the authority,
+/// and the lock is what stops it interleaving with apply/approve's read+CAS.
+async fn locked_lifecycle_cas(
+    state: &AppState,
+    scope: fluidbox_db::TenantScope,
+    tenant: Uuid,
+    installation_id: &str,
+    id: Uuid,
+    status: &str,
+    allowed_from: &[&str],
+) -> sqlx::Result<Option<IntegrationConnectionRow>> {
+    let mut tx = fluidbox_db::scoped_tx(&state.pool, scope).await?;
+    fluidbox_db::acquire_installation_lock(&mut tx, tenant, installation_id).await?;
+    let out =
+        fluidbox_db::set_connection_status_in_tx(&mut *tx, scope, id, status, allowed_from).await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
 async fn handle_lifecycle(
     state: &AppState,
     reg: &GithubAppRegistrationRow,
@@ -1432,9 +1466,11 @@ async fn handle_lifecycle(
         }
         L::Deleted { .. } => match owned {
             Some(c) => {
-                let done = match fluidbox_db::set_connection_status(
-                    &state.pool,
+                let done = match locked_lifecycle_cas(
+                    state,
                     scope,
+                    reg.tenant_id,
+                    &iid_str,
                     c.id,
                     "revoked",
                     &["active", "pending", "suspended", "error"],
@@ -1467,9 +1503,11 @@ async fn handle_lifecycle(
                         } else {
                             ("active", &["suspended"])
                         };
-                        let changed = match fluidbox_db::set_connection_status(
-                            &state.pool,
+                        let changed = match locked_lifecycle_cas(
+                            state,
                             scope,
+                            reg.tenant_id,
+                            &iid_str,
                             c.id,
                             to,
                             from,
@@ -1486,9 +1524,11 @@ async fn handle_lifecycle(
                     }
                     Ok(None) => {
                         // Installation vanished under us — treat as deleted.
-                        if let Err(e) = fluidbox_db::set_connection_status(
-                            &state.pool,
+                        if let Err(e) = locked_lifecycle_cas(
+                            state,
                             scope,
+                            reg.tenant_id,
+                            &iid_str,
                             c.id,
                             "revoked",
                             &["active", "pending", "suspended", "error"],
@@ -1503,9 +1543,11 @@ async fn handle_lifecycle(
                     Err(e) => {
                         if action == "suspend" {
                             // GitHub unreachable: fail toward closed.
-                            if let Err(db) = fluidbox_db::set_connection_status(
-                                &state.pool,
+                            if let Err(db) = locked_lifecycle_cas(
+                                state,
                                 scope,
+                                reg.tenant_id,
+                                &iid_str,
                                 c.id,
                                 "suspended",
                                 &["active"],
