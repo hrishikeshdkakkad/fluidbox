@@ -486,9 +486,38 @@ pub async fn refuse_parked_grant(
             state.metrics.network_grants.inc("denied");
             Some(row)
         }
-        // Already resolved by another replica, or already revoked. Nothing to
-        // ledger — but still wind the session down.
-        Ok(None) => None,
+        // We lost the CAS. That is NOT one situation, and treating it as one is
+        // a bug in both directions:
+        //
+        //   * `denied`/`revoked` — the grant is resolved away, nothing will ever
+        //     release this run, so it must be wound down or it is stranded.
+        //   * `active` — ANOTHER REPLICA ACTIVATED IT and the run is legitimately
+        //     proceeding. Winding it down here would durably fail a run that was
+        //     authorized, which is exactly what a naive "always finalize" does
+        //     under the supported multi-replica topology.
+        //
+        // So re-read and decide. A read failure leaves it alone: not knowing the
+        // state is different from knowing it is resolved.
+        Ok(None) => {
+            match fluidbox_db::network_grants::get_network_grant(&state.pool, scope, session_id)
+                .await
+            {
+                Ok(Some(g)) if g.status == "active" => {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        "another replica activated this grant; leaving the run alone"
+                    );
+                    return;
+                }
+                // Resolved away (or gone entirely — no authority either way):
+                // fall through and wind the session down.
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("re-reading the grant for {session_id} failed: {e}");
+                    return;
+                }
+            }
+        }
         Err(e) => {
             // A failed READ is different: we do not know the grant's state, so
             // leave the session alone and let the next tick retry rather than
