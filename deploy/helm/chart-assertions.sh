@@ -100,6 +100,18 @@ if render -f test-values/assert.yaml --set-string sandbox.nodeSelector.pool="a=b
 fi
 
 # ---------------------------------------------------------------------------
+# The controlled resolver must keep NET_BIND_SERVICE. Without it the container
+# cannot even exec (file capabilities + NO_NEW_PRIVS), so every granted run
+# loses DNS and `helm upgrade --wait` hangs. A render assertion is the only
+# cheap guard: the kind job's runtime does not reproduce the exec failure.
+dns="$(render --set networkGrants.enabled=true \
+  --set networkGrants.dnsClusterIP=172.20.0.53 -s templates/netgrant.yaml)"
+grep -qF 'add: ["NET_BIND_SERVICE"]' <<<"$dns" \
+  || fail "sandbox-dns lost NET_BIND_SERVICE — the resolver will fail to exec"
+grep -qF 'allowPrivilegeEscalation: false' <<<"$dns" \
+  || fail "sandbox-dns must keep allowPrivilegeEscalation: false"
+
+# ---------------------------------------------------------------------------
 # Every preset must lint and render.
 helm lint "$CHART" >/dev/null || fail "helm lint (default values)"
 for preset in "$CHART"/values/*.yaml; do
