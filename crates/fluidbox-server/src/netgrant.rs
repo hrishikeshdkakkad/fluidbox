@@ -259,7 +259,20 @@ pub fn reverify_before_release(
                 // authorized. A narrower one is a refusal, not a downgrade:
                 // silently running with less network than the approver saw is
                 // the failure mode nobody can debug.
+                // Time is an authority dimension too. A policy that cut
+                // `max_grant_secs` while the run was parked permits LESS than
+                // was authorized, even when the mode and targets are identical
+                // — activating the original grant would hand it the full
+                // original lifetime under a policy that no longer allows it.
+                let now_shorter = match (now_grant.expires_at, grant.expires_at) {
+                    (Some(now_exp), Some(frozen_exp)) => now_exp < frozen_exp,
+                    // A policy that would no longer bound the grant at all is
+                    // not narrower; a frozen grant without an expiry is
+                    // malformed and `is_expired` already refused it above.
+                    _ => false,
+                };
                 if now_grant.mode < grant.mode
+                    || now_shorter
                     || !grant.targets.iter().all(|t| {
                         now_grant
                             .targets
@@ -421,6 +434,27 @@ pub async fn refuse_parked_grant(
     // terminal path, so the audit trail and result delivery behave like every
     // other refused run.
     crate::orchestrator::finalize_forced(state, session_id, "failed", reason).await;
+}
+
+/// Tear down the DATAPATH objects for a run's grant, then mark the row revoked.
+///
+/// Order matters and it is the opposite of what the DB-first version did:
+/// containment first, bookkeeping second. A row that says `revoked` while the
+/// CiliumNetworkPolicy still exists is not revocation — the run keeps its
+/// reach. A provider failure therefore does NOT mark the row revoked, so the
+/// sweep retries rather than recording a teardown that did not happen.
+pub async fn revoke_enforcement(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: Uuid,
+    reason: &str,
+) -> bool {
+    if let Err(e) = state.provider.revoke_network_policy(session_id).await {
+        tracing::warn!("tearing down the network policy for {session_id} failed: {e}");
+        return false;
+    }
+    revoke(state, scope, session_id, reason).await;
+    true
 }
 
 /// Surrender a run's network authority. Idempotent by CAS, so it is safe from
@@ -699,6 +733,38 @@ mod tests {
             reverify_before_release(&future, &policy, &approved_request(), &ctx()),
             Err(ReleaseRefusal::UnknownSchema)
         );
+    }
+
+    /// A policy that cut the grant DURATION while the run was parked permits
+    /// less than was authorized, even with an identical mode and targets.
+    /// Release used to compare only mode and targets, so the original grant —
+    /// with its full original lifetime — was activated under a policy that no
+    /// longer allowed it.
+    #[test]
+    fn a_policy_that_shortens_the_grant_refuses_release() {
+        let policy = policy_with(NetworkPolicy {
+            require_approval: true,
+            max_grant_secs: Some(7200),
+            ..open_policy().network
+        });
+        let resolved = resolve_for_run(&approved_request(), &policy, &ctx()).unwrap();
+        let row = pending_row(&resolved.grant);
+        // Same mode, same targets, far shorter ceiling.
+        let shortened = policy_with(NetworkPolicy {
+            max_grant_secs: Some(300),
+            ..policy.network.clone()
+        });
+        assert!(matches!(
+            reverify_before_release(&row, &shortened, &approved_request(), &ctx()),
+            Err(ReleaseRefusal::PolicyMoved { .. })
+        ));
+        // FALSE-GREEN GUARD: a policy that LENGTHENS it still releases, so this
+        // cannot pass by refusing every duration change.
+        let lengthened = policy_with(NetworkPolicy {
+            max_grant_secs: Some(99_999),
+            ..policy.network.clone()
+        });
+        assert!(reverify_before_release(&row, &lengthened, &approved_request(), &ctx()).is_ok());
     }
 
     #[test]

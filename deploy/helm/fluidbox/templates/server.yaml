@@ -197,6 +197,22 @@ spec:
             - { name: FLUIDBOX_NETWORK_MODE, value: "hardened" }
             - { name: FLUIDBOX_REQUIRE_ENFORCED_NETPOL, value: {{ .Values.netpol.requireEnforced | quote }} }
             - { name: FLUIDBOX_NETPOL_PROBE_IMAGE, value: {{ .Values.netpol.probeImage | quote }} }
+{{- if .Values.networkGrants.enabled }}
+            # The CONTROLLED resolver lives in the RELEASE namespace, which is
+            # not the sandbox namespace — the per-run policy's DNS rule selects
+            # on it, and getting it wrong makes every FQDN grant fail to resolve
+            # while the policy still verifies as Valid.
+            - { name: FLUIDBOX_SANDBOX_DNS_NAMESPACE, value: {{ .Release.Namespace | quote }} }
+            # Sandbox pods are pointed here via `dnsPolicy: None`, whose
+            # `nameservers` MUST be IP addresses — a Service DNS name is not
+            # valid there, and kubelet would reject the pod. So this is a
+            # REQUIRED pinned ClusterIP rather than something the chart guesses:
+            # a wrong or absent value makes every FQDN grant fail to resolve
+            # while the policy still verifies as Valid, which is the failure
+            # mode hardest to diagnose from the outside.
+            - name: FLUIDBOX_SANDBOX_DNS_IP
+              value: {{ required "networkGrants.dnsClusterIP is required when networkGrants.enabled=true — pick a free address in your Service CIDR (e.g. kubectl get svc kube-dns -n kube-system -o jsonpath='{.spec.clusterIP}' shows the shape); sandbox pods use dnsPolicy: None, whose nameservers must be IPs" .Values.networkGrants.dnsClusterIP | quote }}
+{{- end }}
             - { name: FLUIDBOX_NETPOL_WAIT_SECS, value: {{ .Values.netpol.waitSeconds | quote }} }
             # Boot-resolve the internal Service ClusterIP → the runner's
             # control URL (no DNS under zeroEgress).

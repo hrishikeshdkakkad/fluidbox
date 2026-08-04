@@ -228,7 +228,11 @@ spec:
   selectors:
     - podSelector:
         matchLabels:
-          io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+          # The SANDBOX namespace — sandboxes do not run in the release
+          # namespace, so selecting that one matches nothing and the gateway
+          # silently does not apply. (Attribution and stable egress IPs break;
+          # containment does not, because the gateway is never the boundary.)
+          io.kubernetes.pod.namespace: {{ .Values.sandbox.namespace | default (printf "%s-sandboxes" .Release.Namespace) }}
           {{ "fluidbox.dev/managed" }}: "true"
   destinationCIDRs: ["0.0.0.0/0"]
   excludedCIDRs:

@@ -78,13 +78,6 @@ pub struct KubernetesProvider {
 }
 
 impl KubernetesProvider {
-    /// Connect using the ambient kube config (in-cluster ServiceAccount, or
-    /// `~/.kube/config` for local dev). Fails if no cluster is reachable.
-    pub async fn connect(cfg: K8sConfig, data_dir: PathBuf) -> anyhow::Result<Self> {
-        let client = Client::try_default().await?;
-        Ok(Self::with_client(client, cfg, data_dir))
-    }
-
     /// Connect and RESOLVE the network enforcer.
     ///
     /// `auto` asks the API server whether `cilium.io/v2` is served — not whether
@@ -92,7 +85,17 @@ impl KubernetesProvider {
     /// is whether the resources the enforcer writes are real. A cluster that
     /// answers no is offline-only and says so at boot, rather than admitting a
     /// grant and failing at provision.
-    pub async fn connect_with_enforcer(
+    /// Connect and RESOLVE the network enforcer.
+    ///
+    /// This is the ONLY constructor that reaches a cluster, and it REQUIRES an
+    /// enforcer decision. There used to be a plain `connect()` beside it that
+    /// defaulted to no enforcer, and production called that one — so every
+    /// Kubernetes egress grant was refused as `unenforceable` while the
+    /// enforcer sat unreachable. Nothing caught it: no test asserts what boot
+    /// wires, and the datapath validation drives the enforcer directly. Making
+    /// the decision a required PARAMETER is the fix that cannot silently
+    /// regress; a reviewer would have to actively pass `None` to break it.
+    pub async fn connect(
         cfg: K8sConfig,
         data_dir: PathBuf,
         mode: NetworkEnforcerMode,
@@ -730,6 +733,10 @@ impl ExecutionProvider for KubernetesProvider {
 
     fn workspace_transport(&self) -> WorkspaceTransport {
         WorkspaceTransport::Archive
+    }
+
+    async fn revoke_network_policy(&self, run_id: Uuid) -> Result<(), ProviderError> {
+        self.revoke_run_policy(run_id).await
     }
 
     fn network_enforcer(&self) -> &dyn fluidbox_core::traits::NetworkPolicyProvider {

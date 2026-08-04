@@ -158,6 +158,13 @@ impl PortSpec {
     pub fn contains_range(&self, other: &PortSpec) -> bool {
         self.from <= other.from && other.to <= self.to
     }
+
+    /// Do these ranges share ANY port? Distinct from [`Self::contains_range`],
+    /// and the distinction is a security boundary: containment answers "is this
+    /// wholly permitted", overlap answers "does this touch the forbidden".
+    pub fn intersects(&self, other: &PortSpec) -> bool {
+        self.from <= other.to && other.from <= self.to
+    }
 }
 
 // ─── FQDN patterns ────────────────────────────────────────────────────────
@@ -254,6 +261,17 @@ impl FqdnPattern {
             (Self::Wildcard { suffix: a }, Self::Wildcard { suffix: b }) => a == b,
             (Self::Exact { .. }, Self::Wildcard { .. }) => false,
         }
+    }
+
+    /// Do these patterns match any name in common?
+    ///
+    /// For DENY evaluation, where the question is "does the request touch
+    /// anything forbidden", not "is the request wholly forbidden". A wildcard
+    /// matches exactly one label, so two DIFFERENT wildcards never intersect
+    /// (`*.a.com` matches `x.a.com`; `*.b.a.com` matches `x.b.a.com`; no name
+    /// is in both).
+    pub fn intersects(&self, other: &FqdnPattern) -> bool {
+        self.covers(other) || other.covers(self)
     }
 
     /// Display form, and the exact string that lowers into a Cilium selector.
@@ -373,6 +391,40 @@ impl TargetRule {
             p.validate()?;
         }
         Ok(())
+    }
+
+    /// Does this rule share ANY (destination, port) with `other`?
+    ///
+    /// **This is what a DENY must be evaluated with, and using `covers` there
+    /// was a real bypass.** `covers` is set containment, so a deny of
+    /// `*.example.com TCP/443-444` versus a request for
+    /// `api.example.com TCP/80-443` compared false in BOTH directions — the
+    /// deny's selector is wider but its ports are narrower, the request's ports
+    /// are wider but its selector is narrower, so neither contains the other —
+    /// and the grant was issued INCLUDING the explicitly denied port 443.
+    /// Overlap is the correct relation: a request that touches any forbidden
+    /// (destination, port) is forbidden.
+    ///
+    /// DNS and CIDR rules never intersect, matching the rest of the model: they
+    /// are different selectors in the datapath, and grant-time code cannot know
+    /// what a name will resolve to. A CIDR deny is enforced by the datapath
+    /// wall, not here.
+    pub fn intersects(&self, other: &TargetRule) -> bool {
+        if self.protocol() != other.protocol() {
+            return false;
+        }
+        let selectors_meet = match (self, other) {
+            (Self::Dns { pattern: a, .. }, Self::Dns { pattern: b, .. }) => a.intersects(b),
+            (Self::Cidr { cidr: a, .. }, Self::Cidr { cidr: b, .. }) => {
+                a.contains(b.addr) || b.contains(a.addr)
+            }
+            _ => false,
+        };
+        selectors_meet
+            && self
+                .ports()
+                .iter()
+                .any(|p| other.ports().iter().any(|q| p.intersects(q)))
     }
 
     /// Does this rule authorize everything `other` authorizes? Used BOTH for
@@ -855,7 +907,10 @@ pub fn resolve_network_grant(
 
     // ── 2. explicit policy deny ──────────────────────────────────────────
     for t in &request.targets {
-        if policy.deny.iter().any(|d| d.covers(t) || t.covers(d)) {
+        // OVERLAP, not containment — see `TargetRule::intersects`. A partially
+        // overlapping deny used to compare false in both directions and let the
+        // forbidden ports through.
+        if policy.deny.iter().any(|d| d.intersects(t)) {
             return GrantResolution::Denied(DenialReason::PolicyDeny {
                 target: t.describe(),
             });
@@ -1497,6 +1552,136 @@ mod tests {
         // CIDR containment is prefix-wise.
         assert!(cidr("10.0.0.0/8", 443).covers(&cidr("10.1.2.0/24", 443)));
         assert!(!cidr("10.1.2.0/24", 443).covers(&cidr("10.0.0.0/8", 443)));
+    }
+
+    /// The bypass an adversarial review found: an explicit policy deny that
+    /// only PARTIALLY overlaps the request used to compare false in both
+    /// directions and let the forbidden ports through.
+    ///
+    /// The original `deny.covers(req) || req.covers(deny)` test fails here
+    /// because neither contains the other — the deny's selector is wider but
+    /// its ports narrower, the request's ports wider but its selector
+    /// narrower. Overlap is the relation a deny needs.
+    #[test]
+    fn a_partially_overlapping_deny_still_denies() {
+        let pol = NetworkPolicy {
+            max_mode: NetworkGrantMode::Approved,
+            allow: vec![TargetRule::dns(
+                FqdnPattern::Wildcard {
+                    suffix: "example.com".into(),
+                },
+                vec![PortSpec::range(1, 65535)],
+                L4Protocol::Tcp,
+            )],
+            deny: vec![TargetRule::dns(
+                FqdnPattern::Wildcard {
+                    suffix: "example.com".into(),
+                },
+                vec![PortSpec::range(443, 444)],
+                L4Protocol::Tcp,
+            )],
+            ..Default::default()
+        };
+        // Requests 80-443: catalogued, mode-legal, and TOUCHING the denied 443.
+        let req = NetworkRequest {
+            mode: NetworkGrantMode::Approved,
+            targets: vec![TargetRule::dns(
+                FqdnPattern::Exact {
+                    name: "api.example.com".into(),
+                },
+                vec![PortSpec::range(80, 443)],
+                L4Protocol::Tcp,
+            )],
+            duration_secs: None,
+        };
+        match resolve_network_grant(&req, &pol, &ctx()) {
+            GrantResolution::Denied(DenialReason::PolicyDeny { .. }) => {}
+            other => panic!("a request touching an explicit deny must be refused, got {other:?}"),
+        }
+
+        // FALSE-GREEN GUARD: a request that genuinely misses the denied range
+        // must still be granted, so this cannot pass by denying everything.
+        let clear = NetworkRequest {
+            targets: vec![TargetRule::dns(
+                FqdnPattern::Exact {
+                    name: "api.example.com".into(),
+                },
+                vec![PortSpec::range(80, 442)],
+                L4Protocol::Tcp,
+            )],
+            ..req.clone()
+        };
+        assert!(
+            matches!(
+                resolve_network_grant(&clear, &pol, &ctx()),
+                GrantResolution::Active(_)
+            ),
+            "a request that does not touch the deny must still be granted"
+        );
+    }
+
+    #[test]
+    fn overlap_and_containment_are_different_relations() {
+        let a = TargetRule::dns(
+            FqdnPattern::Wildcard {
+                suffix: "example.com".into(),
+            },
+            vec![PortSpec::range(443, 444)],
+            L4Protocol::Tcp,
+        );
+        let b = TargetRule::dns(
+            FqdnPattern::Exact {
+                name: "api.example.com".into(),
+            },
+            vec![PortSpec::range(80, 443)],
+            L4Protocol::Tcp,
+        );
+        // Neither contains the other…
+        assert!(!a.covers(&b) && !b.covers(&a));
+        // …but they share api.example.com:443, and overlap is symmetric.
+        assert!(a.intersects(&b) && b.intersects(&a));
+
+        // Disjoint ports do not overlap.
+        let c = TargetRule::dns(
+            FqdnPattern::Exact {
+                name: "api.example.com".into(),
+            },
+            vec![PortSpec::range(80, 442)],
+            L4Protocol::Tcp,
+        );
+        assert!(!a.intersects(&c));
+        // A different protocol never overlaps.
+        let udp = TargetRule::dns(
+            FqdnPattern::Exact {
+                name: "api.example.com".into(),
+            },
+            vec![PortSpec::single(443)],
+            L4Protocol::Udp,
+        );
+        assert!(!a.intersects(&udp));
+        // Two DIFFERENT wildcards match no name in common (a wildcard is
+        // exactly one label), so they must not be treated as overlapping.
+        let w1 = TargetRule::dns(
+            FqdnPattern::Wildcard {
+                suffix: "a.com".into(),
+            },
+            vec![PortSpec::single(443)],
+            L4Protocol::Tcp,
+        );
+        let w2 = TargetRule::dns(
+            FqdnPattern::Wildcard {
+                suffix: "b.a.com".into(),
+            },
+            vec![PortSpec::single(443)],
+            L4Protocol::Tcp,
+        );
+        assert!(!w1.intersects(&w2));
+        // CIDR overlap is real containment either way.
+        assert!(cidr("10.0.0.0/8", 443).intersects(&cidr("10.1.0.0/16", 443)));
+        assert!(cidr("10.1.0.0/16", 443).intersects(&cidr("10.0.0.0/8", 443)));
+        assert!(!cidr("10.0.0.0/8", 443).intersects(&cidr("11.0.0.0/8", 443)));
+        // DNS and CIDR are different selectors and never intersect.
+        assert!(!a.intersects(&cidr("93.184.216.34/32", 443)));
     }
 
     #[test]
