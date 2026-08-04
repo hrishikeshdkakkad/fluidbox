@@ -436,6 +436,16 @@ fn validate_model(harness_id: &str, model: &str) -> Result<(), ApiError> {
     )))
 }
 
+/// The deployment's RESOLVED network posture, asked of the provider rather
+/// than read from config — config says what was requested, the provider says
+/// what is true.
+fn harnesses_network_block(enforcer: &dyn fluidbox_core::traits::NetworkPolicyProvider) -> Value {
+    json!({
+        "enforcer": enforcer.enforcer_name(),
+        "supports_egress_grants": enforcer.supports_egress_grants(),
+    })
+}
+
 /// `GET /v1/harnesses` — the supported harness + model catalog. The SINGLE
 /// source of truth for the dashboard's harness/model pickers (the frontend no
 /// longer hardcodes model lists).
@@ -463,7 +473,10 @@ pub async fn list_harnesses(
             })
         })
         .collect();
-    Ok(Json(json!({ "harnesses": harnesses })))
+    Ok(Json(json!({
+        "harnesses": harnesses,
+        "network": harnesses_network_block(state.provider.network_enforcer()),
+    })))
 }
 
 /// add_revision inheritance for image/model: explicit wins; on a harness
@@ -1844,6 +1857,15 @@ pub async fn get_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harnesses_payload_reports_the_resolved_enforcer_not_the_config() {
+        // The value must come from the PROVIDER. Echoing config is the bug that
+        // let FLUIDBOX_NETWORK_ENFORCER=cilium sit on a cluster with no enforcer.
+        let body = harnesses_network_block(&fluidbox_core::traits::NoNetworkEnforcer);
+        assert_eq!(body["supports_egress_grants"], serde_json::json!(false));
+        assert_eq!(body["enforcer"], serde_json::json!("none"));
+    }
 
     /// `LocalCopy` is host-filesystem read access with no root and no tenant
     /// meaning, and `POST /v1/sessions` admits ANY authenticated principal — so
