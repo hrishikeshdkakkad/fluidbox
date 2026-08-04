@@ -11,11 +11,13 @@ import {
   ConnectionRequirement,
   connectionMatchesConnector,
   isToolConnection,
+  NetworkRequest,
   ownerBadge,
   PolicySummary,
   Revision,
   TriggerSubscription,
 } from "../lib/api";
+import { MODE_LABEL } from "../lib/network";
 import { AddServerWizard } from "../app/capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
 import { CopyBlock, TemplateChips } from "./AutomationContract";
@@ -151,6 +153,12 @@ export function RunComposer({
   const [selectedAgentName, setSelectedAgentName] = useState("");
   const [revisionLoading, setRevisionLoading] = useState(false);
   const [revisionTouched, setRevisionTouched] = useState(false);
+  // A run may only NARROW what the agent declared, so the sole choice this
+  // control offers is inherit-or-offline. `declaredNetwork` is the selected
+  // agent's latest-revision declaration, captured from the same fetch that
+  // shreds the revision into the fields above (see the revision effect).
+  const [offlineOnly, setOfflineOnly] = useState(false);
+  const [declaredNetwork, setDeclaredNetwork] = useState<NetworkRequest | null>(null);
 
   const [newAgentName, setNewAgentName] = useState("");
   const [description, setDescription] = useState("");
@@ -393,6 +401,7 @@ export function RunComposer({
             setRequirements(latest.connection_requirements ?? []);
             setBindings({}); // re-resolve automatically for the new agent
             setAgentPolicyId(latest.policy_id);
+            setDeclaredNetwork(latest.network ?? null);
           }
           setRevisionTouched(false);
         })
@@ -694,6 +703,8 @@ export function RunComposer({
           agent: runAgentName,
           task: task.trim(),
           autonomous,
+          // Narrow-only: the sole network override this UI can send is offline.
+          ...(offlineOnly ? { network: { mode: "offline", targets: [], duration_secs: null } } : {}),
         };
         if (Object.keys(explicit).length > 0) body.bindings = explicit;
         await apiPost("/sessions", body);
@@ -1542,6 +1553,41 @@ export function RunComposer({
                 </details>
               )}
             </>
+          </ComposerSection>
+        )}
+
+        {!agentOnly && mode === "once" && (
+          <ComposerSection index={5} title="Network access" hint="Where this run may reach.">
+            {!declaredNetwork || declaredNetwork.mode === "offline" ? (
+              <p className="helper">
+                This agent declares no network access, so the run is offline. Add a declaration on
+                the agent to change that.
+              </p>
+            ) : (
+              <>
+                <label className="field">
+                  <input
+                    type="radio"
+                    name="run-network-access"
+                    checked={!offlineOnly}
+                    onChange={() => setOfflineOnly(false)}
+                  />
+                  <span>Inherit from agent · {MODE_LABEL[declaredNetwork.mode]}</span>
+                </label>
+                <label className="field">
+                  <input
+                    type="radio"
+                    name="run-network-access"
+                    checked={offlineOnly}
+                    onChange={() => setOfflineOnly(true)}
+                  />
+                  <span>Offline only (this run)</span>
+                </label>
+                <p className="helper">
+                  A run may narrow what the agent declared, never widen it.
+                </p>
+              </>
+            )}
           </ComposerSection>
         )}
         </div>
