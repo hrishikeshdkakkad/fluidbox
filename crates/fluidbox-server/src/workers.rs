@@ -125,6 +125,7 @@ pub fn spawn_all(state: AppState) {
     tokio::spawn(budget_sweeper(state.clone()));
     tokio::spawn(approval_expiry(state.clone()));
     tokio::spawn(network_grant_gate(state.clone()));
+    tokio::spawn(network_grant_expiry(state.clone()));
     // Cross-replica approval wakeups (Gap 13): every replica wakes its OWN
     // waiters off the shared NOTIFY channel.
     spawn_approval_wakeups(state.clone());
@@ -757,6 +758,46 @@ async fn approval_expiry(state: AppState) {
                 Ok(Some(_)) => state.approvals.wake(a.id).await,
                 Err(e) => tracing::warn!("approval {} expiry failed: {e}", a.id),
             }
+        }
+    }
+}
+
+/// Revoke grants that have outlived their absolute expiry.
+///
+/// Expiry used to be checked ONCE, before provisioning, and never again — so a
+/// grant that lapsed mid-run kept its CiliumNetworkPolicy and its reach. The
+/// run's own wall clock does not cover this: that clock starts at `started_at`,
+/// while the grant's expiry is absolute from creation, so provisioning time and
+/// any authorization pause are spent out of the grant's life but not the run's.
+/// An approval pause makes the gap arbitrarily large.
+///
+/// This is the enforcement half of `expires_at`. It tears down the DATAPATH
+/// first and only then marks the row, so a provider failure leaves the row
+/// active and the sweep retries — a row saying `revoked` while the policy still
+/// exists would be a lie in the direction that matters.
+///
+/// The run itself is left alone: losing network is not the same as losing the
+/// right to finish, and the agent's own error handling gets to see it.
+async fn network_grant_expiry(state: AppState) {
+    let mut tick = periodic(Duration::from_secs(15));
+    loop {
+        tick.tick().await;
+        let due = match fluidbox_db::system_worker::expired_active_grants(&state.pool, SWEEP_BATCH)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("expired network grant scan failed: {e}");
+                continue;
+            }
+        };
+        for g in due {
+            let scope = TenantScope::assume(g.tenant_id);
+            tracing::info!(
+                session_id = %g.session_id, mode = %g.mode,
+                "network grant expired; tearing down its enforcement"
+            );
+            crate::netgrant::revoke_enforcement(&state, scope, g.session_id, "grant expired").await;
         }
     }
 }

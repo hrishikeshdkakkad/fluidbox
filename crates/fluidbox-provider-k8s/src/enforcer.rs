@@ -209,9 +209,33 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
 
         match self.cnps.create(&Default::default(), &obj).await {
             Ok(_) => Ok(()),
-            // Already there: `prepare` is idempotent so a retried provision does
-            // not fail on its own previous success.
-            Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+            // Already there. `prepare` must stay idempotent — a retried
+            // provision cannot fail on its own previous success — but it must
+            // NOT blindly adopt whatever object holds the name: a stale or
+            // foreign policy under the deterministic session name would be
+            // accepted, and `verify` only checks that the NAMED policy is
+            // Valid, so a broader one would sail through. Compare the consent
+            // digest; anything else is refused rather than trusted.
+            Err(kube::Error::Api(e)) if e.code == 409 => {
+                let existing = self.cnps.get(&name).await.map_err(|e| {
+                    NetworkPolicyError::Write(format!("re-reading the existing policy failed: {e}"))
+                })?;
+                let same = existing
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("fluidbox.dev/grant-digest"))
+                    .map(|d| d == &granted.grant_digest)
+                    .unwrap_or(false);
+                if same {
+                    Ok(())
+                } else {
+                    Err(NetworkPolicyError::Write(format!(
+                        "a different network policy already exists under the name for run {}                          (its grant digest does not match this run's) — refusing to adopt it",
+                        granted.run_id
+                    )))
+                }
+            }
             Err(e) => Err(NetworkPolicyError::Write(format!(
                 "creating the network policy for run {} failed: {e}",
                 granted.run_id

@@ -262,7 +262,7 @@ async fn transition_inner(
                 // Same reasoning for network authority: surrender it the moment
                 // the run is over. Idempotent by CAS, so the reconciler's retry
                 // below and the abandon paths can all call it safely.
-                crate::netgrant::revoke(state, scope, id, "run terminal").await;
+                crate::netgrant::revoke_enforcement(state, scope, id, "run terminal").await;
                 // Publication is decoupled: enqueue rows; the delivery worker
                 // owns retries. Fires on terminal entry — reachable ONLY from
                 // `finalizing`, so the diff artifact is already stored when
@@ -1048,7 +1048,7 @@ async fn finish_terminal_cleanup(
         tracing::warn!("terminal reconcile {id}: token revoke failed: {e}");
         return;
     }
-    crate::netgrant::revoke(state, scope, id, "terminal reconcile").await;
+    crate::netgrant::revoke_enforcement(state, scope, id, "terminal reconcile").await;
     // Delivery enqueue is owed only when the RunSpec names destinations.
     // enqueue_for_session is per-destination idempotent and returns true only
     // when EVERY destination has a row — partial success (destination A
