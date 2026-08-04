@@ -21,14 +21,15 @@
 # minting passwords. `--with-drill-user` exists only for an internal drill org.
 #
 #   scripts/cloud/auth0-idp-setup.sh <org-slug> [--with-drill-user <email>]
-#   scripts/cloud/auth0-idp-setup.sh --promote <org-slug> <email>
+#   scripts/cloud/auth0-idp-setup.sh --promote <org-slug> <email> [membership-id]
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 . scripts/cloud/lib.sh
 
 if [ "${1:-}" = "--promote" ]; then
-  promote_owner "${2:?usage: --promote <org-slug> <email>}" "${3:?usage: --promote <org-slug> <email>}"
+  promote_owner "${2:?usage: --promote <org-slug> <email> [membership-id]}" \
+    "${3:?usage: --promote <org-slug> <email> [membership-id]}" "${4:-}"
   exit 0
 fi
 
