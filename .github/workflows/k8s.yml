@@ -46,7 +46,7 @@ jobs:
     if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - run: deploy/helm/chart-assertions.sh
 
   # kind + Calico (NOT kindnet — kindnet does not enforce NetworkPolicy). The
