@@ -14,6 +14,9 @@ on:
       - "deploy/helm/**"
       - "deploy/workspaced.Dockerfile"
       - ".github/workflows/k8s.yml"
+      - "crates/fluidbox-core/src/network*.rs"
+      - "crates/fluidbox-server/src/netgrant.rs"
+      - "scripts/netgrant-kind-validation.sh"
       # The chart job asserts the appVersion-binding defaults release.yml
       # relies on — run it when the release pipeline changes too.
       - ".github/workflows/release.yml"
@@ -86,6 +89,14 @@ jobs:
         run: |
           kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
           kubectl -n kube-system rollout status ds/calico-node --timeout=240s
+      # The NEGATIVE CONTROL for enforcer detection. A detector that returned
+      # true unconditionally would pass every assertion in the kind-cilium job;
+      # only a cluster that genuinely lacks Cilium can prove it says no. A
+      # deployment here must come out offline-only.
+      - name: enforcer detection must report ABSENT without Cilium
+        run: |
+          kubectl create ns netgrant
+          cargo run --quiet -p fluidbox-provider-k8s --example enforcer_live -- netgrant --expect-absent
       - name: build + load collector + a tiny contract-stub runner
         run: |
           docker build -q -t fluidbox-workspaced:dev -f deploy/workspaced.Dockerfile .

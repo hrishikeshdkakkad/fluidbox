@@ -29,6 +29,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 pub mod config;
+pub mod enforcer;
 pub mod manifest;
 pub mod netgrant;
 pub mod netpol;
@@ -52,13 +53,22 @@ const MAX_DIFF_BYTES: usize = 16 * 1024 * 1024;
 /// before parse_collected's integrity check decides on what arrived.
 const MAX_STREAM_RESUMES: u32 = 4;
 
+/// What the deployment asked for, before detection resolves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkEnforcerMode {
+    None,
+    Cilium,
+    Auto,
+}
+
 pub struct KubernetesProvider {
     pods: Api<Pod>,
     secrets: Api<Secret>,
-    /// `cilium.io/v2` CiliumNetworkPolicy, as a dynamic resource — the CRD has
-    /// no typed Rust binding and pulling one in for four fields would be a
-    /// dependency we would then have to keep in step with Cilium's schema.
-    cnps: Api<kube::api::DynamicObject>,
+    /// The network-grant enforcer, when this deployment has one. `None` means
+    /// offline-only: `ExecutionProvider::network_enforcer` then answers with the
+    /// refusing `NoNetworkEnforcer`, so `create_run` refuses a wider grant at
+    /// creation instead of letting it fail here.
+    enforcer: Option<std::sync::Arc<crate::enforcer::CiliumNetworkEnforcer>>,
     cfg: K8sConfig,
     namespace: String,
     /// The control plane's data dir: pre-launch collection (no pod ever
@@ -68,91 +78,132 @@ pub struct KubernetesProvider {
 }
 
 impl KubernetesProvider {
-    /// Connect using the ambient kube config (in-cluster ServiceAccount, or
-    /// `~/.kube/config` for local dev). Fails if no cluster is reachable.
-    pub async fn connect(cfg: K8sConfig, data_dir: PathBuf) -> anyhow::Result<Self> {
+    /// Connect and RESOLVE the network enforcer.
+    ///
+    /// `auto` asks the API server whether `cilium.io/v2` is served — not whether
+    /// a Helm release or a DaemonSet by some name exists, because what matters
+    /// is whether the resources the enforcer writes are real. A cluster that
+    /// answers no is offline-only and says so at boot, rather than admitting a
+    /// grant and failing at provision.
+    /// Connect and RESOLVE the network enforcer.
+    ///
+    /// This is the ONLY constructor that reaches a cluster, and it REQUIRES an
+    /// enforcer decision. There used to be a plain `connect()` beside it that
+    /// defaulted to no enforcer, and production called that one — so every
+    /// Kubernetes egress grant was refused as `unenforceable` while the
+    /// enforcer sat unreachable. Nothing caught it: no test asserts what boot
+    /// wires, and the datapath validation drives the enforcer directly. Making
+    /// the decision a required PARAMETER is the fix that cannot silently
+    /// regress; a reviewer would have to actively pass `None` to break it.
+    pub async fn connect(
+        cfg: K8sConfig,
+        data_dir: PathBuf,
+        mode: NetworkEnforcerMode,
+        verify_timeout_secs: u64,
+    ) -> anyhow::Result<Self> {
         let client = Client::try_default().await?;
-        Ok(Self::with_client(client, cfg, data_dir))
+        let mut me = Self::with_client(client.clone(), cfg, data_dir);
+        let wanted = match mode {
+            NetworkEnforcerMode::None => false,
+            NetworkEnforcerMode::Cilium => true,
+            NetworkEnforcerMode::Auto => {
+                let found =
+                    crate::enforcer::CiliumNetworkEnforcer::detect(&client, &me.namespace).await;
+                tracing::info!(
+                    "network enforcer auto-detection: cilium.io/v2 {}",
+                    if found { "present" } else { "absent" }
+                );
+                found
+            }
+        };
+        if wanted {
+            // An explicit `cilium` that is NOT actually present is a boot
+            // refusal, not a silent downgrade: the operator asked for
+            // enforcement and must not get a deployment that quietly cannot
+            // deliver it.
+            if mode == NetworkEnforcerMode::Cilium
+                && !crate::enforcer::CiliumNetworkEnforcer::detect(&client, &me.namespace).await
+            {
+                anyhow::bail!(
+                    "FLUIDBOX_NETWORK_ENFORCER=cilium but this cluster does not serve                      cilium.io/v2 — install Cilium, or set the enforcer to 'none' to run                      offline-only"
+                );
+            }
+            let ns = me.namespace.clone();
+            let resolver = me.cfg.sandbox_resolver_labels();
+            me.enforcer = Some(std::sync::Arc::new(
+                crate::enforcer::CiliumNetworkEnforcer::new(
+                    client,
+                    ns,
+                    verify_timeout_secs,
+                    resolver,
+                ),
+            ));
+        }
+        Ok(me)
     }
 
     pub fn with_client(client: Client, cfg: K8sConfig, data_dir: PathBuf) -> Self {
         let namespace = cfg.namespace.clone();
-        let cnp_resource = kube::api::ApiResource {
-            group: "cilium.io".into(),
-            version: "v2".into(),
-            api_version: "cilium.io/v2".into(),
-            kind: "CiliumNetworkPolicy".into(),
-            plural: "ciliumnetworkpolicies".into(),
-        };
         Self {
             pods: Api::namespaced(client.clone(), &namespace),
             secrets: Api::namespaced(client.clone(), &namespace),
-            cnps: Api::namespaced_with(client, &namespace, &cnp_resource),
+            // Constructed only when the caller has proven Cilium is present
+            // (`with_enforcer`); plain `with_client` stays offline-only so no
+            // existing call site silently gains an enforcer.
+            enforcer: None,
             cfg,
             namespace,
             data_dir,
         }
     }
 
-    /// Program the per-run `CiliumNetworkPolicy` for a grant, if it needs one.
+    /// Program the run's grant and PROVE it, before the pod can start.
     ///
-    /// An OFFLINE grant needs no object: offline is the ABSENCE of an allow,
-    /// delivered by the chart-static baseline's default-deny. A run with no
-    /// grant at all (resolved before governed networking) is offline too.
+    /// Both halves go through [`NetworkPolicyProvider`], so the ordering that
+    /// matters — program, then verify, and only then release the pod by
+    /// creating its Secret — is expressed once and is the same for any future
+    /// enforcer.
     ///
-    /// Fails closed: a rejected or unwritable policy aborts provisioning rather
-    /// than letting the pod start unenforced. A grant whose enforcement we
-    /// cannot program is a refused run, never a quiet downgrade.
-    async fn apply_run_policy(
-        &self,
-        spec: &SandboxSpec,
-        pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<(), ProviderError> {
+    /// Fails closed on every axis. A grant we cannot program, or cannot prove
+    /// was programmed, is a refused run — never a quiet downgrade to whatever
+    /// the datapath happens to be doing.
+    async fn program_and_verify_network(&self, spec: &SandboxSpec) -> Result<(), ProviderError> {
         let Some(granted) = &spec.network_grant else {
             return Ok(());
         };
-        let ctx = netgrant::PolicyContext {
-            namespace: self.namespace.clone(),
-            resolver_labels: self.cfg.sandbox_resolver_labels(),
-            owner_pod_uid: pod_uid.to_string(),
-            owner_pod_name: pod_name.to_string(),
-        };
-        let Some(policy) = netgrant::build_run_policy(granted, spec.session_id, &ctx) else {
-            return Ok(());
-        };
-        let obj: kube::api::DynamicObject = serde_json::from_value(policy)
-            .map_err(|e| ProviderError::Other(format!("bad network policy manifest: {e}")))?;
-        // A structurally invalid policy is rejected by CRD schema validation at
-        // THIS call — which the Phase 0 spike confirmed is a hard API error, and
-        // is a better fail-closed signal than any status poll: there is no
-        // window in which a bad policy sits silently pending.
-        self.cnps
-            .create(&Default::default(), &obj)
+        let enforcer = self.network_enforcer();
+        enforcer
+            .prepare(granted)
             .await
-            .map_err(|e| {
-                ProviderError::Other(format!(
-                    "programming the network grant for {} failed: {e}",
-                    spec.session_id
-                ))
-            })?;
+            .map_err(|e| ProviderError::Other(e.to_string()))?;
+        // The control-plane half of the proof. The in-netns `netpol-gate` init
+        // container proves the other half from the pod's own network identity;
+        // both must hold. See `enforcer.rs` for exactly what each establishes —
+        // this one is policy-acceptance and identity-binding, NOT datapath
+        // realization, and nothing on the k8s API can prove the latter.
+        enforcer
+            .verify(granted)
+            .await
+            .map_err(|e| ProviderError::Other(e.to_string()))?;
         Ok(())
     }
 
-    /// Delete a run's network policy. Idempotent — a missing object is success,
-    /// because this is called from teardown paths that must be safe to retry.
-    /// Owner-reference GC is the primary collector; this is the prompt path and
-    /// the belt-and-braces one.
+    /// Surrender a run's network authority. Idempotent — it runs from terminal
+    /// cleanup, the abandon paths, and the reconcile sweep, all of which retry.
     pub async fn revoke_run_policy(&self, session_id: uuid::Uuid) -> Result<(), ProviderError> {
-        match self
-            .cnps
-            .delete(&netgrant::policy_name(session_id), &DeleteParams::default())
+        // `revoke` needs only the run identity; the tenant and the grant body
+        // are irrelevant to deleting an object named after the run, so a
+        // minimal descriptor is honest here rather than inventing a grant.
+        let granted = fluidbox_core::traits::GrantedNetwork {
+            grant: fluidbox_core::network::NetworkGrant::offline(),
+            tenant_id: uuid::Uuid::nil(),
+            run_id: session_id,
+            grant_digest: String::new(),
+        };
+        self.network_enforcer()
+            .revoke(&granted)
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-            Err(e) => Err(map_err(e)),
-        }
+            .map_err(|e| ProviderError::Other(e.to_string()))
     }
 
     /// Build the persisted handle. `workload_addrs` carries the Gap-6 workload
@@ -452,7 +503,7 @@ impl ExecutionProvider for KubernetesProvider {
         // holds container start until it does. So enforcement is programmed
         // strictly before any untrusted code, GC backstops cleanup, and this is
         // a one-step delta from the pre-existing Pod-then-Secret order.
-        if let Err(e) = self.apply_run_policy(spec, &name, &uid).await {
+        if let Err(e) = self.program_and_verify_network(spec).await {
             let _ = self.delete_pod(&name, Some(&uid)).await;
             return Err(e);
         }
@@ -682,6 +733,19 @@ impl ExecutionProvider for KubernetesProvider {
 
     fn workspace_transport(&self) -> WorkspaceTransport {
         WorkspaceTransport::Archive
+    }
+
+    async fn revoke_network_policy(&self, run_id: Uuid) -> Result<(), ProviderError> {
+        self.revoke_run_policy(run_id).await
+    }
+
+    fn network_enforcer(&self) -> &dyn fluidbox_core::traits::NetworkPolicyProvider {
+        match &self.enforcer {
+            Some(e) => e.as_ref(),
+            // No enforcer detected/configured: offline-only, and the refusing
+            // default says so at CREATE time rather than at provision.
+            None => &fluidbox_core::traits::NoNetworkEnforcer,
+        }
     }
 
     fn runtime_name(&self) -> &'static str {

@@ -359,8 +359,10 @@ networkGrants:
     - 8.8.8.8
   dnsImage: registry.k8s.io/coredns/coredns:v1.11.3
   dnsReplicas: 2
-  # Pin this when the sandbox pods' `dnsPolicy: None` config needs a stable
-  # address known before the Service exists. Empty = allocate normally.
+  # REQUIRED when enabled. Sandbox pods use `dnsPolicy: None`, whose
+  # `nameservers` must be IP ADDRESSES — a Service DNS name is not valid there.
+  # Pick a free address in your Service CIDR; the Service is pinned to it too,
+  # so the address is stable and known before any sandbox starts.
   dnsClusterIP: ""
   dnsResources:
     requests: { cpu: 50m, memory: 64Mi }
