@@ -184,6 +184,21 @@ pub fn build_run_policy(
     // under the unchanged-policy shortcut, and an already-active grant is never
     // re-resolved at all. The renderer is the one place EVERY grant passes
     // through, so it is where this has to fail closed.
+    // A schema this binary does not know is refused in BOTH directions. Too LOW
+    // and its deny snapshot is unknown (below); too HIGH and it carries
+    // semantics this build cannot interpret — a rollback to this binary after a
+    // future v3 would otherwise render a v3 grant under v2 rules and silently
+    // ignore whatever v3 added. An old binary cannot be repaired once v3 exists,
+    // so the upper bound has to be enforced now, before there is anything to
+    // enforce it against.
+    if !g.grant.schema_supported() {
+        return Err(format!(
+            "this grant is schema v{}, which this build does not know (it understands up \
+             to v{}) — refusing to program a policy from semantics it cannot interpret",
+            g.grant.schema_version,
+            fluidbox_core::network::SCHEMA_VERSION
+        ));
+    }
     if g.grant.mode == NetworkGrantMode::Public {
         // A grant frozen BEFORE deny snapshots existed carries an empty list
         // that means "unknown", not "none" — so programming it as a world-allow
@@ -542,6 +557,51 @@ mod tests {
         // …alongside the world allow, which Cilium's deny precedence outranks.
         let egress = p["spec"]["egress"].as_array().unwrap();
         assert!(egress.iter().any(|r| r["toEntities"][0] == "world"));
+    }
+
+    /// A grant from a schema this build does not know is refused in BOTH
+    /// directions, and the two directions fail for DIFFERENT reasons.
+    ///
+    /// Too LOW: its deny snapshot is unknown rather than empty, so programming
+    /// it as a world-allow could silently drop denies the policy really had.
+    /// Too HIGH: it carries semantics this build cannot interpret, and a
+    /// rollback would otherwise render a future grant under today's rules. The
+    /// upper bound has to exist BEFORE there is a future schema, because an old
+    /// binary cannot be repaired once one exists.
+    #[test]
+    fn a_grant_from_an_unknown_schema_is_refused_in_both_directions() {
+        use fluidbox_core::network::{SCHEMA_VERSION, SCHEMA_WITH_DENIES};
+        let sid = uuid::Uuid::now_v7();
+
+        // Too low: a v1 `public` grant, whose empty deny list means "unknown".
+        let mut old = granted(NetworkGrantMode::Public, vec![]);
+        old.grant.schema_version = SCHEMA_WITH_DENIES - 1;
+        let err = build_run_policy(&old, sid, &ctx()).expect_err("v1 public must refuse");
+        assert!(
+            err.contains("deny set is UNKNOWN"),
+            "names the reason: {err}"
+        );
+
+        // Too high: a schema this build has never seen.
+        let mut future = granted(NetworkGrantMode::Approved, vec![dns_target("a.test", 443)]);
+        future.grant.schema_version = SCHEMA_VERSION + 1;
+        let err = build_run_policy(&future, sid, &ctx()).expect_err("a future schema must refuse");
+        assert!(err.contains("does not know"), "names the reason: {err}");
+
+        // FALSE-GREEN GUARDS. A CURRENT-schema grant of each mode still renders,
+        // so this cannot pass by refusing everything…
+        let ok = granted(NetworkGrantMode::Public, vec![]);
+        assert_eq!(ok.grant.schema_version, SCHEMA_VERSION);
+        assert!(build_run_policy(&ok, sid, &ctx()).is_ok());
+        // …and a LOW-schema grant that is not `public` is unaffected: `approved`
+        // is a closed allow-list resolution already checked against the live
+        // policy, and `offline` programs nothing at all.
+        let mut old_approved = granted(NetworkGrantMode::Approved, vec![dns_target("a.test", 443)]);
+        old_approved.grant.schema_version = SCHEMA_WITH_DENIES - 1;
+        assert!(build_run_policy(&old_approved, sid, &ctx()).is_ok());
+        let mut old_offline = granted(NetworkGrantMode::Offline, vec![]);
+        old_offline.grant.schema_version = SCHEMA_WITH_DENIES - 1;
+        assert_eq!(build_run_policy(&old_offline, sid, &ctx()).unwrap(), None);
     }
 
     /// A NAME-based deny must NOT be rendered: `EgressDenyRule` has no
