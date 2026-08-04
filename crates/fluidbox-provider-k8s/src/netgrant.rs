@@ -96,19 +96,47 @@ fn egress_rule(rule: &TargetRule) -> Value {
     }
 }
 
-/// The DNS-visibility rule. `toFQDNs` only works when the DNS request itself
-/// transits Cilium's L7 proxy, which is what `rules.dns` turns on — without it
-/// a name-based grant matches nothing at all.
+/// The DNS rule. `toFQDNs` only works when the DNS request itself transits
+/// Cilium's L7 proxy, which is what `rules.dns` turns on — without it a
+/// name-based grant matches nothing at all.
 ///
-/// It is emitted ONLY for a mode that has name-based targets. Offline gets no
-/// DNS allow whatsoever, which is what makes offline byte-identical in effect
-/// to today's `zeroEgress`.
-fn dns_visibility_rule(resolver_labels: &Value) -> Value {
+/// **`patterns` restricts WHICH NAMES may be looked up, and that is a
+/// containment control, not a formality.** An unrestricted `matchPattern: "*"`
+/// is a covert egress channel on its own: the workload queries
+/// `<base32-encoded-secret>.attacker.example`, the resolver forwards it to the
+/// public internet, and the attacker's authoritative nameserver receives the
+/// data — **without ever opening a connection the policy would have blocked.**
+/// The question *is* the exfiltration. So an `approved` grant may resolve
+/// exactly the names it was granted and nothing else.
+///
+/// `public` passes `None`, which does emit `*`: a public grant may already
+/// connect anywhere the deny wall permits, so restricting its lookups would
+/// buy nothing and break ordinary name resolution.
+///
+/// Offline gets no DNS rule whatsoever, which is what keeps offline
+/// byte-identical in effect to `zeroEgress`.
+fn dns_rule(resolver_labels: &Value, patterns: Option<&[&TargetRule]>) -> Value {
+    let dns_matchers: Vec<Value> = match patterns {
+        None => vec![json!({ "matchPattern": "*" })],
+        Some(targets) => targets
+            .iter()
+            .filter_map(|t| match t {
+                TargetRule::Dns { pattern, .. } => Some(match pattern.normalized() {
+                    FqdnPattern::Exact { name } => json!({ "matchName": name }),
+                    FqdnPattern::Wildcard { suffix } => {
+                        json!({ "matchPattern": format!("*.{suffix}") })
+                    }
+                }),
+                // A CIDR target needs no name resolved.
+                TargetRule::Cidr { .. } => None,
+            })
+            .collect(),
+    };
     json!({
         "toEndpoints": [{ "matchLabels": resolver_labels }],
         "toPorts": [{
             "ports": [{ "port": "53", "protocol": "ANY" }],
-            "rules": { "dns": [{ "matchPattern": "*" }] }
+            "rules": { "dns": dns_matchers }
         }]
     })
 }
@@ -156,13 +184,15 @@ pub fn build_run_policy(
                 .iter()
                 .any(|t| matches!(t, TargetRule::Dns { .. }));
             if has_dns_targets {
-                egress.push(dns_visibility_rule(&ctx.resolver_labels));
+                let dns_targets: Vec<&TargetRule> = g.grant.targets.iter().collect();
+                egress.push(dns_rule(&ctx.resolver_labels, Some(&dns_targets)));
             }
             egress.extend(g.grant.targets.iter().map(egress_rule));
         }
         NetworkGrantMode::Public => {
-            // Public still needs names to resolve.
-            egress.push(dns_visibility_rule(&ctx.resolver_labels));
+            // Public may already connect anywhere the wall permits, so an
+            // unrestricted lookup adds no reach it does not already have.
+            egress.push(dns_rule(&ctx.resolver_labels, None));
             // `world`, NEVER `all`: a CIDR/world selector cannot reach
             // in-cluster identities, which is exactly the property that keeps
             // `public` from implicitly opening the cluster. `all` would throw
@@ -301,13 +331,71 @@ mod tests {
         // without it `toFQDNs` matches nothing at all.
         let dns = &egress[0];
         assert_eq!(dns["toPorts"][0]["ports"][0]["port"], "53");
-        assert_eq!(dns["toPorts"][0]["rules"]["dns"][0]["matchPattern"], "*");
+        // Scoped to the granted name, not `*` — see
+        // `an_approved_grant_may_resolve_only_its_granted_names` for why an
+        // unrestricted lookup is itself an exfiltration channel.
+        assert_eq!(
+            dns["toPorts"][0]["rules"]["dns"][0]["matchPattern"],
+            "*.example.com"
+        );
         // …and the grant itself.
         let allow = &egress[1];
         assert_eq!(allow["toFQDNs"][0]["matchPattern"], "*.example.com");
         assert_eq!(allow["toPorts"][0]["ports"][0]["port"], "443");
         assert_eq!(allow["toPorts"][0]["ports"][0]["protocol"], "TCP");
         assert!(allow["toPorts"][0]["ports"][0].get("endPort").is_none());
+    }
+
+    /// The DNS rule must permit ONLY the granted names.
+    ///
+    /// An unrestricted `matchPattern: "*"` is a covert egress channel by
+    /// itself — the workload encodes secrets into a lookup for a domain the
+    /// attacker controls and their nameserver receives it, with no connection
+    /// the policy could have blocked. This is the assertion that keeps the
+    /// channel closed.
+    #[test]
+    fn an_approved_grant_may_resolve_only_its_granted_names() {
+        let sid = uuid::Uuid::now_v7();
+        let p = build_run_policy(
+            &granted(
+                NetworkGrantMode::Approved,
+                vec![
+                    dns_target("example.com", 443),
+                    TargetRule::dns(
+                        FqdnPattern::Exact {
+                            name: "pypi.org".into(),
+                        },
+                        vec![PortSpec::single(443)],
+                        L4Protocol::Tcp,
+                    ),
+                ],
+            ),
+            sid,
+            &ctx(),
+        )
+        .unwrap();
+        let dns = &p["spec"]["egress"][0]["toPorts"][0]["rules"]["dns"];
+        let matchers = dns.as_array().unwrap();
+        assert_eq!(matchers.len(), 2, "one matcher per granted name: {dns}");
+        assert_eq!(matchers[0]["matchPattern"], "*.example.com");
+        assert_eq!(matchers[1]["matchName"], "pypi.org");
+        // THE assertion: no wildcard-everything anywhere in the rendered policy.
+        let rendered = serde_json::to_string(&p).unwrap();
+        assert!(
+            !rendered.contains(r#"{"matchPattern":"*"}"#),
+            "an approved grant must not permit arbitrary DNS lookups: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_public_grant_may_resolve_anything_because_it_may_reach_anything() {
+        // Restricting lookups here would buy no containment — public already
+        // reaches whatever the deny wall permits — and would break ordinary
+        // name resolution.
+        let sid = uuid::Uuid::now_v7();
+        let p = build_run_policy(&granted(NetworkGrantMode::Public, vec![]), sid, &ctx()).unwrap();
+        let dns = &p["spec"]["egress"][0]["toPorts"][0]["rules"]["dns"];
+        assert_eq!(dns[0]["matchPattern"], "*");
     }
 
     #[test]
