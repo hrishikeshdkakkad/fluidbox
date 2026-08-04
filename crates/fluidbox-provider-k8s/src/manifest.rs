@@ -237,6 +237,22 @@ pub fn build_pod(spec: &SandboxSpec, cfg: &K8sConfig) -> Value {
         ],
     });
 
+    // Route the sandbox at the CONTROLLED resolver.
+    //
+    // Without this the pod keeps the cluster default (kube-dns), which its
+    // per-run policy does not allow — so an FQDN grant silently fails to
+    // resolve while the policy itself verifies as perfectly Valid. That is the
+    // worst kind of failure: everything reports healthy and nothing works.
+    //
+    // The controlled resolver is forward-only with NO `kubernetes` plugin, so a
+    // sandbox cannot resolve in-cluster Service names even when its grant lets
+    // it resolve public ones. Offline runs are pointed there too and simply get
+    // no answer — they have no allow rule reaching it, which is exactly right.
+    if !cfg.sandbox_dns_ip.is_empty() {
+        pod_spec["dnsPolicy"] = json!("None");
+        pod_spec["dnsConfig"] = json!({ "nameservers": [cfg.sandbox_dns_ip] });
+    }
+
     apply_cluster_policy(&mut pod_spec, cfg);
 
     json!({
@@ -378,6 +394,46 @@ mod tests {
 
     fn cfg() -> K8sConfig {
         K8sConfig::from_env()
+    }
+
+    /// The sandbox must be POINTED at the controlled resolver, not merely
+    /// allowed to reach it.
+    ///
+    /// This is the gap an adversarial review found: the per-run policy allowed
+    /// :53 to the controlled CoreDNS, but the pod still used the cluster
+    /// default (kube-dns) — which its policy does NOT allow. Every FQDN grant
+    /// therefore failed to resolve while the policy verified as perfectly
+    /// Valid. The kind validation missed it because its fixture pods set
+    /// `dnsConfig` by hand and never exercised `build_pod`.
+    #[test]
+    fn a_sandbox_is_pointed_at_the_controlled_resolver() {
+        let mut c = cfg();
+        c.sandbox_dns_ip = "10.96.0.53".into();
+        let pod = build_pod(&spec(), &c);
+        assert_eq!(pod["spec"]["dnsPolicy"], "None");
+        assert_eq!(pod["spec"]["dnsConfig"]["nameservers"][0], "10.96.0.53");
+
+        // Unconfigured (grants disabled) leaves the cluster default alone, so
+        // enabling this feature is what changes DNS — nothing else.
+        let plain = build_pod(&spec(), &cfg());
+        assert!(plain["spec"].get("dnsPolicy").is_none());
+        assert!(plain["spec"].get("dnsConfig").is_none());
+    }
+
+    /// The resolver the per-run policy allows must be selected in the RELEASE
+    /// namespace, which is NOT the sandbox namespace. Using the sandbox
+    /// namespace selects nothing, and the failure is silent.
+    #[test]
+    fn the_resolver_selector_uses_the_release_namespace() {
+        let mut c = cfg();
+        c.namespace = "fluidbox-sandboxes".into();
+        c.dns_namespace = "fluidbox".into();
+        let labels = c.sandbox_resolver_labels();
+        assert_eq!(labels["k8s:io.kubernetes.pod.namespace"], "fluidbox");
+        assert_ne!(
+            labels["k8s:io.kubernetes.pod.namespace"], "fluidbox-sandboxes",
+            "selecting the sandbox namespace matches no resolver pod"
+        );
     }
 
     /// The pod must carry all three labels its own network policy selects on.

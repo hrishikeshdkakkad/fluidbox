@@ -66,12 +66,24 @@ offline-only — a schedule has no caller to pass a request. Mirrors
 `Budgets::tightened_by` and the remove-only capability keep-list.
 
 **Deny precedence is a documented total order**, proven pairwise-exhaustively rather
-than one condition at a time: structural deny → policy deny → mode ceiling →
-`public`+brokered → target-catalog subset → approval → allow. Expiry clamps;
-everything else refuses rather than silently downgrading.
+than one condition at a time. In full, as the code runs it: `offline` short-circuits
+to Active → enforceability → structural validity and blocked ranges → explicit policy
+deny → mode ceiling → `public`+brokered → target-catalog subset → expiry → approval,
+else allow. Expiry clamps first and only then refuses (if the grant would lapse before
+the run ends); everything else refuses rather than silently downgrading.
+
+*(An earlier revision of this list omitted the short-circuit, enforceability, and
+expiry — it described an order the implementation did not have. An adversarial review
+caught it; the list above is the one the code implements and the pairwise test proves.)*
 
 **`public` + brokered surfaces is refused unless policy opts in**, following the
 `TrustTier::ReadOnly` precedent. The dangerous pairing is credentials plus reach.
+
+**An `approved` grant may resolve only the names it was granted.** An unrestricted
+DNS rule is a covert egress channel by itself: a workload encodes data into a lookup
+for a domain the attacker controls, the resolver forwards it, and their nameserver
+receives it — with no connection the policy could have blocked. `public` keeps a
+wildcard because it may already reach anything the wall permits.
 
 ---
 
@@ -135,7 +147,7 @@ Pod-then-Secret order.
 |---|---|
 | 0 | Findings note with pinned Cilium version + image digest, and the R2 answer picking the deny-set shape. **Done.** |
 | 1–3 | `just check` (fmt, clippy `-D warnings`, workspace tests, web build). **924 tests green.** |
-| 2 | `bash scripts/governance-e2e.sh` — refuse-on-unenforceable, the pause, approve, deny over real HTTP. **64/64.** |
+| 2 | `bash scripts/governance-e2e.sh` — refuse-on-unenforceable over real HTTP, including that an enforcer env var cannot conjure one on a provider that has none. The pause/approve/deny choreography is NOT covered there: availability is asked of the provider, so Docker (correctly) refuses before a pause can happen. |
 | 4 | `bash scripts/netgrant-kind-validation.sh` — full assertion matrix on real Cilium, exit 0, no skips. |
 | 6 | A live managed-cluster acceptance report. Unit tests and YAML alone do not count. |
 

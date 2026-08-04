@@ -399,7 +399,11 @@ pub async fn parked_network_grants(pool: &PgPool, limit: i64) -> sqlx::Result<Ve
            join sessions s on s.id = g.session_id
            left join approvals a on a.id = g.approval_id
           where s.status = 'awaiting_authorization'
-            and g.status in ('pending', 'active')
+            -- `revoked`/`denied` are included so a parked run whose grant was
+            -- taken away underneath it (the stale-schema sweep, a cancel, the
+            -- crash window between activation and spawn) is RESOLVED rather
+            -- than left parked forever with nothing explaining why.
+            and g.status in ('pending', 'active', 'revoked', 'denied')
           order by g.created_at limit $1",
     )
     .bind(limit)
@@ -407,6 +411,115 @@ pub async fn parked_network_grants(pool: &PgPool, limit: i64) -> sqlx::Result<Ve
     .await?;
     tx.commit().await?;
     Ok(out)
+}
+
+/// An ACTIVE grant whose absolute expiry has passed, with the session it
+/// governs — the expired-grant sweep's worklist.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExpiredGrantRow {
+    pub tenant_id: Uuid,
+    pub session_id: Uuid,
+    pub mode: String,
+}
+
+/// Grants that are still `active` past `expires_at`, across every tenant.
+///
+/// Uses migration 0028's `session_network_grants_expiry` partial index, which
+/// existed for this sweep from the start but had no consumer — so an expiry was
+/// checked once before provisioning and never again, and a grant that lapsed
+/// mid-run kept its datapath authority. The run's own wall clock does not save
+/// it: that clock starts at `started_at`, while the grant's expiry is absolute
+/// from creation, so provisioning time and any authorization pause are spent
+/// out of the grant's life but not the run's.
+///
+/// Only sessions that are still live are returned — a terminal run's grant is
+/// revoked by the terminal path, and re-revoking it would be noise.
+pub async fn expired_active_grants(
+    pool: &PgPool,
+    limit: i64,
+) -> sqlx::Result<Vec<ExpiredGrantRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "select s.tenant_id, g.session_id, g.mode
+           from session_network_grants g
+           join sessions s on s.id = g.session_id
+          where g.status = 'active'
+            and g.expires_at is not null
+            and g.expires_at < now()
+            and s.status not in ('completed','failed','cancelled','budget_exceeded')
+          order by g.expires_at limit $1",
+    )
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Active grants whose FROZEN document predates the current schema.
+///
+/// The upgrade path the renderer alone cannot cover: a run already executing
+/// under a policy written by an older build never calls `prepare` again, so
+/// tightening the renderer does nothing for it. This scan finds those runs so
+/// their enforcement can be torn down and re-evaluated.
+pub async fn stale_schema_active_grants(
+    pool: &PgPool,
+    current_schema: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<ExpiredGrantRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "select s.tenant_id, g.session_id, g.mode
+           from session_network_grants g
+           join sessions s on s.id = g.session_id
+          where g.status = 'active'
+            and g.mode = 'public'
+            and coalesce((g.grant_doc->>'schema_version')::int, 1) < $1
+            and s.status not in ('completed','failed','cancelled','budget_exceeded')
+          order by g.created_at limit $2",
+    )
+    .bind(current_schema)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// For a set of run ids, which are NOT backed by a grant that is currently in
+/// force — i.e. whose datapath policy should not exist.
+///
+/// A run with no grant row at all is included: nothing authorizes it.
+pub async fn runs_without_live_grants(pool: &PgPool, run_ids: &[Uuid]) -> sqlx::Result<Vec<Uuid>> {
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = crate::worker_tx(pool).await?;
+    let live: Vec<(Uuid,)> = sqlx::query_as(
+        "select g.session_id from session_network_grants g
+           join sessions s on s.id = g.session_id
+          where g.session_id = any($1)
+            and g.status = 'active'
+            -- An OFFLINE grant programs no policy, so a policy attached to one
+            -- is anomalous by definition and must be collected rather than
+            -- treated as authorized.
+            and g.mode <> 'offline'
+            -- A TERMINAL session authorizes nothing, whatever its row says.
+            -- Terminal cleanup ignores a failed revoke, so without this a
+            -- policy could survive a finished run until the grant expired.
+            and s.status not in ('completed','failed','cancelled','budget_exceeded')
+            and (g.expires_at is null or g.expires_at > now())",
+    )
+    .bind(run_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let live: std::collections::HashSet<Uuid> = live.into_iter().map(|(id,)| id).collect();
+    Ok(run_ids
+        .iter()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect())
 }
 
 /// One reservation the expiry sweep converted into a conservative charge.
