@@ -147,7 +147,7 @@ Pod-then-Secret order.
 |---|---|
 | 0 | Findings note with pinned Cilium version + image digest, and the R2 answer picking the deny-set shape. **Done.** |
 | 1–3 | `just check` (fmt, clippy `-D warnings`, workspace tests, web build). **924 tests green.** |
-| 2 | `bash scripts/governance-e2e.sh` — refuse-on-unenforceable, the pause, approve, deny over real HTTP. **64/64.** |
+| 2 | `bash scripts/governance-e2e.sh` — refuse-on-unenforceable over real HTTP, including that an enforcer env var cannot conjure one on a provider that has none. The pause/approve/deny choreography is NOT covered there: availability is asked of the provider, so Docker (correctly) refuses before a pause can happen. |
 | 4 | `bash scripts/netgrant-kind-validation.sh` — full assertion matrix on real Cilium, exit 0, no skips. |
 | 6 | A live managed-cluster acceptance report. Unit tests and YAML alone do not count. |
 

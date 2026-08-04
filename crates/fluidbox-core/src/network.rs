@@ -137,8 +137,16 @@ impl L4Protocol {
 
 /// An inclusive port range. A single port is `from == to`; the wire form keeps
 /// both so lowering to Cilium's `{port, endPort}` is mechanical.
+/// NOT `deny_unknown_fields`, deliberately.
+///
+/// This type is shared by the STORED representation (frozen RunSpecs and
+/// stored policy blobs) and the authoring path. Making it strict made stored
+/// blobs strict at the same boundary, so a row that had legitimately been
+/// accepted with an extra key would suddenly fail to deserialize — stranding a
+/// policy that is already governing runs, which is the one thing the lenient
+/// stored shape exists to prevent. Authoring strictness belongs in the
+/// `Draft*` mirrors in `policy.rs`, where it cannot reach stored data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PortSpec {
     pub from: u16,
     pub to: u16,
@@ -799,6 +807,8 @@ pub enum DenialReason {
     },
     /// `public` plus brokered surfaces, without the policy opt-in.
     PublicWithBrokered,
+    /// The policy carries a deny the datapath cannot express for this mode.
+    UnenforceableDeny { target: String },
     /// A target the policy's catalog does not cover.
     NotInCatalog { target: String },
     /// The deployment cannot enforce a grant at all.
@@ -819,6 +829,7 @@ impl DenialReason {
             Self::PolicyDeny { .. } => "policy_deny",
             Self::ModeCeiling { .. } => "mode_ceiling",
             Self::PublicWithBrokered => "public_with_brokered",
+            Self::UnenforceableDeny { .. } => "unenforceable_deny",
             Self::NotInCatalog { .. } => "not_in_catalog",
             Self::Unenforceable { .. } => "unenforceable",
             Self::ExpiryTooShort { .. } => "expiry_too_short",
@@ -845,6 +856,12 @@ impl DenialReason {
             Self::PublicWithBrokered => "a public network grant is refused for a run holding \
                  brokered tool surfaces; set network.allow_public_with_brokered to opt in"
                 .into(),
+            Self::UnenforceableDeny { target } => format!(
+                "this policy denies {target}, but a NAME-based deny cannot be enforced in \
+                 the datapath under a 'public' grant (Cilium's egressDeny has no FQDN \
+                 selector) — so the run is refused rather than issued a grant that would \
+                 ignore the deny. Use an 'approved' grant, or express the deny as a CIDR."
+            ),
             Self::NotInCatalog { target } => {
                 format!("network target {target} is not covered by the policy's allowed targets")
             }
@@ -958,6 +975,28 @@ pub fn resolve_network_grant(
         && !policy.allow_public_with_brokered
     {
         return GrantResolution::Denied(DenialReason::PublicWithBrokered);
+    }
+
+    // ── 4b. denies we could not enforce for this mode ────────────────────
+    //
+    // `public` allows the world and relies on `egressDeny` to carve holes in
+    // it. Cilium's `EgressDenyRule` has no `toFQDNs` (verified against the
+    // 1.19.6 CRD; cilium#35494 declined it because a DNS deny would fail open
+    // for unresolved names), so a NAME-based deny cannot be rendered. Under
+    // `approved` this does not matter — the grant is a closed allow-list and
+    // resolution already refuses any target overlapping a deny — but under
+    // `public` it would mean issuing a grant that silently ignores the
+    // operator's deny. Refuse instead.
+    if request.mode == NetworkGrantMode::Public {
+        if let Some(d) = policy
+            .deny
+            .iter()
+            .find(|d| matches!(d, TargetRule::Dns { .. }))
+        {
+            return GrantResolution::Denied(DenialReason::UnenforceableDeny {
+                target: d.describe(),
+            });
+        }
     }
 
     // ── 5. target-catalog subset ─────────────────────────────────────────
@@ -1941,6 +1980,53 @@ mod tests {
             resolve_network_grant(&req(None), &pol, &no_wall),
             GrantResolution::Active(_)
         ));
+    }
+
+    /// Adding `denied` must not change the digest of an ALREADY-FROZEN grant.
+    ///
+    /// The digest is the consent anchor: `approvals.input_digest` equals it for
+    /// every parked grant. If deploying this field changed the digest of grants
+    /// frozen before it existed, every run waiting on a human would fail its
+    /// release re-verification with `grant_digest_mismatch` and have to be
+    /// recreated. `skip_serializing_if` is what prevents that, and this is the
+    /// test that keeps it prevented.
+    #[test]
+    fn adding_denied_does_not_disturb_an_already_frozen_grants_digest() {
+        let frozen: NetworkGrant = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "mode": "approved",
+            "targets": [],
+            "expires_at": "2099-01-01T00:00:00Z",
+            "policy_digest": "sha256:p"
+        }))
+        .unwrap();
+        assert!(frozen.denied.is_empty(), "an absent key defaults to empty");
+        let wire = serde_json::to_value(&frozen).unwrap();
+        assert!(
+            wire.get("denied").is_none(),
+            "an empty deny list must not appear on the wire: {wire}"
+        );
+        // Byte-identical to what the pre-`denied` build would have produced.
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "schema_version": 1,
+                "mode": "approved",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "policy_digest": "sha256:p"
+            })
+        );
+        // …and a grant that DOES carry denies serializes them and digests
+        // differently, so the field is not merely inert.
+        let with_denies = NetworkGrant {
+            denied: vec![TargetRule::cidr(
+                "203.0.113.0/24".parse().unwrap(),
+                vec![PortSpec::single(443)],
+                L4Protocol::Tcp,
+            )],
+            ..frozen.clone()
+        };
+        assert_ne!(with_denies.digest(), frozen.digest());
     }
 
     #[test]
