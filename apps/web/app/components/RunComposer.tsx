@@ -82,6 +82,9 @@ interface RunComposerDraft {
   pubComment: boolean;
   pubCheck: boolean;
   capabilityKeepList: string;
+  /** The per-run "offline only" narrowing; optional so pre-narrowing drafts
+   *  still validate (no `version` bump, no validator requirement). */
+  offlineOnly?: boolean;
 }
 
 function isRunComposerDraft(value: unknown): value is RunComposerDraft {
@@ -258,13 +261,14 @@ export function RunComposer({
       pubComment,
       pubCheck,
       capabilityKeepList,
+      offlineOnly,
     }),
     [
       mode, task, autonomous, agentChoice, selectedAgentName, revisionTouched, newAgentName,
       description, harness, model, systemPrompt, policyName, policyOverride, workspace, pins, requirements, bindings, kind,
       automationName, allowTask, allowWorkspace, callbackUrl, concurrency, cron, timezone,
       missedPolicy, connection, repositories, evOpened, evReopened, evSync, pubComment, pubCheck,
-      capabilityKeepList,
+      capabilityKeepList, offlineOnly,
     ]
   );
   // Loading an existing revision is not user input. Only persist agent fields
@@ -300,6 +304,7 @@ export function RunComposer({
     evSync ||
     !pubComment ||
     pubCheck ||
+    offlineOnly ||
     capabilityKeepList.trim().length > 0;
   const restoreDraft = useCallback((saved: RunComposerDraft) => {
     if (!isRunComposerDraft(saved)) return;
@@ -337,6 +342,7 @@ export function RunComposer({
     setPubComment(saved.pubComment);
     setPubCheck(saved.pubCheck);
     setCapabilityKeepList(saved.capabilityKeepList);
+    setOfflineOnly(saved.offlineOnly ?? false);
   }, []);
   const clearDraft = useSessionDraft({
     key: draftKey,
@@ -384,6 +390,11 @@ export function RunComposer({
     if (agentChoice !== "existing" || !selectedAgentName || revisionTouched) return;
     const selected = agents.find((candidate) => candidate.name === selectedAgentName);
     if (!selected) return;
+    // Reset before the load: a pending/failed load must never show the previous
+    // agent's declaration, and a per-run narrowing must never carry to a
+    // different agent. The fetch below reinstates the real declaration.
+    setDeclaredNetwork(null);
+    setOfflineOnly(false);
     let active = true;
     const start = window.setTimeout(() => {
       setRevisionLoading(true);
@@ -475,6 +486,10 @@ export function RunComposer({
     setPins([]);
     setRequirements([]); // a new agent declares its requirements in the editor
     setBindings({});
+    // A new agent has no declaration; the server creates it offline. Clear any
+    // narrowing carried from a previously selected agent.
+    setDeclaredNetwork(null);
+    setOfflineOnly(false);
     setRevisionTouched(false);
     setPendingAgentSwitch(null);
   };

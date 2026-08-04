@@ -1867,6 +1867,46 @@ mod tests {
         assert_eq!(body["enforcer"], serde_json::json!("none"));
     }
 
+    #[test]
+    fn harnesses_payload_reports_a_live_egress_capable_enforcer() {
+        // The NoNetworkEnforcer case alone passes even if the block hardcodes
+        // "none"/false. A fake that answers "cilium"/true proves BOTH fields are
+        // delegated to the argument, not baked in.
+        struct FakeCiliumEnforcer;
+
+        #[async_trait::async_trait]
+        impl fluidbox_core::traits::NetworkPolicyProvider for FakeCiliumEnforcer {
+            async fn prepare(
+                &self,
+                _granted: &fluidbox_core::traits::GrantedNetwork,
+            ) -> Result<(), fluidbox_core::traits::NetworkPolicyError> {
+                Ok(())
+            }
+            async fn verify(
+                &self,
+                _granted: &fluidbox_core::traits::GrantedNetwork,
+            ) -> Result<(), fluidbox_core::traits::NetworkPolicyError> {
+                Ok(())
+            }
+            async fn revoke(
+                &self,
+                _granted: &fluidbox_core::traits::GrantedNetwork,
+            ) -> Result<(), fluidbox_core::traits::NetworkPolicyError> {
+                Ok(())
+            }
+            fn enforcer_name(&self) -> &'static str {
+                "cilium"
+            }
+            fn supports_egress_grants(&self) -> bool {
+                true
+            }
+        }
+
+        let body = harnesses_network_block(&FakeCiliumEnforcer);
+        assert_eq!(body["enforcer"], serde_json::json!("cilium"));
+        assert_eq!(body["supports_egress_grants"], serde_json::json!(true));
+    }
+
     /// `LocalCopy` is host-filesystem read access with no root and no tenant
     /// meaning, and `POST /v1/sessions` admits ANY authenticated principal — so
     /// the authority must be derived from the principal CLASS, not from a

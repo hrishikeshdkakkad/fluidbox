@@ -238,7 +238,12 @@ function Agents() {
                           <span className="chip">image {short(r.runner_image, 24)}</span>
                         </div>
                       ))}
-                      <button className="btn sm" style={{ marginTop: 12 }} onClick={() => setAddRev(a.id)}>
+                      <button
+                        className="btn sm"
+                        style={{ marginTop: 12 }}
+                        disabled={!revs[a.id]}
+                        onClick={() => setAddRev(a.id)}
+                      >
                         Add revision
                       </button>
                     </div>
@@ -300,11 +305,11 @@ function AddRevision({
   // network.max_mode; a failed read renders "unknown", never a false floor.
   const [ceiling, setCeiling] = useState<NetworkGrantMode | null>(null);
   useEffect(() => {
+    // Show "unknown" the instant the policy changes, rather than leaving the
+    // previous policy's ceiling on screen until the new read resolves.
+    setCeiling(null);
     const name = policyName ?? currentPolicyName;
-    if (!name) {
-      setCeiling(null);
-      return;
-    }
+    if (!name) return;
     let live = true;
     apiGetCached<{ content: PolicyContent }>(`/policies/${encodeURIComponent(name)}`, {
       maxAgeMs: 30_000,
@@ -352,7 +357,11 @@ function AddRevision({
         default_workspace: draftToInput(workspace),
         capability_bundles: pins.map((p) => `${p.name}@${p.version}`),
         connection_requirements: requirements,
-        network,
+        // Defense in depth: only send a declaration we actually have. With no
+        // `current` revision (still loading / failed load) `network` is the
+        // offline default, and sending it would OVERWRITE the agent's real
+        // declaration — the server inherits only when the field is ABSENT.
+        ...(current ? { network } : {}),
       });
       onAdded();
     } catch (e) {
