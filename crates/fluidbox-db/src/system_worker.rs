@@ -399,7 +399,11 @@ pub async fn parked_network_grants(pool: &PgPool, limit: i64) -> sqlx::Result<Ve
            join sessions s on s.id = g.session_id
            left join approvals a on a.id = g.approval_id
           where s.status = 'awaiting_authorization'
-            and g.status in ('pending', 'active')
+            -- `revoked`/`denied` are included so a parked run whose grant was
+            -- taken away underneath it (the stale-schema sweep, a cancel, the
+            -- crash window between activation and spawn) is RESOLVED rather
+            -- than left parked forever with nothing explaining why.
+            and g.status in ('pending', 'active', 'revoked', 'denied')
           order by g.created_at limit $1",
     )
     .bind(limit)
@@ -480,6 +484,33 @@ pub async fn stale_schema_active_grants(
     .await?;
     tx.commit().await?;
     Ok(out)
+}
+
+/// For a set of run ids, which are NOT backed by a grant that is currently in
+/// force — i.e. whose datapath policy should not exist.
+///
+/// A run with no grant row at all is included: nothing authorizes it.
+pub async fn runs_without_live_grants(pool: &PgPool, run_ids: &[Uuid]) -> sqlx::Result<Vec<Uuid>> {
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = crate::worker_tx(pool).await?;
+    let live: Vec<(Uuid,)> = sqlx::query_as(
+        "select g.session_id from session_network_grants g
+          where g.session_id = any($1)
+            and g.status = 'active'
+            and (g.expires_at is null or g.expires_at > now())",
+    )
+    .bind(run_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let live: std::collections::HashSet<Uuid> = live.into_iter().map(|(id,)| id).collect();
+    Ok(run_ids
+        .iter()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect())
 }
 
 /// One reservation the expiry sweep converted into a conservative charge.

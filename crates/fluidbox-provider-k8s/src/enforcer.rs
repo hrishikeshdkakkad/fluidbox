@@ -457,6 +457,24 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
         }
     }
 
+    async fn list_programmed(&self) -> Result<Vec<uuid::Uuid>, NetworkPolicyError> {
+        let lp = kube::api::ListParams::default().labels("fluidbox.dev/managed=true");
+        let list = self.cnps.list(&lp).await.map_err(|e| {
+            NetworkPolicyError::Write(format!("listing network policies failed: {e}"))
+        })?;
+        Ok(list
+            .items
+            .iter()
+            .filter_map(|o| {
+                o.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get(LABEL_SESSION))
+                    .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            })
+            .collect())
+    }
+
     fn enforcer_name(&self) -> &'static str {
         "cilium"
     }

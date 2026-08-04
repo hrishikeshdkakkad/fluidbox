@@ -193,3 +193,18 @@ human refusing a grant is the system working.
   different sources and different failure modes.
 - **The Docker `host-dev` profile is not a boundary** and never was. Docker
   enforces `offline` only, under `hardened`.
+- **A policy edit that only REPHRASES a deny can refuse a parked release.** The
+  comparison at release is representation-sensitive: denying ports 443 and 444
+  as two rules, then rewriting them as one `443-444` range, reads as "the deny
+  set grew" even though it did not. The direction is safe (it can never let a
+  LARGER deny set through unnoticed) but it costs a re-created run. Rephrase
+  denies when nothing is parked.
+- **The re-verification failure streak is per-replica.** A parked run's retry
+  count lives in one process, so a restart resets it and two replicas count
+  independently. Consequence: the bound on how long a permanently-unreadable
+  policy keeps a run parked is per-replica, not deployment-wide.
+- **Unknown fields INSIDE a target rule are ignored when authoring.** Strictness
+  stops at the `network:` section boundary: `TargetRule` and `PortSpec` are
+  shared with the STORED representation, and making them strict would strand
+  policies already governing runs. A typo in a port or pattern field is
+  therefore silently dropped — check a rule reads as you intended after saving.

@@ -1194,6 +1194,17 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
     // or lapsed grant can never reach a sandbox. This is the last check before
     // any pod exists, and it is deliberately independent of how the session got
     // here: the gate worker's release and this gate agree, or nothing runs.
+    // The frozen grant must be one this binary understands, in both directions
+    // — a rollback can hand an older binary a newer grant, and interpreting it
+    // under old semantics would silently drop whatever the newer schema added.
+    if !run_spec.network.schema_supported() {
+        anyhow::bail!(
+            "this run's network grant is schema v{}, which this build does not know \
+             (it understands up to v{}) — refusing to provision",
+            run_spec.network.schema_version,
+            fluidbox_core::network::SCHEMA_VERSION
+        );
+    }
     match fluidbox_db::network_grants::get_network_grant(&state.pool, scope, session_id).await {
         Ok(Some(g)) if g.is_in_force(chrono::Utc::now()) => {}
         Ok(Some(g)) => {
