@@ -31,7 +31,7 @@
 //! is the belt, that is the braces, and the docs say so rather than implying
 //! this check is stronger than it is.
 
-use crate::netgrant;
+use crate::netgrant::{self, LABEL_SESSION};
 use fluidbox_core::traits::{GrantedNetwork, NetworkPolicyError, NetworkPolicyProvider};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject};
@@ -371,13 +371,20 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
 
     async fn revoke(&self, granted: &GrantedNetwork) -> Result<(), NetworkPolicyError> {
         let name = Self::object_name(granted);
-        // Delete only what belongs to THIS run. Deleting by deterministic name
-        // alone would remove the very foreign object `prepare` refused to adopt
-        // — turning a refusal into the deletion of somebody else's policy. The
-        // uid precondition makes the API server enforce that, so it holds even
-        // if the object is replaced between the read and the delete.
-        let uid = match self.cnps.get_opt(&name).await {
-            Ok(Some(o)) => o.metadata.uid,
+        // Delete only what belongs to THIS run — two independent checks,
+        // because they answer different questions.
+        //
+        // OWNERSHIP: the object must carry our run's session label. A uid
+        // precondition alone authenticates the object we just read, not that it
+        // is ours; so if `prepare` refused a foreign object under the
+        // deterministic name, terminal cleanup would then delete that very
+        // object — turning a refusal into somebody else's outage.
+        //
+        // ATOMICITY: the uid precondition then makes the API server enforce
+        // that we delete the object we inspected, closing the delete/recreate
+        // window between the read and the delete.
+        let existing = match self.cnps.get_opt(&name).await {
+            Ok(Some(o)) => o,
             Ok(None) => return Ok(()),
             Err(e) => {
                 return Err(NetworkPolicyError::Write(format!(
@@ -386,8 +393,23 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
                 )))
             }
         };
+        let ours = existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(LABEL_SESSION))
+            .map(|v| v == &granted.run_id.to_string())
+            .unwrap_or(false);
+        if !ours {
+            tracing::warn!(
+                run_id = %granted.run_id,
+                "a network policy exists under this run's name but is not labelled as ours; \
+                 leaving it alone rather than deleting another owner's object"
+            );
+            return Ok(());
+        }
         let dp = DeleteParams {
-            preconditions: uid.map(|u| kube::api::Preconditions {
+            preconditions: existing.metadata.uid.map(|u| kube::api::Preconditions {
                 uid: Some(u),
                 resource_version: None,
             }),
@@ -399,9 +421,16 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
             // Idempotence matters: this runs from terminal cleanup, the abandon
             // paths, and the reconcile sweep.
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-            // The object was replaced between our read and the delete: it is no
-            // longer ours to remove, and refusing is the safe answer.
-            Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+            // The object was REPLACED between our read and the delete. This is
+            // NOT success: a replacement is still standing, and reporting Ok
+            // would let the caller mark the grant revoked — after which the
+            // expiry sweeper never revisits the row and the replacement leaks
+            // as an additive Cilium allow. Erroring makes the caller retry,
+            // which re-reads and re-evaluates ownership.
+            Err(kube::Error::Api(e)) if e.code == 409 => Err(NetworkPolicyError::Write(format!(
+                "the network policy for run {} was replaced while being deleted; retrying",
+                granted.run_id
+            ))),
             Err(e) => Err(NetworkPolicyError::Write(format!(
                 "deleting the network policy for run {} failed: {e}",
                 granted.run_id

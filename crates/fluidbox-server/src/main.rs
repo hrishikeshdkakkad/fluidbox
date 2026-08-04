@@ -336,6 +336,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state: state::AppState = Arc::new(AppStateInner {
+        netgrant_reverify_failures: Default::default(),
         tenant_id: seed.tenant_id,
         redactor: fluidbox_core::event::Redactor::default(),
         provider,
