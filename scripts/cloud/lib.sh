@@ -76,6 +76,49 @@ ensure_kubeconfig() {
   ok "kubectl context: $KUBECTX"
 }
 
+CLOUD_API="${CLOUD_API:-https://dw87mc37yx8wp.cloudfront.net}"
+
+# The operator admin token, from SSM. Pinned to the DEPLOYER profile because
+# that is the identity SSM grants, and because a bare `aws` here would resolve
+# to the `default` profile — which on the operator machine is the account ROOT.
+cloud_admin_token() {
+  printf '%s' "${FLUIDBOX_ADMIN_TOKEN:-$(AWS_PROFILE=${AWS_PROFILE:-fluidbox-deployer} aws ssm get-parameter \
+    --name /fluidbox/cloud/admin-token --with-decryption --region "$CLOUD_REGION" \
+    --query Parameter.Value --output text 2>/dev/null)}"
+}
+
+# promote_owner <org-slug> <email> — grant owner to an already-provisioned member.
+#
+# First login JIT-provisions at claim_mappings.default_role (member), and core
+# REFUSES to arm a bootstrap owner while an active owner exists ("an active
+# owner already exists; deactivate it before arming a bootstrap owner", observed
+# 409). So promotion is a separate admin act, which also means it works for
+# issuers that never emit a true `email_verified` — the claim core's
+# bootstrap-owner path requires unconditionally.
+promote_owner() {
+  local slug="${1:?usage: promote_owner <org-slug> <email>}"
+  local email="${2:?usage: promote_owner <org-slug> <email>}"
+  local auth mid code
+  auth="Authorization: Bearer $(cloud_admin_token)"
+  mid=$(curl -sS --max-time 20 -H "$auth" "$CLOUD_API/v1/admin/orgs/$slug/members" | python3 -c "
+import json,sys
+want=sys.argv[1].strip().lower()
+for m in json.load(sys.stdin).get('members',[]):
+    if (m.get('email') or '').strip().lower()==want:
+        print(m['membership_id']); break
+" "$email")
+  [ -n "$mid" ] || die "no member with email $email in org $slug" \
+    "sign in once at the dashboard first — that is what creates the membership"
+  code=$(curl -sS -o /tmp/fbx-promote.json -w '%{http_code}' --max-time 20 \
+    -X POST -H "$auth" -H 'Content-Type: application/json' \
+    -d '{"roles":["member","owner"]}' \
+    "$CLOUD_API/v1/admin/orgs/$slug/members/$mid/roles")
+  case "$code" in
+    200|204) ok "$email is now an owner of $slug";;
+    *) die "promotion failed ($code)" "$(head -c 400 /tmp/fbx-promote.json 2>/dev/null)";;
+  esac
+}
+
 # Evidence directory helper: scripts append their proof artifacts here.
 evidence_dir() {
   local name="$1" dir

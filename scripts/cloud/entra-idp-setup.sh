@@ -38,41 +38,14 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 . scripts/cloud/lib.sh
 
-API="${CLOUD_API:-https://dw87mc37yx8wp.cloudfront.net}"
+API="$CLOUD_API"
+admin_token() { cloud_admin_token; }
 
-admin_token() {
-  printf '%s' "${FLUIDBOX_ADMIN_TOKEN:-$(AWS_PROFILE=${AWS_PROFILE:-fluidbox-deployer} aws ssm get-parameter \
-    --name /fluidbox/cloud/admin-token --with-decryption --region "$CLOUD_REGION" \
-    --query Parameter.Value --output text 2>/dev/null)}"
-}
-
-# --promote <slug> <email>: grant owner to an already-provisioned member.
-#
-# First login JIT-provisions at claim_mappings.default_role (member). Promotion
-# is a separate admin act on purpose — it does not depend on the bootstrap arm,
-# which core gates on a TRUE email_verified claim that Entra only supplies when
-# xms_edov lands. This path works either way.
+# Shared with auth0-idp-setup.sh — see promote_owner() in lib.sh for why
+# promotion is a separate admin act rather than a bootstrap-owner arm.
 if [ "${1:-}" = "--promote" ]; then
-  PSLUG="${2:?usage: --promote <org-slug> <email>}"
-  PEMAIL="${3:?usage: --promote <org-slug> <email>}"
-  AUTH="Authorization: Bearer $(admin_token)"
-  MID=$(curl -sS --max-time 20 -H "$AUTH" "$API/v1/admin/orgs/$PSLUG/members" | python3 -c "
-import json,sys
-want=sys.argv[1].strip().lower()
-for m in json.load(sys.stdin).get('members',[]):
-    if (m.get('email') or '').strip().lower()==want:
-        print(m['membership_id']); break
-" "$PEMAIL")
-  [ -n "$MID" ] || die "no member with email $PEMAIL in org $PSLUG" \
-    "sign in once at the dashboard first — that is what creates the membership"
-  CODE=$(curl -sS -o /tmp/fbx-promote.json -w '%{http_code}' --max-time 20 \
-    -X POST -H "$AUTH" -H 'Content-Type: application/json' \
-    -d '{"roles":["member","owner"]}' \
-    "$API/v1/admin/orgs/$PSLUG/members/$MID/roles")
-  case "$CODE" in
-    200|204) ok "$PEMAIL is now an owner of $PSLUG"; exit 0;;
-    *) die "promotion failed ($CODE)" "$(cat /tmp/fbx-promote.json 2>/dev/null | head -c 400)";;
-  esac
+  promote_owner "${2:?usage: --promote <org-slug> <email>}" "${3:?usage: --promote <org-slug> <email>}"
+  exit 0
 fi
 
 SLUG="${1:-${ENTRA_ORG_SLUG:-fluidzero}}"
