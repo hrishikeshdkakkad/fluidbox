@@ -190,7 +190,20 @@ body {
   margin: 0 auto;
   padding: 0 24px;
   display: grid;
-  grid-template-columns: minmax(210px, 1fr) auto minmax(210px, 1fr);
+  /* THIS is the rule that actually governs the desktop header — geist.css is
+   * imported AFTER globals.css in layout.tsx, so it wins. Fixing only the
+   * globals.css copy left the overlap fully intact in production (verified on
+   * the live deployment: computed grid stayed 277px/540px/277px).
+   *
+   * Same defect as the globals rule: the middle track is `auto`, so the nav
+   * never shrinks, while the actions cluster (~450px of status pill + New Run +
+   * theme toggle + org/email + Log out) is pinned near its 210px minimum,
+   * overflows its own track, and — being `justify-self: end` — bleeds LEFT over
+   * Docs/Settings/Governance.
+   *
+   * `auto minmax(0, 1fr) auto` is what the narrower breakpoint at line ~1092
+   * already used; the desktop rule was the outlier in both stylesheets. */
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 24px;
 }
