@@ -25,6 +25,17 @@ resource "kubernetes_config_map_v1" "litellm" {
           litellm_params:
             model: "anthropic/claude-*"
             api_key: os.environ/ANTHROPIC_API_KEY
+        # The codex harness catalog (harness.rs): explicit default + wildcard,
+        # mirroring the anthropic shape. Routing alone does not grant access —
+        # minted tenant keys still carry the llm_tenant_models allowlist.
+        - model_name: gpt-5.4-mini
+          litellm_params:
+            model: openai/gpt-5.4-mini
+            api_key: os.environ/OPENAI_API_KEY
+        - model_name: "gpt-*"
+          litellm_params:
+            model: "openai/gpt-*"
+            api_key: os.environ/OPENAI_API_KEY
       general_settings:
         master_key: os.environ/LITELLM_MASTER_KEY
       litellm_settings:
@@ -90,6 +101,15 @@ resource "kubernetes_deployment_v1" "litellm" {
               secret_key_ref {
                 name = "fluidbox-secrets"
                 key  = "ANTHROPIC_API_KEY"
+              }
+            }
+          }
+          env {
+            name = "OPENAI_API_KEY"
+            value_from {
+              secret_key_ref {
+                name = "fluidbox-secrets"
+                key  = "OPENAI_API_KEY"
               }
             }
           }

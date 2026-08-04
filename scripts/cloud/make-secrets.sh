@@ -7,7 +7,8 @@
 # Inputs (env):
 #   FLUIDBOX_CLOUD_DATABASE_URL          Neon DIRECT (non-pooler) URL for the app DB   [required]
 #   FLUIDBOX_CLOUD_LITELLM_DATABASE_URL  small dedicated LiteLLM DB URL                [required]
-#   FLUIDBOX_CLOUD_ANTHROPIC_API_KEY     model key for LiteLLM                         [required]
+#   FLUIDBOX_CLOUD_ANTHROPIC_API_KEY     model key for LiteLLM (claude-*)              [required]
+#   FLUIDBOX_CLOUD_OPENAI_API_KEY        model key for LiteLLM (gpt-*, codex harness)  [required]
 #   FLUIDBOX_CLOUD_ADMIN_TOKEN / _CREDENTIAL_KEY / _LITELLM_MASTER_KEY  [optional: generated]
 #
 # Generated values are ALSO written to SSM SecureString under /fluidbox/cloud/*
@@ -25,6 +26,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 : "${FLUIDBOX_CLOUD_DATABASE_URL:?set FLUIDBOX_CLOUD_DATABASE_URL (Neon DIRECT non-pooler URL — pgbouncer breaks sqlx + LISTEN/NOTIFY)}"
 : "${FLUIDBOX_CLOUD_LITELLM_DATABASE_URL:?set FLUIDBOX_CLOUD_LITELLM_DATABASE_URL (dedicated small DB; NEVER the app DB)}"
 : "${FLUIDBOX_CLOUD_ANTHROPIC_API_KEY:?set FLUIDBOX_CLOUD_ANTHROPIC_API_KEY}"
+: "${FLUIDBOX_CLOUD_OPENAI_API_KEY:?set FLUIDBOX_CLOUD_OPENAI_API_KEY (litellm routes gpt-* for the codex harness)}"
 
 case "$FLUIDBOX_CLOUD_DATABASE_URL" in
   *-pooler*) die "DATABASE_URL looks like a POOLER endpoint" "use the DIRECT Neon connection string (CLAUDE.md gotcha: PgBouncer transaction mode breaks sqlx prepared statements and PgListener)";;
@@ -68,6 +70,7 @@ kubectl create secret generic fluidbox-secrets -n "$CLOUD_NS" \
   --from-literal=FLUIDBOX_CREDENTIAL_KEY="$CRED_KEY" \
   --from-literal=LITELLM_MASTER_KEY="$LITELLM_KEY" \
   --from-literal=ANTHROPIC_API_KEY="$FLUIDBOX_CLOUD_ANTHROPIC_API_KEY" \
+  --from-literal=OPENAI_API_KEY="$FLUIDBOX_CLOUD_OPENAI_API_KEY" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 ok "fluidbox-secrets applied"
 
