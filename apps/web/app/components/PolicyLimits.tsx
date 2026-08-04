@@ -15,11 +15,16 @@ import { useState } from "react";
 import {
   ApprovalScope,
   EgressMode,
+  NetworkGrantMode,
+  NetworkPolicy,
   PolicyAction,
   PolicyContent,
+  TargetRule,
 } from "../lib/api";
 import { coerceCap, coerceTtlSecs } from "../lib/policy-caps";
+import { MODE_HINT, MODE_LABEL, MODE_ORDER, networkOf } from "../lib/network";
 import { VERB } from "./PermissionMatrix";
+import { TargetRuleEditor } from "./TargetRuleEditor";
 
 /** A cap the policy did not set. `spec::Budgets` is four `Option`s, so an unset
  *  cap arrives as `null` — no ceiling of that kind, which is not zero. */
@@ -220,6 +225,92 @@ export function PolicyLimits({
         </label>
       </div>
       <p className="helper">If nobody answers in time: {VERB[approvals.timeout_action]}.</p>
+
+      {(() => {
+        const net = networkOf(content);
+        const setNet = (patch: Partial<NetworkPolicy>) =>
+          set({ network: { ...net, ...patch } });
+        return (
+          <>
+            <div className="sectitle">Where a sandbox may reach</div>
+            <p className="helper" style={{ marginBottom: 4 }}>
+              The ceiling for every run on this policy. An agent may ask for less, never more.
+            </p>
+
+            <label className="field">
+              <span className="lab">Ceiling</span>
+              <select
+                className="inp"
+                value={net.max_mode}
+                onChange={(e) => {
+                  const max_mode = e.target.value as NetworkGrantMode;
+                  // A public request must carry NO targets; clearing here keeps the
+                  // ceiling and the catalog from disagreeing on screen.
+                  setNet(max_mode === "public" ? { max_mode, allow: [] } : { max_mode });
+                }}
+              >
+                {MODE_ORDER.map((m) => (
+                  <option key={m} value={m}>
+                    {MODE_LABEL[m]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="helper">{MODE_HINT[net.max_mode]}</p>
+
+            {net.max_mode === "public" && (
+              <p className="helper warn">
+                Public grants reach anything the deployment&rsquo;s deny wall does not forbid.
+                On a deployment fronted by a CDN, that wall cannot enumerate every address of
+                your own public API, so a run could in principle reach it. Sandbox tokens are
+                scoped to the internal plane and the load balancer refuses unsigned origin
+                traffic, so the exposure is limited to unauthenticated endpoints — but prefer
+                Approved targets where you can name them.
+              </p>
+            )}
+
+            {net.max_mode === "approved" && (
+              <>
+                <div className="sectitle">Allowed targets</div>
+                <TargetRuleEditor
+                  value={net.allow}
+                  onChange={(allow: TargetRule[]) => setNet({ allow })}
+                />
+              </>
+            )}
+
+            {net.max_mode !== "offline" && (
+              <>
+                <label className="field">
+                  <span className="lab">Require a human to authorize each run</span>
+                  <input
+                    type="checkbox"
+                    checked={net.require_approval}
+                    onChange={(e) => setNet({ require_approval: e.target.checked })}
+                  />
+                </label>
+                <p className="helper">
+                  The run parks in <code>awaiting_authorization</code> and appears in the
+                  timeline for approval before it gets any egress.
+                </p>
+
+                <label className="field">
+                  <span className="lab">Max grant lifetime (seconds)</span>
+                  <input
+                    className="inp"
+                    type="number"
+                    value={net.max_grant_secs ?? ""}
+                    placeholder="default"
+                    onChange={(e) =>
+                      setNet({ max_grant_secs: e.target.value === "" ? null : Number(e.target.value) })
+                    }
+                  />
+                </label>
+              </>
+            )}
+          </>
+        );
+      })()}
 
       <div className="sectitle">Unattended runs</div>
       <label className="check">
