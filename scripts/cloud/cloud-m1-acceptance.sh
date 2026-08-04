@@ -258,15 +258,77 @@ c16() { say "[16] core + chart + suites unchanged and green"
           && record 16 "zero core/chart changes + core suite green" PASS "c16-unchanged.txt" \
           || record 16 "zero core/chart changes + core suite green" FAIL "c16-unchanged.txt"; }
 
+# [17] measured vs modeled cost.
+#
+# The old version asked only for the tag-filtered figure and recorded
+# MANUAL-REVIEW whenever the API CALL succeeded — including when it returned
+# $0.00 because the cost-allocation tag was never activated. Same
+# existence-vs-efficacy flaw as criterion 2: a successful call is not a
+# measurement.
+#
+# This account is SHARED with other projects (observed 2026-08-03: ~$5.7/day of
+# ECS + RDS + EC2 that is not ours), so an account-wide total can never be
+# fluidbox's idle cost. Two things are separately measurable:
+#
+#   * TAG-FILTERED — the real answer, but only once `project` is Active.
+#   * FLUIDBOX-EXCLUSIVE SERVICES — EKS does not appear anywhere in this
+#     account's pre-fluidbox baseline, so any EKS spend is ours by construction.
+#     That is a genuine partial measurement with no tag required, and it is the
+#     floor to sanity-check the model against while the tag is pending.
+#
+# Shared services (ELB, EC2, VPC, KMS, S3) still need the tag to attribute.
 c17() { say "[17] measured vs modeled cost"
-        local o="$EV/c17-cost.json"
-        aws ce get-cost-and-usage \
-          --time-period "Start=$(date -v1d +%Y-%m-%d 2>/dev/null || date -d "$(date +%Y-%m-01)" +%Y-%m-%d),End=$(date +%Y-%m-%d)" \
+        local o="$EV/c17-cost.json" x="$EV/c17-exclusive.json" t="$EV/c17-tag-status.json"
+        local start end
+        start=$(date -v1d +%Y-%m-%d 2>/dev/null || date -d "$(date +%Y-%m-01)" +%Y-%m-%d)
+        end=$(date +%Y-%m-%d)
+        [ "$start" = "$end" ] && { warn "month just rolled over — no closed day yet"; }
+
+        as_any ce list-cost-allocation-tags --region us-east-1 \
+          --query "CostAllocationTags[?TagKey=='project']" --output json > "$t" 2>&1
+        local tag_active=0
+        grep -q '"Status": *"Active"' "$t" && tag_active=1
+
+        # Always capture the fluidbox-exclusive slice; it needs no tag.
+        as_any ce get-cost-and-usage --time-period "Start=$start,End=$end" \
           --granularity MONTHLY --metrics UnblendedCost \
-          --filter "{\"Tags\":{\"Key\":\"project\",\"Values\":[\"fluidbox\"]}}" \
-          --group-by Type=DIMENSION,Key=SERVICE > "$o" 2>&1 \
-          && record 17 "cost reconciliation data captured" MANUAL-REVIEW "c17-cost.json vs docs/hosted/cloud-cost-model.md (write the delta into the validation report)" \
-          || record 17 "cost reconciliation" FAIL "c17-cost.json (is the cost-allocation tag Active yet?)"; }
+          --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Elastic Kubernetes Service"]}}' \
+          --region us-east-1 > "$x" 2>&1
+        local eks
+        eks=$(python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(sum(float(r['Total']['UnblendedCost']['Amount']) for r in d['ResultsByTime']))
+except Exception: print('0')" "$x" 2>/dev/null)
+        echo "  EKS (fluidbox-exclusive) month-to-date: \$$eks"
+
+        if [ "$tag_active" != "1" ]; then
+          fail "the 'project' cost-allocation tag is INACTIVE — fluidbox spend cannot be isolated"
+          fail "  this account is shared; an account-wide total is NOT fluidbox's idle cost"
+          fail "  activate it (Billing > Cost allocation tags), then re-run — needs ~24h to populate"
+          record 17 "measured cost not isolable (tag inactive; EKS-only floor \$$eks)" FAIL "c17-exclusive.json + c17-tag-status.json"
+          return
+        fi
+
+        as_any ce get-cost-and-usage --time-period "Start=$start,End=$end" \
+          --granularity MONTHLY --metrics UnblendedCost \
+          --filter '{"Tags":{"Key":"project","Values":["fluidbox"]}}' \
+          --group-by Type=DIMENSION,Key=SERVICE --region us-east-1 > "$o" 2>&1
+        local total
+        total=$(python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(round(sum(float(g['Metrics']['UnblendedCost']['Amount'])
+              for r in d['ResultsByTime'] for g in r.get('Groups',[])),2))
+except Exception: print('0')" "$o" 2>/dev/null)
+        echo "  tag-filtered month-to-date: \$$total"
+        if [ "$total" = "0" ] || [ "$total" = "0.0" ]; then
+          record 17 "tag Active but still \$0 — data not populated yet (allow 24h)" FAIL "c17-cost.json"
+        else
+          record 17 "measured cost captured (\$$total MTD) — reconcile vs cloud-cost-model.md" MANUAL-REVIEW "c17-cost.json"
+        fi; }
 
 c18() { say "[18] documentation set complete"
         local missing=0
