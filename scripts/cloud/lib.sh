@@ -87,7 +87,8 @@ cloud_admin_token() {
     --query Parameter.Value --output text 2>/dev/null)}"
 }
 
-# promote_owner <org-slug> <email> — grant owner to an already-provisioned member.
+# promote_owner <org-slug> <email> [membership-id] — grant owner to an
+# already-provisioned member.
 #
 # First login JIT-provisions at claim_mappings.default_role (member), and core
 # REFUSES to arm a bootstrap owner while an active owner exists ("an active
@@ -95,20 +96,53 @@ cloud_admin_token() {
 # 409). So promotion is a separate admin act, which also means it works for
 # issuers that never emit a true `email_verified` — the claim core's
 # bootstrap-owner path requires unconditionally.
+#
+# Email is NOT a unique key. Core identifies people by OIDC subject, and one
+# mailbox routinely maps to several subjects at the same IdP (observed live
+# 2026-08-04: the scripted `auth0|…` database user AND a `google-oauth2|…`
+# social login, same address, two active memberships). Picking "the first
+# email match" therefore promotes an arbitrary one — the original bug was a
+# silent no-op against the already-owner row while the session's membership
+# stayed member. On multiple matches this now refuses, prints the candidates,
+# and requires the explicit membership id. Deactivated memberships are never
+# candidates (promotion would be invisible until an admin reactivates them).
 promote_owner() {
-  local slug="${1:?usage: promote_owner <org-slug> <email>}"
-  local email="${2:?usage: promote_owner <org-slug> <email>}"
-  local auth mid code
+  local slug="${1:?usage: promote_owner <org-slug> <email> [membership-id]}"
+  local email="${2:?usage: promote_owner <org-slug> <email> [membership-id]}"
+  local pick="${3:-}"
+  local auth sel mid code
   auth="Authorization: Bearer $(cloud_admin_token)"
-  mid=$(curl -sS --max-time 20 -H "$auth" "$CLOUD_API/v1/admin/orgs/$slug/members" | python3 -c "
-import json,sys
-want=sys.argv[1].strip().lower()
-for m in json.load(sys.stdin).get('members',[]):
-    if (m.get('email') or '').strip().lower()==want:
-        print(m['membership_id']); break
-" "$email")
-  [ -n "$mid" ] || die "no member with email $email in org $slug" \
-    "sign in once at the dashboard first — that is what creates the membership"
+  sel=$(curl -sS --max-time 20 -H "$auth" "$CLOUD_API/v1/admin/orgs/$slug/members" | python3 -c "
+import json, sys
+want = sys.argv[1].strip().lower()
+pick = sys.argv[2].strip()
+matches = [m for m in json.load(sys.stdin).get('members', [])
+           if (m.get('email') or '').strip().lower() == want
+           and m.get('membership_status') == 'active']
+if pick:
+    matches = [m for m in matches if m.get('membership_id') == pick]
+if len(matches) == 1:
+    print('OK', matches[0]['membership_id'])
+else:
+    print('NONE' if not matches else 'MANY')
+    for m in matches:
+        print('  %s  roles=%-14s last_login=%s' % (
+            m['membership_id'], ','.join(m.get('roles', [])),
+            m.get('last_login_at') or '-'))
+" "$email" "$pick")
+  case "$sel" in
+    OK\ *) mid="${sel#OK }";;
+    NONE*) die "no active member with email $email${pick:+ and membership id $pick} in org $slug" \
+      "sign in once at the dashboard first — that is what creates the membership";;
+    MANY*)
+      fail "email $email has MULTIPLE active memberships in $slug — refusing to guess"
+      printf '    %s\n' \
+        "one mailbox can map to several IdP subjects (e.g. database user vs Google login)" \
+        "re-run with the membership id of the identity that should be owner:"
+      printf '%s\n' "$sel" | tail -n +2 | sed 's/^ */      /'
+      exit 1;;
+    *) die "could not list members of org $slug" "$(printf '%.400s' "$sel")";;
+  esac
   code=$(curl -sS -o /tmp/fbx-promote.json -w '%{http_code}' --max-time 20 \
     -X POST -H "$auth" -H 'Content-Type: application/json' \
     -d '{"roles":["member","owner"]}' \
