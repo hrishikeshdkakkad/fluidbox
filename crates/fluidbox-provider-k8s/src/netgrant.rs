@@ -201,6 +201,29 @@ pub fn build_run_policy(
         }
     }
 
+    // The policy's own denies, rendered as `egressDeny` so they actually bind.
+    // Cilium evaluates deny across ALL policies and it outranks every allow, so
+    // these hold even against this policy's own `toEntities: world`. Without
+    // them a `public` grant ignored the tenant's denies entirely: resolution
+    // iterates REQUESTED targets and a public request has none.
+    let egress_deny: Vec<Value> = g
+        .grant
+        .denied
+        .iter()
+        .map(|d| match d {
+            TargetRule::Dns { pattern, .. } => {
+                // A name-based deny lowers to the FQDN selector. It binds only
+                // once the name has been resolved through the DNS proxy, which
+                // is why the deployment-wide CIDR wall remains the floor.
+                json!({ "toFQDNs": [match pattern.normalized() {
+                    FqdnPattern::Exact { name } => json!({ "matchName": name }),
+                    FqdnPattern::Wildcard { suffix } => json!({ "matchPattern": format!("*.{suffix}") }),
+                }] })
+            }
+            TargetRule::Cidr { cidr, .. } => json!({ "toCIDR": [cidr.to_string()] }),
+        })
+        .collect();
+
     Some(json!({
         "apiVersion": "cilium.io/v2",
         "kind": "CiliumNetworkPolicy",
@@ -230,6 +253,7 @@ pub fn build_run_policy(
             // the cross-run isolation boundary.
             "endpointSelector": { "matchLabels": identity_labels(g, session_id) },
             "egress": egress,
+            "egressDeny": egress_deny,
         }
     }))
 }
@@ -423,6 +447,52 @@ mod tests {
         // A range lowers to Cilium's {port, endPort} form.
         assert_eq!(egress[0]["toPorts"][0]["ports"][0]["port"], "80");
         assert_eq!(egress[0]["toPorts"][0]["ports"][0]["endPort"], 443);
+    }
+
+    /// A `public` grant must still carry the tenant policy's own denies.
+    ///
+    /// This was the bypass: resolution iterates the REQUESTED targets, and a
+    /// public request has none by construction, so every `network.deny` entry
+    /// was skipped — and the lowering emitted `toEntities: world` with no
+    /// `egressDeny` at all. A policy saying "public, but never this corporate
+    /// range" got only the first half.
+    #[test]
+    fn a_public_grant_still_carries_the_policys_denies() {
+        let sid = uuid::Uuid::now_v7();
+        let mut g = granted(NetworkGrantMode::Public, vec![]);
+        g.grant.denied = vec![
+            TargetRule::cidr(
+                "203.0.113.0/24".parse().unwrap(),
+                vec![PortSpec::single(443)],
+                L4Protocol::Tcp,
+            ),
+            dns_target("corp.example", 443),
+        ];
+        let p = build_run_policy(&g, sid, &ctx()).unwrap();
+        let deny = p["spec"]["egressDeny"].as_array().unwrap();
+        assert_eq!(deny.len(), 2, "both denies must be rendered: {deny:?}");
+        assert_eq!(deny[0]["toCIDR"][0], "203.0.113.0/24");
+        assert_eq!(deny[1]["toFQDNs"][0]["matchPattern"], "*.corp.example");
+        // …alongside the world allow, which Cilium's deny precedence outranks.
+        let egress = p["spec"]["egress"].as_array().unwrap();
+        assert!(egress.iter().any(|r| r["toEntities"][0] == "world"));
+    }
+
+    /// An APPROVED grant carries them too — defence in depth, since resolution
+    /// already refuses a request that overlaps a deny.
+    #[test]
+    fn an_approved_grant_also_renders_the_policys_denies() {
+        let sid = uuid::Uuid::now_v7();
+        let mut g = granted(
+            NetworkGrantMode::Approved,
+            vec![dns_target("example.com", 443)],
+        );
+        g.grant.denied = vec![dns_target("secret.example.com", 443)];
+        let p = build_run_policy(&g, sid, &ctx()).unwrap();
+        assert_eq!(
+            p["spec"]["egressDeny"][0]["toFQDNs"][0]["matchPattern"],
+            "*.secret.example.com"
+        );
     }
 
     #[test]

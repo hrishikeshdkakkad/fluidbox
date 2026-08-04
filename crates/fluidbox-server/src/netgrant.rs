@@ -359,18 +359,21 @@ async fn reverify_context(
         serde_json::from_value(session.run_spec.clone()).map_err(|e| e.to_string())?;
     // The CURRENT policy, not the frozen snapshot: the point of the re-check is
     // to notice that the world moved.
-    let current = match fluidbox_db::latest_policy_version(&state.pool, scope, spec.policy_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        Some(v) => {
-            serde_json::from_value::<fluidbox_core::policy::Policy>(v.content).unwrap_or(
-                // A policy that no longer parses cannot authorize anything.
-                spec.policy_snapshot.clone(),
-            )
-        }
-        None => spec.policy_snapshot.clone(),
-    };
+    // The CURRENT policy, not the frozen snapshot: the point of the re-check is
+    // to notice that the world moved. An unreadable or missing one REFUSES —
+    // falling back to the frozen policy would release under exactly the stale
+    // authority this check exists to catch, and during a rolling deploy an
+    // older replica that cannot parse a newer policy schema would do so
+    // routinely.
+    let current: fluidbox_core::policy::Policy =
+        match fluidbox_db::latest_policy_version(&state.pool, scope, spec.policy_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Some(v) => serde_json::from_value(v.content)
+                .map_err(|e| format!("the current policy could not be read: {e}"))?,
+            None => return Err("the governing policy has no versions".into()),
+        };
     // The request that produced this grant, reconstructed from the frozen
     // authority itself: re-resolution must be asked the same question the
     // approver answered.
