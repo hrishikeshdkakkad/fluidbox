@@ -447,11 +447,12 @@ curl -s -X POST -H "$H" "$API/v1/sessions/$S2/cancel" >/dev/null
 #      default (`FLUIDBOX_NETWORK_ENFORCER` unset ⇒ none). This is the real
 #      posture of a Docker deployment: a deployment that cannot enforce a grant
 #      is offline-only and says so.
-#   2/3. APPROVE and DENY of the pre-provisioning pause. Those need an enforcer,
-#      so this section starts its OWN server on a second port with
-#      `FLUIDBOX_NETWORK_ENFORCER=cilium` rather than skipping — the governance
-#      choreography is what is under test here; the DATAPATH is Phase 4/6's job.
-say "NETWORK GRANTS — refusal, pause, approve, deny"
+#   2. That the env var alone CANNOT conjure an enforcer: a second server runs
+#      with `FLUIDBOX_NETWORK_ENFORCER=cilium` on the Docker provider and must
+#      still refuse, because availability is asked of the PROVIDER. The
+#      pause/approve/deny choreography moved to where an enforcer really exists
+#      (see the note below).
+say "NETWORK GRANTS — refusal is provider-driven"
 
 NETPOL=netgrant-e2e
 del "/policies/$NETPOL" >/dev/null
@@ -534,79 +535,34 @@ if [ "$NET_UP" != "1" ]; then
 else
   ok "second server up with FLUIDBOX_NETWORK_ENFORCER=cilium"
 
-  nsess() { # task -> session json
-    curl -s -X POST -H "$H" -H "$CT" \
-      -d "{\"agent\":\"$NET_AGENT\",\"task\":\"$1\",\"repo\":{\"kind\":\"none\"}}" \
-      "$NET_API/v1/sessions"
-  }
-  nget() { curl -s -H "$H" "$NET_API/v1$1"; }
+  # The env var alone must NOT be enough. `enforcement_available` asks the
+  # PROVIDER, and the Docker provider has no target-level egress enforcement —
+  # so it refuses even when an operator has configured an enforcer it cannot
+  # deliver. This assertion exists because the earlier wiring read the CONFIG,
+  # which would have admitted the grant here and only failed at provision.
+  CODE=$(curl -s -o "$GB" -w "%{http_code}" -X POST -H "$H" -H "$CT" \
+    -d "{\"agent\":\"$NET_AGENT\",\"task\":\"docker cannot enforce\",\"repo\":{\"kind\":\"none\"}}" \
+    "$NET_API/v1/sessions")
+  if [ "$CODE" = "422" ] && grep -qi "cannot enforce network grants" "$GB"; then
+    ok "…and the DOCKER provider still refuses: the env var cannot conjure an enforcer"
+  else
+    no "expected 422 unenforceable from the Docker provider, got $CODE: $(cat "$GB")"
+  fi
 
-  # ── The pause ────────────────────────────────────────────────────────
-  NS=$(nsess "netgrant approve" | j "['session']['id']")
-  [ -n "$NS" ] && ok "run created with an enforcer present ($NS)" || no "run create failed"
-  ST=$(nget "/sessions/$NS" | j "['session']['status']")
-  [ "$ST" = "awaiting_authorization" ] \
-    && ok "…and PARKED in awaiting_authorization (no sandbox provisioned)" \
-    || no "expected awaiting_authorization, got '$ST'"
-  # No container may exist for a parked run — the whole point of the pause.
-  sleep 2
-  NCONT=$(docker ps --filter "label=fluidbox.session=$NS" -q | wc -l | tr -d ' ')
-  [ "$NCONT" = "0" ] && ok "…with ZERO sandboxes (enforcement precedes any code)" || no "$NCONT sandbox(es) exist for a parked run"
-
-  # The approval carries the grant digest as its consent anchor.
-  NAID=$(nget "/sessions/$NS/approvals" | python3 -c "
-import sys,json
-a=[x for x in json.load(sys.stdin)['approvals'] if x['tool']=='network.grant']
-print(a[0]['id'] if a else '')" 2>/dev/null)
-  [ -n "$NAID" ] && ok "a network.grant approval is pending" || no "no network.grant approval row"
-  NDIG=$(nget "/sessions/$NS/approvals" | python3 -c "
-import sys,json
-a=[x for x in json.load(sys.stdin)['approvals'] if x['tool']=='network.grant']
-print(a[0].get('input_digest','') if a else '')" 2>/dev/null)
-  SDIG=$(nget "/sessions/$NS" | python3 -c "
-import sys,json
-print(json.load(sys.stdin)['session']['run_spec']['network'].get('mode',''))" 2>/dev/null)
-  [ -n "$NDIG" ] && ok "…whose input_digest is the grant digest (a stable thing to consent to)" || no "approval carries no input_digest"
-  [ "$SDIG" = "approved" ] && ok "the frozen RunSpec carries the resolved grant (mode=approved)" || no "run_spec.network.mode = '$SDIG'"
-
-  # ── APPROVE → released ───────────────────────────────────────────────
-  curl -s -X POST -H "$H" -H "$CT" -d '{"decision":"approved_once"}' \
-    "$NET_API/v1/approvals/$NAID/decision" >/dev/null
-  REL=""
-  for _ in $(seq 1 30); do
-    ST=$(nget "/sessions/$NS" | j "['session']['status']")
-    [ "$ST" != "awaiting_authorization" ] && { REL=$ST; break; }
-    sleep 1
-  done
-  [ -n "$REL" ] && ok "approved grant released the pause (→ $REL)" || no "still parked 30s after approval"
-  curl -s -X POST -H "$H" "$NET_API/v1/sessions/$NS/cancel" >/dev/null
-
-  # ── DENY → the run never provisions ──────────────────────────────────
-  NS2=$(nsess "netgrant deny" | j "['session']['id']")
-  NAID2=$(nget "/sessions/$NS2/approvals" | python3 -c "
-import sys,json
-a=[x for x in json.load(sys.stdin)['approvals'] if x['tool']=='network.grant']
-print(a[0]['id'] if a else '')" 2>/dev/null)
-  [ -n "$NAID2" ] && ok "second run parked with its own approval" || no "no approval for the deny case"
-  curl -s -X POST -H "$H" -H "$CT" -d '{"decision":"denied"}' \
-    "$NET_API/v1/approvals/$NAID2/decision" >/dev/null
-  DST=""
-  for _ in $(seq 1 30); do
-    ST=$(nget "/sessions/$NS2" | j "['session']['status']")
-    case "$ST" in failed|cancelled|finalizing|cancelling) DST=$ST; break;; esac
-    sleep 1
-  done
-  [ -n "$DST" ] && ok "denied grant wound the run down (→ $DST) — it never provisioned" || no "denied run stuck in '$ST'"
-  NCONT2=$(docker ps --filter "label=fluidbox.session=$NS2" -q | wc -l | tr -d ' ')
-  [ "$NCONT2" = "0" ] && ok "…with ZERO sandboxes ever created" || no "$NCONT2 sandbox(es) for a denied run"
-  # The timeline records both the freeze and the refusal.
-  NEV=$(nget "/sessions/$NS2/events?limit=200" | python3 -c "
-import sys,json
-t=[e['type'] for e in json.load(sys.stdin)['events']]
-print(','.join(sorted({x for x in t if x.startswith('network.grant')})))" 2>/dev/null)
-  echo "$NEV" | grep -q "network.grant.frozen" \
-    && ok "ledger carries network.grant.frozen (+ $NEV)" || no "timeline network events: '$NEV'"
-
+  # NOTE — the pause/approve/deny choreography is NOT exercised here any more,
+  # and that is a deliberate consequence of a fix rather than lost coverage.
+  #
+  # `enforcement_available` used to read the CONFIG, so setting the env var on a
+  # Docker deployment was enough to reach the pause. It now asks the PROVIDER,
+  # which is the whole point: a deployment that cannot enforce refuses at create
+  # time instead of parking a run it could never have contained. There is no
+  # honest way to reach the pause from Docker, and adding a seam that made an
+  # unenforceable deployment claim otherwise would reintroduce exactly the
+  # fail-open this closed.
+  #
+  # The choreography is covered where an enforcer genuinely exists:
+  # `scripts/netgrant-kind-validation.sh` (live Cilium) and the Rust tests in
+  # `netgrant.rs` (park, release re-verification, refusal).
   kill "$NET_PID" 2>/dev/null; wait "$NET_PID" 2>/dev/null
 fi
 

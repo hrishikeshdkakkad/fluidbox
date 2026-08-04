@@ -27,3 +27,11 @@ kube = { version = "4", default-features = false, features = [
     "ws",
 ] }
 k8s-openapi = { version = "0.28", features = ["latest"] }
+
+chrono = { workspace = true }
+
+[dev-dependencies]
+# The live enforcer EXAMPLE drives kube-rs directly, so it needs the same
+# process-level CryptoProvider main.rs installs. Dev-only: the library itself
+# never picks a TLS backend for its embedder.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
