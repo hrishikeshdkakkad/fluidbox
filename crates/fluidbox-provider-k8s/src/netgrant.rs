@@ -96,19 +96,47 @@ fn egress_rule(rule: &TargetRule) -> Value {
     }
 }
 
-/// The DNS-visibility rule. `toFQDNs` only works when the DNS request itself
-/// transits Cilium's L7 proxy, which is what `rules.dns` turns on — without it
-/// a name-based grant matches nothing at all.
+/// The DNS rule. `toFQDNs` only works when the DNS request itself transits
+/// Cilium's L7 proxy, which is what `rules.dns` turns on — without it a
+/// name-based grant matches nothing at all.
 ///
-/// It is emitted ONLY for a mode that has name-based targets. Offline gets no
-/// DNS allow whatsoever, which is what makes offline byte-identical in effect
-/// to today's `zeroEgress`.
-fn dns_visibility_rule(resolver_labels: &Value) -> Value {
+/// **`patterns` restricts WHICH NAMES may be looked up, and that is a
+/// containment control, not a formality.** An unrestricted `matchPattern: "*"`
+/// is a covert egress channel on its own: the workload queries
+/// `<base32-encoded-secret>.attacker.example`, the resolver forwards it to the
+/// public internet, and the attacker's authoritative nameserver receives the
+/// data — **without ever opening a connection the policy would have blocked.**
+/// The question *is* the exfiltration. So an `approved` grant may resolve
+/// exactly the names it was granted and nothing else.
+///
+/// `public` passes `None`, which does emit `*`: a public grant may already
+/// connect anywhere the deny wall permits, so restricting its lookups would
+/// buy nothing and break ordinary name resolution.
+///
+/// Offline gets no DNS rule whatsoever, which is what keeps offline
+/// byte-identical in effect to `zeroEgress`.
+fn dns_rule(resolver_labels: &Value, patterns: Option<&[&TargetRule]>) -> Value {
+    let dns_matchers: Vec<Value> = match patterns {
+        None => vec![json!({ "matchPattern": "*" })],
+        Some(targets) => targets
+            .iter()
+            .filter_map(|t| match t {
+                TargetRule::Dns { pattern, .. } => Some(match pattern.normalized() {
+                    FqdnPattern::Exact { name } => json!({ "matchName": name }),
+                    FqdnPattern::Wildcard { suffix } => {
+                        json!({ "matchPattern": format!("*.{suffix}") })
+                    }
+                }),
+                // A CIDR target needs no name resolved.
+                TargetRule::Cidr { .. } => None,
+            })
+            .collect(),
+    };
     json!({
         "toEndpoints": [{ "matchLabels": resolver_labels }],
         "toPorts": [{
             "ports": [{ "port": "53", "protocol": "ANY" }],
-            "rules": { "dns": [{ "matchPattern": "*" }] }
+            "rules": { "dns": dns_matchers }
         }]
     })
 }
@@ -138,13 +166,71 @@ pub struct PolicyContext {
 /// emitting an empty policy would be noise at best and, if it ever grew an
 /// empty-egress-means-allow-all interpretation, a hazard. The chart-static
 /// baseline already puts every sandbox in default-deny.
+/// `Err` means the grant CANNOT be safely rendered and the run must not start.
 pub fn build_run_policy(
     g: &GrantedNetwork,
     session_id: uuid::Uuid,
     ctx: &PolicyContext,
-) -> Option<Value> {
+) -> Result<Option<Value>, String> {
+    // A schema this binary does not know is refused, and BEFORE the offline
+    // shortcut: an unknown future `offline` might not mean offline under that
+    // schema's semantics, so answering "no policy needed" would be an assumption
+    // this build is not entitled to make.
+    //
+    // The bound is enforced in BOTH directions. Too HIGH and the grant carries
+    // semantics this build cannot interpret — a rollback after a future v3 would
+    // otherwise render a v3 grant under v2 rules and silently ignore whatever v3
+    // added. An old binary cannot be repaired once v3 exists, so the upper bound
+    // has to exist now, before there is anything to enforce it against.
+    if !g.grant.schema_supported() {
+        return Err(format!(
+            "this grant is schema v{}, which this build does not know (it understands up \
+             to v{}) — refusing to interpret it",
+            g.grant.schema_version,
+            fluidbox_core::network::SCHEMA_VERSION
+        ));
+    }
     if !g.grant.grants_egress() {
-        return None;
+        return Ok(None);
+    }
+    // A NAME-based deny under `public` cannot be rendered (see `egress_deny`
+    // below) and `public` allows the world — so silently filtering it would
+    // leave the allow standing with the deny gone.
+    //
+    // Checked HERE rather than only at resolution because resolution does not
+    // see every path: a grant frozen before that check existed still releases
+    // under the unchanged-policy shortcut, and an already-active grant is never
+    // re-resolved at all. The renderer is the one place EVERY grant passes
+    // through, so it is where this has to fail closed.
+    if g.grant.mode == NetworkGrantMode::Public {
+        // A grant frozen BEFORE deny snapshots existed carries an empty list
+        // that means "unknown", not "none" — so programming it as a world-allow
+        // could silently drop denies the policy really had. Nothing in the
+        // grant can distinguish the two cases, so the schema version is the
+        // disambiguator and a v1 public grant is refused. Recreate the run:
+        // resolution will freeze a v2 grant with its denies recorded.
+        if g.grant.schema_version < fluidbox_core::network::SCHEMA_WITH_DENIES {
+            return Err(format!(
+                "this `public` grant was frozen under schema v{} — before policy denies \
+                 were recorded in the grant — so its deny set is UNKNOWN rather than \
+                 empty. Refusing to program a world-allow that might be missing them; \
+                 recreate the run to freeze a current grant.",
+                g.grant.schema_version
+            ));
+        }
+        if let Some(d) = g
+            .grant
+            .denied
+            .iter()
+            .find(|d| matches!(d, TargetRule::Dns { .. }))
+        {
+            return Err(format!(
+                "this grant is `public` and its policy denies {} by NAME, which Cilium's \
+                 egressDeny cannot express — refusing to program a policy that would allow \
+                 the world with that deny silently absent",
+                d.describe()
+            ));
+        }
     }
     let mut egress: Vec<Value> = Vec::new();
     match g.grant.mode {
@@ -156,13 +242,15 @@ pub fn build_run_policy(
                 .iter()
                 .any(|t| matches!(t, TargetRule::Dns { .. }));
             if has_dns_targets {
-                egress.push(dns_visibility_rule(&ctx.resolver_labels));
+                let dns_targets: Vec<&TargetRule> = g.grant.targets.iter().collect();
+                egress.push(dns_rule(&ctx.resolver_labels, Some(&dns_targets)));
             }
             egress.extend(g.grant.targets.iter().map(egress_rule));
         }
         NetworkGrantMode::Public => {
-            // Public still needs names to resolve.
-            egress.push(dns_visibility_rule(&ctx.resolver_labels));
+            // Public may already connect anywhere the wall permits, so an
+            // unrestricted lookup adds no reach it does not already have.
+            egress.push(dns_rule(&ctx.resolver_labels, None));
             // `world`, NEVER `all`: a CIDR/world selector cannot reach
             // in-cluster identities, which is exactly the property that keeps
             // `public` from implicitly opening the cluster. `all` would throw
@@ -171,7 +259,43 @@ pub fn build_run_policy(
         }
     }
 
-    Some(json!({
+    // The policy's own denies, rendered as `egressDeny` so they actually bind.
+    // Cilium evaluates deny across ALL policies and it outranks every allow, so
+    // these hold even against this policy's own `toEntities: world`. Without
+    // them a `public` grant ignored the tenant's denies entirely: resolution
+    // iterates REQUESTED targets and a public request has none.
+    //
+    // **CIDR denies ONLY.** `EgressDenyRule` in `cilium.io/v2` has no `toFQDNs`
+    // field — verified against the 1.19.6 CRD schema, where `egress` carries it
+    // and `egressDeny` does not. Cilium declined the feature deliberately
+    // (cilium#35494): a DNS deny would have to fail open for names the proxy has
+    // not yet resolved. Emitting one here would be pruned by the API server,
+    // leaving the `world` allow standing with NO deny — precisely the fail-open
+    // this rendering exists to prevent.
+    //
+    // A DNS deny is therefore enforced at RESOLUTION instead, which refuses the
+    // run outright rather than issuing a grant it cannot contain. See
+    // `resolve_network_grant`'s unenforceable-deny check.
+    let egress_deny: Vec<Value> = g
+        .grant
+        .denied
+        .iter()
+        .filter_map(|d| match d {
+            TargetRule::Cidr { cidr, .. } => Some(json!({
+                "toCIDR": [cidr.to_string()],
+                // Ports and protocol are part of the deny. Dropping them would
+                // silently WIDEN an authored `TCP/443` deny into all-ports,
+                // all-protocols — safe here by luck, but a lie about what the
+                // operator wrote, and wrong the moment a deny is meant to be
+                // surgical.
+                "toPorts": to_ports(d),
+            })),
+            // Unrenderable; resolution refuses these instead.
+            TargetRule::Dns { .. } => None,
+        })
+        .collect();
+
+    Ok(Some(json!({
         "apiVersion": "cilium.io/v2",
         "kind": "CiliumNetworkPolicy",
         "metadata": {
@@ -200,8 +324,9 @@ pub fn build_run_policy(
             // the cross-run isolation boundary.
             "endpointSelector": { "matchLabels": identity_labels(g, session_id) },
             "egress": egress,
+            "egressDeny": egress_deny,
         }
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -257,7 +382,9 @@ mod tests {
         // existing zeroEgress posture, delivered by the chart-static baseline.
         let sid = uuid::Uuid::now_v7();
         assert!(
-            build_run_policy(&granted(NetworkGrantMode::Offline, vec![]), sid, &ctx()).is_none()
+            build_run_policy(&granted(NetworkGrantMode::Offline, vec![]), sid, &ctx())
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -272,7 +399,7 @@ mod tests {
             NetworkGrantMode::Approved,
             vec![dns_target("example.com", 443)],
         );
-        let p = build_run_policy(&g, sid, &ctx()).unwrap();
+        let p = build_run_policy(&g, sid, &ctx()).unwrap().unwrap();
         let sel = &p["spec"]["endpointSelector"]["matchLabels"];
         assert_eq!(sel[LABEL_SESSION], sid.to_string());
         assert_eq!(sel[LABEL_TENANT], g.tenant_id.to_string());
@@ -295,19 +422,81 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let egress = p["spec"]["egress"].as_array().unwrap();
         // The DNS-visibility rule must be present, and must carry rules.dns —
         // without it `toFQDNs` matches nothing at all.
         let dns = &egress[0];
         assert_eq!(dns["toPorts"][0]["ports"][0]["port"], "53");
-        assert_eq!(dns["toPorts"][0]["rules"]["dns"][0]["matchPattern"], "*");
+        // Scoped to the granted name, not `*` — see
+        // `an_approved_grant_may_resolve_only_its_granted_names` for why an
+        // unrestricted lookup is itself an exfiltration channel.
+        assert_eq!(
+            dns["toPorts"][0]["rules"]["dns"][0]["matchPattern"],
+            "*.example.com"
+        );
         // …and the grant itself.
         let allow = &egress[1];
         assert_eq!(allow["toFQDNs"][0]["matchPattern"], "*.example.com");
         assert_eq!(allow["toPorts"][0]["ports"][0]["port"], "443");
         assert_eq!(allow["toPorts"][0]["ports"][0]["protocol"], "TCP");
         assert!(allow["toPorts"][0]["ports"][0].get("endPort").is_none());
+    }
+
+    /// The DNS rule must permit ONLY the granted names.
+    ///
+    /// An unrestricted `matchPattern: "*"` is a covert egress channel by
+    /// itself — the workload encodes secrets into a lookup for a domain the
+    /// attacker controls and their nameserver receives it, with no connection
+    /// the policy could have blocked. This is the assertion that keeps the
+    /// channel closed.
+    #[test]
+    fn an_approved_grant_may_resolve_only_its_granted_names() {
+        let sid = uuid::Uuid::now_v7();
+        let p = build_run_policy(
+            &granted(
+                NetworkGrantMode::Approved,
+                vec![
+                    dns_target("example.com", 443),
+                    TargetRule::dns(
+                        FqdnPattern::Exact {
+                            name: "pypi.org".into(),
+                        },
+                        vec![PortSpec::single(443)],
+                        L4Protocol::Tcp,
+                    ),
+                ],
+            ),
+            sid,
+            &ctx(),
+        )
+        .unwrap()
+        .unwrap();
+        let dns = &p["spec"]["egress"][0]["toPorts"][0]["rules"]["dns"];
+        let matchers = dns.as_array().unwrap();
+        assert_eq!(matchers.len(), 2, "one matcher per granted name: {dns}");
+        assert_eq!(matchers[0]["matchPattern"], "*.example.com");
+        assert_eq!(matchers[1]["matchName"], "pypi.org");
+        // THE assertion: no wildcard-everything anywhere in the rendered policy.
+        let rendered = serde_json::to_string(&p).unwrap();
+        assert!(
+            !rendered.contains(r#"{"matchPattern":"*"}"#),
+            "an approved grant must not permit arbitrary DNS lookups: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_public_grant_may_resolve_anything_because_it_may_reach_anything() {
+        // Restricting lookups here would buy no containment — public already
+        // reaches whatever the deny wall permits — and would break ordinary
+        // name resolution.
+        let sid = uuid::Uuid::now_v7();
+        let p = build_run_policy(&granted(NetworkGrantMode::Public, vec![]), sid, &ctx())
+            .unwrap()
+            .unwrap();
+        let dns = &p["spec"]["egress"][0]["toPorts"][0]["rules"]["dns"];
+        assert_eq!(dns[0]["matchPattern"], "*");
     }
 
     #[test]
@@ -328,6 +517,7 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let egress = p["spec"]["egress"].as_array().unwrap();
         assert_eq!(egress.len(), 1, "only the CIDR allow: {egress:?}");
@@ -337,6 +527,159 @@ mod tests {
         assert_eq!(egress[0]["toPorts"][0]["ports"][0]["endPort"], 443);
     }
 
+    /// A `public` grant must still carry the tenant policy's own denies.
+    ///
+    /// This was the bypass: resolution iterates the REQUESTED targets, and a
+    /// public request has none by construction, so every `network.deny` entry
+    /// was skipped — and the lowering emitted `toEntities: world` with no
+    /// `egressDeny` at all. A policy saying "public, but never this corporate
+    /// range" got only the first half.
+    #[test]
+    fn a_public_grant_still_carries_the_policys_denies() {
+        let sid = uuid::Uuid::now_v7();
+        let mut g = granted(NetworkGrantMode::Public, vec![]);
+        // CIDR denies only — a NAME deny under `public` is a REFUSAL, covered by
+        // `a_dns_deny_is_never_rendered_because_cilium_cannot_express_it`.
+        g.grant.denied = vec![
+            TargetRule::cidr(
+                "203.0.113.0/24".parse().unwrap(),
+                vec![PortSpec::single(443)],
+                L4Protocol::Tcp,
+            ),
+            TargetRule::cidr(
+                "198.51.100.0/24".parse().unwrap(),
+                vec![PortSpec::single(80)],
+                L4Protocol::Tcp,
+            ),
+        ];
+        let p = build_run_policy(&g, sid, &ctx()).unwrap().unwrap();
+        let deny = p["spec"]["egressDeny"].as_array().unwrap();
+        assert_eq!(deny.len(), 2, "both CIDR denies must render: {deny:?}");
+        assert_eq!(deny[0]["toCIDR"][0], "203.0.113.0/24");
+        assert_eq!(deny[1]["toCIDR"][0], "198.51.100.0/24");
+        // …alongside the world allow, which Cilium's deny precedence outranks.
+        let egress = p["spec"]["egress"].as_array().unwrap();
+        assert!(egress.iter().any(|r| r["toEntities"][0] == "world"));
+    }
+
+    /// A grant from a schema this build does not know is refused in BOTH
+    /// directions, and the two directions fail for DIFFERENT reasons.
+    ///
+    /// Too LOW: its deny snapshot is unknown rather than empty, so programming
+    /// it as a world-allow could silently drop denies the policy really had.
+    /// Too HIGH: it carries semantics this build cannot interpret, and a
+    /// rollback would otherwise render a future grant under today's rules. The
+    /// upper bound has to exist BEFORE there is a future schema, because an old
+    /// binary cannot be repaired once one exists.
+    #[test]
+    fn a_grant_from_an_unknown_schema_is_refused_in_both_directions() {
+        use fluidbox_core::network::{SCHEMA_VERSION, SCHEMA_WITH_DENIES};
+        let sid = uuid::Uuid::now_v7();
+
+        // Too low: a v1 `public` grant, whose empty deny list means "unknown".
+        let mut old = granted(NetworkGrantMode::Public, vec![]);
+        old.grant.schema_version = SCHEMA_WITH_DENIES - 1;
+        let err = build_run_policy(&old, sid, &ctx()).expect_err("v1 public must refuse");
+        assert!(
+            err.contains("deny set is UNKNOWN"),
+            "names the reason: {err}"
+        );
+
+        // Too high: a schema this build has never seen.
+        let mut future = granted(NetworkGrantMode::Approved, vec![dns_target("a.test", 443)]);
+        future.grant.schema_version = SCHEMA_VERSION + 1;
+        let err = build_run_policy(&future, sid, &ctx()).expect_err("a future schema must refuse");
+        assert!(err.contains("does not know"), "names the reason: {err}");
+
+        // FALSE-GREEN GUARDS. A CURRENT-schema grant of each mode still renders,
+        // so this cannot pass by refusing everything…
+        let ok = granted(NetworkGrantMode::Public, vec![]);
+        assert_eq!(ok.grant.schema_version, SCHEMA_VERSION);
+        assert!(build_run_policy(&ok, sid, &ctx()).is_ok());
+        // …and a LOW-schema grant that is not `public` is unaffected: `approved`
+        // is a closed allow-list resolution already checked against the live
+        // policy, and `offline` programs nothing at all.
+        let mut old_approved = granted(NetworkGrantMode::Approved, vec![dns_target("a.test", 443)]);
+        old_approved.grant.schema_version = SCHEMA_WITH_DENIES - 1;
+        assert!(build_run_policy(&old_approved, sid, &ctx()).is_ok());
+        let mut old_offline = granted(NetworkGrantMode::Offline, vec![]);
+        old_offline.grant.schema_version = SCHEMA_WITH_DENIES - 1;
+        assert_eq!(build_run_policy(&old_offline, sid, &ctx()).unwrap(), None);
+    }
+
+    /// A NAME-based deny must NOT be rendered: `EgressDenyRule` has no
+    /// `toFQDNs` in `cilium.io/v2` (verified against the 1.19.6 CRD schema —
+    /// `egress` carries the field, `egressDeny` does not; cilium#35494 declined
+    /// it because a DNS deny would fail open for unresolved names). Emitting
+    /// one would be PRUNED by the API server, leaving the world allow standing
+    /// with no deny at all — a fail-open dressed as a fix. Resolution refuses
+    /// the run instead.
+    #[test]
+    fn a_dns_deny_is_never_rendered_because_cilium_cannot_express_it() {
+        let sid = uuid::Uuid::now_v7();
+        // A `public` grant whose policy denies a NAME is REFUSED outright.
+        // Rendering it with the deny quietly filtered would leave the world
+        // allow standing with the deny gone — a fail-open dressed as a fix.
+        // Refusing HERE (not only at resolution) covers every path, including
+        // grants frozen before the resolution-time check existed, and grants
+        // that are already active and never re-resolved.
+        let mut g = granted(NetworkGrantMode::Public, vec![]);
+        g.grant.denied = vec![dns_target("corp.example", 443)];
+        let err = build_run_policy(&g, sid, &ctx())
+            .expect_err("a public grant with a NAME deny must refuse");
+        assert!(err.contains("corp.example"), "the refusal names it: {err}");
+
+        // APPROVED does not refuse: the grant is a closed allow-list and
+        // resolution already refuses any target overlapping a deny, so nothing
+        // is silently lost by not rendering it. (It does NOT enforce the deny
+        // at the datapath either — a denied service co-hosted on a granted
+        // name's address stays reachable. That residual is documented.)
+        let mut appr = granted(
+            NetworkGrantMode::Approved,
+            vec![dns_target("example.com", 443)],
+        );
+        appr.grant.denied = vec![dns_target("corp.example", 443)];
+        assert!(build_run_policy(&appr, sid, &ctx()).is_ok());
+
+        // A CIDR deny renders, with ports and protocol intact — dropping them
+        // would silently WIDEN an authored TCP/443 deny to all-ports.
+        let mut ok_grant = granted(NetworkGrantMode::Public, vec![]);
+        ok_grant.grant.denied = vec![TargetRule::cidr(
+            "203.0.113.0/24".parse().unwrap(),
+            vec![PortSpec::single(443)],
+            L4Protocol::Tcp,
+        )];
+        let p = build_run_policy(&ok_grant, sid, &ctx()).unwrap().unwrap();
+        let deny = p["spec"]["egressDeny"].as_array().unwrap();
+        assert_eq!(deny.len(), 1, "only the CIDR deny is renderable: {deny:?}");
+        assert_eq!(deny[0]["toCIDR"][0], "203.0.113.0/24");
+        let rendered = serde_json::to_string(&p["spec"]["egressDeny"]).unwrap();
+        assert!(
+            !rendered.contains("toFQDNs"),
+            "an unrenderable DNS deny must not be emitted: {rendered}"
+        );
+        assert_eq!(deny[0]["toPorts"][0]["ports"][0]["port"], "443");
+        assert_eq!(deny[0]["toPorts"][0]["ports"][0]["protocol"], "TCP");
+    }
+
+    /// An APPROVED grant carries them too — defence in depth, since resolution
+    /// already refuses a request that overlaps a deny.
+    #[test]
+    fn an_approved_grant_also_renders_the_policys_denies() {
+        let sid = uuid::Uuid::now_v7();
+        let mut g = granted(
+            NetworkGrantMode::Approved,
+            vec![dns_target("example.com", 443)],
+        );
+        g.grant.denied = vec![TargetRule::cidr(
+            "198.51.100.0/24".parse().unwrap(),
+            vec![PortSpec::single(443)],
+            L4Protocol::Tcp,
+        )];
+        let p = build_run_policy(&g, sid, &ctx()).unwrap().unwrap();
+        assert_eq!(p["spec"]["egressDeny"][0]["toCIDR"][0], "198.51.100.0/24");
+    }
+
     #[test]
     fn public_lowers_to_world_never_all() {
         // `all` includes cluster entities; `world` cannot reach them. That
@@ -344,7 +687,9 @@ mod tests {
         // cluster, and the Phase 0 spike is why it is stated as a rule rather
         // than left to whoever edits this next.
         let sid = uuid::Uuid::now_v7();
-        let p = build_run_policy(&granted(NetworkGrantMode::Public, vec![]), sid, &ctx()).unwrap();
+        let p = build_run_policy(&granted(NetworkGrantMode::Public, vec![]), sid, &ctx())
+            .unwrap()
+            .unwrap();
         let egress = p["spec"]["egress"].as_array().unwrap();
         let entities: Vec<&Value> = egress.iter().filter_map(|r| r.get("toEntities")).collect();
         assert_eq!(entities.len(), 1);
@@ -376,6 +721,7 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let owner = &p["metadata"]["ownerReferences"][0];
         assert_eq!(owner["kind"], "Pod");
@@ -417,6 +763,7 @@ mod tests {
             sid,
             &ctx(),
         )
+        .unwrap()
         .unwrap();
         let allow = &p["spec"]["egress"][1];
         assert_eq!(allow["toFQDNs"][0]["matchName"], "api.example.com");

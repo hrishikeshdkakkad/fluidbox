@@ -329,7 +329,7 @@ struct DraftPolicy {
     #[serde(default)]
     egress: DraftEgress,
     #[serde(default)]
-    network: crate::network::NetworkPolicy,
+    network: DraftNetwork,
     #[serde(default)]
     budgets: DraftBudgets,
     #[serde(default)]
@@ -352,6 +352,46 @@ struct DraftDefaults {
 struct DraftEgress {
     #[serde(default)]
     mode: EgressMode,
+}
+
+/// Strict mirror of [`crate::network::NetworkPolicy`].
+///
+/// It exists for the same reason every other `Draft*` here does, and the cost
+/// of its absence was concrete: `DraftPolicy` embedded the LENIENT
+/// `NetworkPolicy`, so `require_approvals:` (a plausible typo for
+/// `require_approval`) was silently dropped and the section defaulted to
+/// **no human approval**. A misspelled `max_grant_secs` fell back to the longer
+/// default the same way. The authoring path's whole promise is that a typo is a
+/// 422 rather than a quietly weaker policy — stored blobs keep the lenient
+/// shape so old rows deserialize forever.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DraftNetwork {
+    #[serde(default)]
+    max_mode: crate::network::NetworkGrantMode,
+    #[serde(default)]
+    allow: Vec<crate::network::TargetRule>,
+    #[serde(default)]
+    deny: Vec<crate::network::TargetRule>,
+    #[serde(default)]
+    require_approval: bool,
+    #[serde(default)]
+    allow_public_with_brokered: bool,
+    #[serde(default)]
+    max_grant_secs: Option<u64>,
+}
+
+impl From<DraftNetwork> for crate::network::NetworkPolicy {
+    fn from(d: DraftNetwork) -> Self {
+        crate::network::NetworkPolicy {
+            max_mode: d.max_mode,
+            allow: d.allow,
+            deny: d.deny,
+            require_approval: d.require_approval,
+            allow_public_with_brokered: d.allow_public_with_brokered,
+            max_grant_secs: d.max_grant_secs,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -463,7 +503,7 @@ impl From<DraftPolicy> for Policy {
             egress: Egress {
                 mode: d.egress.mode,
             },
-            network: d.network,
+            network: d.network.into(),
             budgets: crate::spec::Budgets {
                 max_wall_clock_secs: d.budgets.max_wall_clock_secs,
                 max_tokens: d.budgets.max_tokens,
@@ -1276,6 +1316,67 @@ tools:
     /// engine's — this is the PLAN §10 #1 shell-risk classifier decision and
     /// the #3 budget decision, tested. governance-e2e.sh relies on the
     /// Read/WebFetch/`git push` anchors staying exactly like this.
+    /// The authoring path must refuse a typo in the NETWORK section too.
+    ///
+    /// `DraftPolicy` used to embed the lenient `NetworkPolicy`, so
+    /// `require_approvals:` was silently dropped and the section defaulted to
+    /// **no human approval** — a typo that quietly removed the gate. The
+    /// "unknown fields refused at every level" guarantee did not actually cover
+    /// this section, and its test never exercised it.
+    #[test]
+    fn a_typo_in_the_network_section_is_refused_not_ignored() {
+        // The exact plausible slip: a trailing "s".
+        let err = Policy::parse_yaml_strict(
+            "name: p\nnetwork:\n  max_mode: approved\n  require_approvals: true\n",
+        )
+        .expect_err("a typo'd network key must be a refusal");
+        assert!(
+            err.contains("require_approvals"),
+            "the refusal must name the offending key, got: {err}"
+        );
+
+        // …and the correctly-spelled key still works, so this cannot pass by
+        // refusing every network section.
+        let ok = Policy::parse_yaml_strict(
+            "name: p\nnetwork:\n  max_mode: approved\n  require_approval: true\n",
+        )
+        .expect("a correct network section must parse");
+        assert!(ok.network.require_approval);
+        assert_eq!(
+            ok.network.max_mode,
+            crate::network::NetworkGrantMode::Approved
+        );
+
+        // NOTE — a typo INSIDE a target rule is NOT currently refused, and the
+        // test that claimed otherwise was false-green: it wrote `too: 443` while
+        // OMITTING the required `to`, so parsing failed for the missing field
+        // rather than the unknown one. Proven here rather than asserted away:
+        // with `to` present, the unknown key is silently accepted.
+        let with_unknown = Policy::parse_yaml_strict(
+            "name: p\nnetwork:\n  allow:\n    - kind: dns\n      pattern: { kind: exact, name: a.test }\n      ports: [{ from: 443, to: 443, through: 8443 }]\n      protocol: tcp\n",
+        );
+        assert!(
+            with_unknown.is_ok(),
+            "documented residual: nested target fields are lenient — \
+             `TargetRule`/`PortSpec` are shared with the STORED representation, so making \
+             them strict would strand policies already governing runs. Strictness stops at \
+             the `network:` section boundary."
+        );
+
+        // STORED blobs stay lenient — an old row carrying an unknown key must
+        // keep deserializing forever, or a bound added later strands a policy
+        // that is already governing runs.
+        let stored: Policy = serde_json::from_value(serde_json::json!({
+            "name": "p",
+            "network": {"max_mode": "approved", "some_future_key": 1}
+        }))
+        .expect("stored blobs must stay lenient");
+        assert_eq!(
+            stored.network.max_mode,
+            crate::network::NetworkGrantMode::Approved
+        );
+    }
+
     #[test]
     fn a_policy_without_a_network_section_serializes_as_it_always_did() {
         // The frozen `policy_snapshot` in a RunSpec is asserted BYTE-EQUAL to

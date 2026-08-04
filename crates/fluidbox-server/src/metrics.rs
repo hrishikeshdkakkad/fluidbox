@@ -401,6 +401,7 @@ impl Default for Metrics {
                     "policy_moved",
                     "grant_not_pending",
                     "grant_schema_unsupported",
+                    "cas_reread_failed",
                 ],
             ),
             active_runs: Gauge::default(),

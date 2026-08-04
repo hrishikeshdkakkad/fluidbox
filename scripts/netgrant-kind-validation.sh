@@ -258,7 +258,14 @@ spec:
             fluidbox-resolver: "true"
       toPorts:
         - ports: [{ port: "53", protocol: ANY }]
-          rules: { dns: [{ matchPattern: "*" }] }
+          # SCOPED to the granted name, mirroring what `netgrant::build_run_policy`
+          # emits. These fixtures are hand-written and therefore CAN DRIFT from the
+          # builder — they already did: they carried `matchPattern: "*"` while the
+          # builder had been changed to scope lookups, so this suite reported the
+          # datapath as fine when it was testing a policy the code no longer
+          # produces. Keep them in step, and prefer adding assertions that would
+          # fail if they diverge again.
+          rules: { dns: [{ matchName: "allowed.netgrant.test" }] }
     - toFQDNs: [{ matchName: "allowed.netgrant.test" }]
       toPorts: [{ ports: [{ port: "9099", protocol: TCP }] }]
 EOF
@@ -271,6 +278,24 @@ else
 fi
 expect app "http://allowed.netgrant.test:9099/clientip" REACH "approved reaches its granted FQDN"
 expect app "http://denied.netgrant.test:9099/clientip" BLOCK "approved cannot reach an ungranted FQDN"
+# …and specifically cannot even LOOK UP a name it was not granted. The row
+# above passes with or without that property (an unresolved name and a blocked
+# connection both fail the curl), so it proves nothing about DNS on its own.
+# This one does: an unrestricted DNS rule is an exfiltration channel by itself —
+# encode data into a lookup for an attacker-controlled domain and their
+# nameserver receives it, with no connection for the policy to block.
+if kubectl -n "$NS" exec sandbox-app -- timeout 6 nslookup denied.netgrant.test >/dev/null 2>&1; then
+  no "an UNGRANTED name must not resolve (DNS lookups are an exfiltration channel)"
+else
+  ok "…and cannot even RESOLVE an ungranted name (lookups are scoped to the grant)"
+fi
+# FALSE-GREEN GUARD: the granted name must still resolve, so this cannot pass by
+# breaking DNS altogether.
+if kubectl -n "$NS" exec sandbox-app -- timeout 6 nslookup allowed.netgrant.test >/dev/null 2>&1; then
+  ok "…while the GRANTED name still resolves (DNS is scoped, not broken)"
+else
+  no "the granted name must still resolve"
+fi
 expect app "http://$DENIED_IP:9099/clientip" BLOCK "…nor that target's raw IP"
 expect app "http://169.254.169.254/" BLOCK "…nor cloud metadata"
 expect app "http://10.0.0.1:9099/" BLOCK "…nor a walled RFC1918 address"
@@ -362,7 +387,7 @@ spec:
             fluidbox-resolver: "true"
       toPorts:
         - ports: [{ port: "53", protocol: ANY }]
-          rules: { dns: [{ matchPattern: "*" }] }
+          rules: { dns: [{ matchName: "denied.netgrant.test" }] }
     - toFQDNs: [{ matchName: "denied.netgrant.test" }]
       toPorts: [{ ports: [{ port: "9099", protocol: TCP }] }]
 EOF
@@ -397,6 +422,8 @@ spec:
             fluidbox-resolver: "true"
       toPorts:
         - ports: [{ port: "53", protocol: ANY }]
+          # PUBLIC legitimately keeps the wildcard: it may already reach anything
+          # the deny wall permits, so scoping lookups would buy no containment.
           rules: { dns: [{ matchPattern: "*" }] }
     - toEntities: ["world"]
 EOF
@@ -438,6 +465,31 @@ if [ "$HEAVY" = "1" ]; then
   kubectl -n "$NS" rollout status deploy/sandbox-dns --timeout=180s >/dev/null 2>&1
   sleep 20
   expect app "http://$DENIED_IP:9099/clientip" BLOCK "DNS rebinding: the grant does not follow a name to a new address"
+fi
+
+# ── The ENFORCER itself, against this live cluster ─────────────────────────
+#
+# Everything above applies policies with kubectl, which proves the OBJECT MODEL
+# but not the Rust that writes it. This runs the real `NetworkPolicyProvider`
+# implementation against this API server — including, most importantly, that
+# `verify()` fails closed rather than rubber-stamping.
+say "ENFORCER — the Rust implementation, live"
+if command -v cargo >/dev/null 2>&1; then
+  # Keyed on the EXIT CODE, not on grepping the output: the example prints
+  # colour, so a pattern spanning "0 failed" and "(enforcer)" matches across
+  # an ANSI escape and silently never fires. The exit code cannot lie.
+  cargo run --quiet -p fluidbox-provider-k8s --example enforcer_live -- "$NS" \
+    > "$WORK/enforcer.log" 2>&1
+  enf_rc=$?
+  sed 's/^/  /' "$WORK/enforcer.log"
+  if [ "$enf_rc" -eq 0 ]; then
+    epass=$(grep -oE "[0-9]+ passed" "$WORK/enforcer.log" | tail -1 | cut -d" " -f1)
+    ok "live enforcer checks passed (${epass:-?} assertions)"
+  else
+    no "live enforcer checks FAILED — see the output above"
+  fi
+else
+  no "cargo is required for the live enforcer checks (no skips)"
 fi
 
 say "RESULT"

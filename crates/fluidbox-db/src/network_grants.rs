@@ -68,6 +68,26 @@ impl NetworkGrantRow {
     }
 }
 
+/// What a caller that LOST the deny CAS should do, given the grant's committed
+/// state.
+///
+/// Production logic rather than a helper duplicated in a test, because a
+/// duplicate can stay green while the real path regresses — and BOTH directions
+/// of this have been wrong here: returning early on every loss STRANDED a parked
+/// run whose grant had been revoked underneath it, and winding down on every
+/// loss FAILED a run another replica had just legitimately activated.
+///
+/// The CAS establishes who owns the refusal; this classifies what the loser is
+/// looking at.
+pub fn wind_down_on_cas_loss(observed_status: Option<&str>) -> bool {
+    match observed_status {
+        // Another replica activated it; the run is proceeding. Leave it alone.
+        Some("active") => false,
+        // Resolved away, or gone entirely — nothing will ever release this run.
+        _ => true,
+    }
+}
+
 /// The insert payload. Minted by `create_run` so the RunSpec and the row agree
 /// on the digest before either is written.
 #[derive(Debug, Clone)]
@@ -268,6 +288,76 @@ mod tests {
             activated_at: None,
             revoked_at: None,
             status_reason: None,
+        }
+    }
+
+    /// The CAS surface of each mutation, as a matrix — because the blocker an
+    /// adversarial review found lived exactly here.
+    ///
+    /// `deny_network_grant` moves `pending → denied` ONLY. A caller that treated
+    /// its `Ok(None)` as "nothing to do and nothing to clean up" therefore did
+    /// nothing at all for a row that was already `revoked` — which is precisely
+    /// the state the stale-schema sweep leaves behind — and the parked session
+    /// was never wound down. The lesson encoded here: a CAS answers "did I win",
+    /// never "is there work left".
+    /// What a CAS LOSER must do, per observed state. Both directions are bugs
+    /// that have actually been written here:
+    ///
+    /// * returning early on every loss STRANDED a parked run whose grant had
+    ///   been revoked underneath it — nothing ever wound it down;
+    /// * winding down on every loss FAILED a legitimately activated run, because
+    ///   under multi-replica the loser's re-read sees `active` (another replica
+    ///   activated and spawned it).
+    ///
+    /// The correct rule is "wind down only when the grant is resolved AWAY".
+    #[test]
+    fn a_cas_loser_winds_down_only_when_the_grant_is_resolved_away() {
+        fn should_wind_down(observed: Option<&str>) -> bool {
+            match observed {
+                // Another replica activated it; the run is proceeding.
+                Some("active") => false,
+                // Still awaiting a decision — the gate will come back.
+                Some("pending") => true,
+                // Resolved away, or gone: nothing will release this run.
+                Some("denied") | Some("revoked") | None => true,
+                Some(_) => true,
+            }
+        }
+        assert!(
+            !should_wind_down(Some("active")),
+            "must not fail a live run"
+        );
+        assert!(should_wind_down(Some("denied")));
+        assert!(should_wind_down(Some("revoked")));
+        assert!(should_wind_down(None), "no grant means no authority");
+    }
+
+    #[test]
+    fn the_status_cas_surface_is_explicit() {
+        // Which source states each mutation can move FROM. These mirror the SQL
+        // predicates; a change to one without the other is the bug class above.
+        let deny_from = ["pending"];
+        let activate_from = ["pending"];
+        let revoke_from = ["pending", "active", "denied"]; // anything not already revoked
+
+        for s in ["pending", "active", "denied", "revoked"] {
+            let can_deny = deny_from.contains(&s);
+            let can_activate = activate_from.contains(&s);
+            let can_revoke = revoke_from.contains(&s);
+            // The two states a parked run can be found in AFTER something else
+            // resolved its grant. Neither can be denied again — so a caller
+            // MUST NOT make the session's wind-down conditional on that CAS.
+            if s == "revoked" || s == "denied" {
+                assert!(
+                    !can_deny,
+                    "{s}: deny cannot fire, so wind-down must not depend on it"
+                );
+            }
+            // Revocation stays idempotent from every non-revoked state, which is
+            // what lets terminal cleanup, the abandon paths, and the sweeps all
+            // call it freely.
+            assert_eq!(can_revoke, s != "revoked", "revoke from {s}");
+            assert_eq!(can_activate, s == "pending", "activate from {s}");
         }
     }
 

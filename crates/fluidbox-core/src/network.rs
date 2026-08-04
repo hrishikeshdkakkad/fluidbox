@@ -24,10 +24,23 @@
 //! cannot be rendered is refused HERE, at resolution, with a reason.
 //!
 //! **Deny precedence is a documented total order**, not an emergent property of
-//! evaluation order: structural deny → policy deny → mode ceiling → the
-//! `public`+brokered rule → target-catalog subset → approval → allow.
-//! [`resolve_network_grant`] implements it and
-//! `deny_precedence_total_order` proves it pairwise-exhaustively.
+//! evaluation order. The order the code actually runs, in full:
+//!
+//! 0. `offline` short-circuits to Active — the absence of authority needs no
+//!    enforcer and no policy, which is what keeps every pre-existing run working
+//! 1. enforceability (`Unenforceable`)
+//! 2. structural validity (`InvalidTarget`) and blocked ranges (`BlockedRange`)
+//! 3. explicit policy deny
+//! 4. mode ceiling
+//! 5. `public` + brokered surfaces
+//! 6. a deny the datapath cannot express for this mode
+//! 7. target-catalog subset
+//! 8. expiry (clamped first; refuses if it would lapse before the run)
+//! 9. approval requirement, else allow
+//!
+//! An earlier revision of this list omitted 0, 1 and 7, which an adversarial
+//! review caught: the documentation claimed an order the implementation did not
+//! have. `deny_precedence_total_order` proves the ranked part pairwise.
 //!
 //! ## What this module does NOT decide
 //!
@@ -46,7 +59,18 @@ use std::net::IpAddr;
 /// Stamped into every grant. Bump ONLY for a change that alters what an
 /// existing frozen grant MEANS — a new field with a fail-safe default does not
 /// qualify. Consumers refuse a version they do not know rather than guessing.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The first schema that carries [`NetworkGrant::denied`].
+///
+/// Below it, an EMPTY deny list is AMBIGUOUS — it means either "the policy had
+/// no denies" or "this grant predates deny snapshots and its denies are
+/// unknown". Nothing can tell those apart from the grant alone, which is why
+/// the version exists: a `public` grant at v1 is refused rather than programmed
+/// as a world-allow whose denies might simply be missing. `offline` and
+/// `approved` are unaffected — the former programs nothing and the latter is a
+/// closed allow-list that resolution already checked against the live policy.
+pub const SCHEMA_WITH_DENIES: u32 = 2;
 
 /// Grant lifetime when neither the policy ceiling nor the request bounds it.
 /// Comfortably exceeds the default run wall clock (1800 s, `Budgets::default`)
@@ -125,6 +149,15 @@ impl L4Protocol {
 
 /// An inclusive port range. A single port is `from == to`; the wire form keeps
 /// both so lowering to Cilium's `{port, endPort}` is mechanical.
+/// NOT `deny_unknown_fields`, deliberately.
+///
+/// This type is shared by the STORED representation (frozen RunSpecs and
+/// stored policy blobs) and the authoring path. Making it strict made stored
+/// blobs strict at the same boundary, so a row that had legitimately been
+/// accepted with an extra key would suddenly fail to deserialize — stranding a
+/// policy that is already governing runs, which is the one thing the lenient
+/// stored shape exists to prevent. Authoring strictness belongs in the
+/// `Draft*` mirrors in `policy.rs`, where it cannot reach stored data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortSpec {
     pub from: u16,
@@ -157,6 +190,13 @@ impl PortSpec {
 
     pub fn contains_range(&self, other: &PortSpec) -> bool {
         self.from <= other.from && other.to <= self.to
+    }
+
+    /// Do these ranges share ANY port? Distinct from [`Self::contains_range`],
+    /// and the distinction is a security boundary: containment answers "is this
+    /// wholly permitted", overlap answers "does this touch the forbidden".
+    pub fn intersects(&self, other: &PortSpec) -> bool {
+        self.from <= other.to && other.from <= self.to
     }
 }
 
@@ -254,6 +294,17 @@ impl FqdnPattern {
             (Self::Wildcard { suffix: a }, Self::Wildcard { suffix: b }) => a == b,
             (Self::Exact { .. }, Self::Wildcard { .. }) => false,
         }
+    }
+
+    /// Do these patterns match any name in common?
+    ///
+    /// For DENY evaluation, where the question is "does the request touch
+    /// anything forbidden", not "is the request wholly forbidden". A wildcard
+    /// matches exactly one label, so two DIFFERENT wildcards never intersect
+    /// (`*.a.com` matches `x.a.com`; `*.b.a.com` matches `x.b.a.com`; no name
+    /// is in both).
+    pub fn intersects(&self, other: &FqdnPattern) -> bool {
+        self.covers(other) || other.covers(self)
     }
 
     /// Display form, and the exact string that lowers into a Cilium selector.
@@ -373,6 +424,40 @@ impl TargetRule {
             p.validate()?;
         }
         Ok(())
+    }
+
+    /// Does this rule share ANY (destination, port) with `other`?
+    ///
+    /// **This is what a DENY must be evaluated with, and using `covers` there
+    /// was a real bypass.** `covers` is set containment, so a deny of
+    /// `*.example.com TCP/443-444` versus a request for
+    /// `api.example.com TCP/80-443` compared false in BOTH directions — the
+    /// deny's selector is wider but its ports are narrower, the request's ports
+    /// are wider but its selector is narrower, so neither contains the other —
+    /// and the grant was issued INCLUDING the explicitly denied port 443.
+    /// Overlap is the correct relation: a request that touches any forbidden
+    /// (destination, port) is forbidden.
+    ///
+    /// DNS and CIDR rules never intersect, matching the rest of the model: they
+    /// are different selectors in the datapath, and grant-time code cannot know
+    /// what a name will resolve to. A CIDR deny is enforced by the datapath
+    /// wall, not here.
+    pub fn intersects(&self, other: &TargetRule) -> bool {
+        if self.protocol() != other.protocol() {
+            return false;
+        }
+        let selectors_meet = match (self, other) {
+            (Self::Dns { pattern: a, .. }, Self::Dns { pattern: b, .. }) => a.intersects(b),
+            (Self::Cidr { cidr: a, .. }, Self::Cidr { cidr: b, .. }) => {
+                a.contains(b.addr) || b.contains(a.addr)
+            }
+            _ => false,
+        };
+        selectors_meet
+            && self
+                .ports()
+                .iter()
+                .any(|p| other.ports().iter().any(|q| p.intersects(q)))
     }
 
     /// Does this rule authorize everything `other` authorizes? Used BOTH for
@@ -635,6 +720,17 @@ pub struct NetworkGrant {
     /// Digest of the `NetworkPolicy` section that produced this grant.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub policy_digest: String,
+    /// The governing policy's explicit denies, FROZEN so the datapath can
+    /// enforce them rather than resolution merely checking them.
+    ///
+    /// Resolution alone was not enough: it iterates the REQUESTED targets, and
+    /// a `public` request has none by construction — so every `network.deny`
+    /// entry was skipped and `public` lowered to "the world minus the
+    /// deployment-wide wall", silently ignoring the tenant's own denies. A
+    /// policy that says "public, but never this corporate range" was not
+    /// getting the second half.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied: Vec<TargetRule>,
 }
 
 impl Default for NetworkGrant {
@@ -648,6 +744,7 @@ impl Default for NetworkGrant {
             targets: Vec::new(),
             expires_at: None,
             policy_digest: String::new(),
+            denied: Vec::new(),
         }
     }
 }
@@ -722,6 +819,8 @@ pub enum DenialReason {
     },
     /// `public` plus brokered surfaces, without the policy opt-in.
     PublicWithBrokered,
+    /// The policy carries a deny the datapath cannot express for this mode.
+    UnenforceableDeny { target: String },
     /// A target the policy's catalog does not cover.
     NotInCatalog { target: String },
     /// The deployment cannot enforce a grant at all.
@@ -742,6 +841,7 @@ impl DenialReason {
             Self::PolicyDeny { .. } => "policy_deny",
             Self::ModeCeiling { .. } => "mode_ceiling",
             Self::PublicWithBrokered => "public_with_brokered",
+            Self::UnenforceableDeny { .. } => "unenforceable_deny",
             Self::NotInCatalog { .. } => "not_in_catalog",
             Self::Unenforceable { .. } => "unenforceable",
             Self::ExpiryTooShort { .. } => "expiry_too_short",
@@ -768,6 +868,15 @@ impl DenialReason {
             Self::PublicWithBrokered => "a public network grant is refused for a run holding \
                  brokered tool surfaces; set network.allow_public_with_brokered to opt in"
                 .into(),
+            Self::UnenforceableDeny { target } => format!(
+                "this policy denies {target} by NAME, and a name-based deny cannot be \
+                 programmed in the datapath (Cilium's egressDeny has no FQDN selector) — \
+                 so a 'public' grant would allow the world with that deny silently absent, \
+                 and is refused. Express the deny as a CIDR to have it enforced. An \
+                 'approved' grant is narrower (resolution refuses to GRANT a denied name), \
+                 but note it does not enforce the deny at the datapath either: a denied \
+                 service co-hosted on a granted name's address stays reachable."
+            ),
             Self::NotInCatalog { target } => {
                 format!("network target {target} is not covered by the policy's allowed targets")
             }
@@ -808,13 +917,16 @@ impl GrantResolution {
 /// Resolve a request against a policy. **The order below IS the security
 /// contract** — see `deny_precedence_total_order`, which proves it pairwise.
 ///
-/// 1. structural validity + blocked ranges
-/// 2. explicit policy deny
-/// 3. mode ceiling
-/// 4. `public` + brokered
-/// 5. target-catalog subset
-/// 6. approval requirement
-/// 7. allow
+/// 0. `offline` → Active (short-circuit: no authority, so no enforcer needed)
+/// 1. enforceability
+/// 2. structural validity + blocked ranges
+/// 3. explicit policy deny
+/// 4. mode ceiling
+/// 5. `public` + brokered
+/// 6. a deny the datapath cannot express for this mode
+/// 7. target-catalog subset
+/// 8. expiry (clamps, then refuses if it would lapse before the run ends)
+/// 9. approval requirement, else allow
 ///
 /// Expiry CLAMPS (a request may only shorten, the policy ceiling bounds it);
 /// everything else REFUSES rather than silently downgrading, because a run that
@@ -855,7 +967,10 @@ pub fn resolve_network_grant(
 
     // ── 2. explicit policy deny ──────────────────────────────────────────
     for t in &request.targets {
-        if policy.deny.iter().any(|d| d.covers(t) || t.covers(d)) {
+        // OVERLAP, not containment — see `TargetRule::intersects`. A partially
+        // overlapping deny used to compare false in both directions and let the
+        // forbidden ports through.
+        if policy.deny.iter().any(|d| d.intersects(t)) {
             return GrantResolution::Denied(DenialReason::PolicyDeny {
                 target: t.describe(),
             });
@@ -878,6 +993,28 @@ pub fn resolve_network_grant(
         return GrantResolution::Denied(DenialReason::PublicWithBrokered);
     }
 
+    // ── 4b. denies we could not enforce for this mode ────────────────────
+    //
+    // `public` allows the world and relies on `egressDeny` to carve holes in
+    // it. Cilium's `EgressDenyRule` has no `toFQDNs` (verified against the
+    // 1.19.6 CRD; cilium#35494 declined it because a DNS deny would fail open
+    // for unresolved names), so a NAME-based deny cannot be rendered. Under
+    // `approved` this does not matter — the grant is a closed allow-list and
+    // resolution already refuses any target overlapping a deny — but under
+    // `public` it would mean issuing a grant that silently ignores the
+    // operator's deny. Refuse instead.
+    if request.mode == NetworkGrantMode::Public {
+        if let Some(d) = policy
+            .deny
+            .iter()
+            .find(|d| matches!(d, TargetRule::Dns { .. }))
+        {
+            return GrantResolution::Denied(DenialReason::UnenforceableDeny {
+                target: d.describe(),
+            });
+        }
+    }
+
     // ── 5. target-catalog subset ─────────────────────────────────────────
     for t in &request.targets {
         if !policy.allow.iter().any(|a| a.covers(t)) {
@@ -888,8 +1025,19 @@ pub fn resolve_network_grant(
     }
 
     // ── expiry: clamp, then require it to outlive the run ────────────────
-    let ceiling = policy.max_grant_secs.unwrap_or(DEFAULT_GRANT_SECS);
-    let grant_secs = request.duration_secs.map_or(ceiling, |d| d.min(ceiling));
+    // Clamped to a sane maximum before any i64 arithmetic. An unbounded `u64`
+    // cast with `as i64` wraps — `u64::MAX` becomes -1, which would produce an
+    // "active" grant whose expiry is a second in the PAST. A year is far beyond
+    // any real grant and keeps every downstream `Duration` well inside range.
+    const MAX_GRANT_SECS: u64 = 365 * 24 * 3600;
+    let ceiling = policy
+        .max_grant_secs
+        .unwrap_or(DEFAULT_GRANT_SECS)
+        .min(MAX_GRANT_SECS);
+    let grant_secs = request
+        .duration_secs
+        .map_or(ceiling, |d| d.min(ceiling))
+        .min(MAX_GRANT_SECS);
     if let Some(wall) = ctx.run_wall_clock_secs {
         if grant_secs < wall {
             return GrantResolution::Denied(DenialReason::ExpiryTooShort {
@@ -920,6 +1068,10 @@ pub fn resolve_network_grant(
             .collect(),
         expires_at: Some(ctx.now + Duration::seconds(grant_secs as i64)),
         policy_digest: policy.digest(),
+        // Frozen so the datapath enforces them. A `public` grant especially
+        // needs this: it carries no targets, so resolution's deny loop never
+        // sees anything to compare against.
+        denied: policy.deny.clone(),
     };
 
     // ── 6/7. approval, else allow ────────────────────────────────────────
@@ -1027,6 +1179,18 @@ mod tests {
         }
         let conditions: Vec<Cond> = vec![
             Cond {
+                name: "unenforceable",
+                // Ranked FIRST because the code checks it first: nothing below
+                // can be delivered by a deployment with no enforcer, so there
+                // is no point refusing on a narrower ground. It was previously
+                // excluded from this matrix and tested only in isolation — an
+                // adversarial review flagged exactly that gap.
+                setup: |_req, _p, c| c.enforcement_available = false,
+                code: "unenforceable",
+                needs_public: false,
+                adds_target: false,
+            },
+            Cond {
                 name: "invalid_target",
                 setup: |req, _p, _c| {
                     // A port-0 target can never lower.
@@ -1086,6 +1250,27 @@ mod tests {
                     p.allow_public_with_brokered = false;
                 },
                 code: "public_with_brokered",
+                needs_public: true,
+                adds_target: false,
+            },
+            Cond {
+                name: "unenforceable_deny",
+                // Ranked between public+brokered and the catalog, matching the
+                // code. It was previously outside this matrix entirely, so a
+                // reordering of that branch could have violated the documented
+                // precedence while this "pairwise-exhaustive" test stayed green.
+                setup: |req, p, _c| {
+                    req.mode = NetworkGrantMode::Public;
+                    p.max_mode = NetworkGrantMode::Public;
+                    p.deny.push(TargetRule::dns(
+                        FqdnPattern::Exact {
+                            name: "corp.example".into(),
+                        },
+                        vec![PortSpec::single(443)],
+                        L4Protocol::Tcp,
+                    ));
+                },
+                code: "unenforceable_deny",
                 needs_public: true,
                 adds_target: false,
             },
@@ -1499,6 +1684,136 @@ mod tests {
         assert!(!cidr("10.1.2.0/24", 443).covers(&cidr("10.0.0.0/8", 443)));
     }
 
+    /// The bypass an adversarial review found: an explicit policy deny that
+    /// only PARTIALLY overlaps the request used to compare false in both
+    /// directions and let the forbidden ports through.
+    ///
+    /// The original `deny.covers(req) || req.covers(deny)` test fails here
+    /// because neither contains the other — the deny's selector is wider but
+    /// its ports narrower, the request's ports wider but its selector
+    /// narrower. Overlap is the relation a deny needs.
+    #[test]
+    fn a_partially_overlapping_deny_still_denies() {
+        let pol = NetworkPolicy {
+            max_mode: NetworkGrantMode::Approved,
+            allow: vec![TargetRule::dns(
+                FqdnPattern::Wildcard {
+                    suffix: "example.com".into(),
+                },
+                vec![PortSpec::range(1, 65535)],
+                L4Protocol::Tcp,
+            )],
+            deny: vec![TargetRule::dns(
+                FqdnPattern::Wildcard {
+                    suffix: "example.com".into(),
+                },
+                vec![PortSpec::range(443, 444)],
+                L4Protocol::Tcp,
+            )],
+            ..Default::default()
+        };
+        // Requests 80-443: catalogued, mode-legal, and TOUCHING the denied 443.
+        let req = NetworkRequest {
+            mode: NetworkGrantMode::Approved,
+            targets: vec![TargetRule::dns(
+                FqdnPattern::Exact {
+                    name: "api.example.com".into(),
+                },
+                vec![PortSpec::range(80, 443)],
+                L4Protocol::Tcp,
+            )],
+            duration_secs: None,
+        };
+        match resolve_network_grant(&req, &pol, &ctx()) {
+            GrantResolution::Denied(DenialReason::PolicyDeny { .. }) => {}
+            other => panic!("a request touching an explicit deny must be refused, got {other:?}"),
+        }
+
+        // FALSE-GREEN GUARD: a request that genuinely misses the denied range
+        // must still be granted, so this cannot pass by denying everything.
+        let clear = NetworkRequest {
+            targets: vec![TargetRule::dns(
+                FqdnPattern::Exact {
+                    name: "api.example.com".into(),
+                },
+                vec![PortSpec::range(80, 442)],
+                L4Protocol::Tcp,
+            )],
+            ..req.clone()
+        };
+        assert!(
+            matches!(
+                resolve_network_grant(&clear, &pol, &ctx()),
+                GrantResolution::Active(_)
+            ),
+            "a request that does not touch the deny must still be granted"
+        );
+    }
+
+    #[test]
+    fn overlap_and_containment_are_different_relations() {
+        let a = TargetRule::dns(
+            FqdnPattern::Wildcard {
+                suffix: "example.com".into(),
+            },
+            vec![PortSpec::range(443, 444)],
+            L4Protocol::Tcp,
+        );
+        let b = TargetRule::dns(
+            FqdnPattern::Exact {
+                name: "api.example.com".into(),
+            },
+            vec![PortSpec::range(80, 443)],
+            L4Protocol::Tcp,
+        );
+        // Neither contains the other…
+        assert!(!a.covers(&b) && !b.covers(&a));
+        // …but they share api.example.com:443, and overlap is symmetric.
+        assert!(a.intersects(&b) && b.intersects(&a));
+
+        // Disjoint ports do not overlap.
+        let c = TargetRule::dns(
+            FqdnPattern::Exact {
+                name: "api.example.com".into(),
+            },
+            vec![PortSpec::range(80, 442)],
+            L4Protocol::Tcp,
+        );
+        assert!(!a.intersects(&c));
+        // A different protocol never overlaps.
+        let udp = TargetRule::dns(
+            FqdnPattern::Exact {
+                name: "api.example.com".into(),
+            },
+            vec![PortSpec::single(443)],
+            L4Protocol::Udp,
+        );
+        assert!(!a.intersects(&udp));
+        // Two DIFFERENT wildcards match no name in common (a wildcard is
+        // exactly one label), so they must not be treated as overlapping.
+        let w1 = TargetRule::dns(
+            FqdnPattern::Wildcard {
+                suffix: "a.com".into(),
+            },
+            vec![PortSpec::single(443)],
+            L4Protocol::Tcp,
+        );
+        let w2 = TargetRule::dns(
+            FqdnPattern::Wildcard {
+                suffix: "b.a.com".into(),
+            },
+            vec![PortSpec::single(443)],
+            L4Protocol::Tcp,
+        );
+        assert!(!w1.intersects(&w2));
+        // CIDR overlap is real containment either way.
+        assert!(cidr("10.0.0.0/8", 443).intersects(&cidr("10.1.0.0/16", 443)));
+        assert!(cidr("10.1.0.0/16", 443).intersects(&cidr("10.0.0.0/8", 443)));
+        assert!(!cidr("10.0.0.0/8", 443).intersects(&cidr("11.0.0.0/8", 443)));
+        // DNS and CIDR are different selectors and never intersect.
+        assert!(!a.intersects(&cidr("93.184.216.34/32", 443)));
+    }
+
     #[test]
     fn narrowing_is_remove_only() {
         let declared = NetworkRequest {
@@ -1715,6 +2030,53 @@ mod tests {
         ));
     }
 
+    /// Adding `denied` must not change the digest of an ALREADY-FROZEN grant.
+    ///
+    /// The digest is the consent anchor: `approvals.input_digest` equals it for
+    /// every parked grant. If deploying this field changed the digest of grants
+    /// frozen before it existed, every run waiting on a human would fail its
+    /// release re-verification with `grant_digest_mismatch` and have to be
+    /// recreated. `skip_serializing_if` is what prevents that, and this is the
+    /// test that keeps it prevented.
+    #[test]
+    fn adding_denied_does_not_disturb_an_already_frozen_grants_digest() {
+        let frozen: NetworkGrant = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "mode": "approved",
+            "targets": [],
+            "expires_at": "2099-01-01T00:00:00Z",
+            "policy_digest": "sha256:p"
+        }))
+        .unwrap();
+        assert!(frozen.denied.is_empty(), "an absent key defaults to empty");
+        let wire = serde_json::to_value(&frozen).unwrap();
+        assert!(
+            wire.get("denied").is_none(),
+            "an empty deny list must not appear on the wire: {wire}"
+        );
+        // Byte-identical to what the pre-`denied` build would have produced.
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "schema_version": 1,
+                "mode": "approved",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "policy_digest": "sha256:p"
+            })
+        );
+        // …and a grant that DOES carry denies serializes them and digests
+        // differently, so the field is not merely inert.
+        let with_denies = NetworkGrant {
+            denied: vec![TargetRule::cidr(
+                "203.0.113.0/24".parse().unwrap(),
+                vec![PortSpec::single(443)],
+                L4Protocol::Tcp,
+            )],
+            ..frozen.clone()
+        };
+        assert_ne!(with_denies.digest(), frozen.digest());
+    }
+
     #[test]
     fn a_grant_without_an_expiry_reads_as_expired_not_eternal() {
         // A hand-edited or malformed row must fail closed.
@@ -1724,6 +2086,7 @@ mod tests {
             targets: vec![],
             expires_at: None,
             policy_digest: String::new(),
+            denied: vec![],
         };
         assert!(g.is_expired(now()));
         // …and a future schema version is refused rather than guessed at.
@@ -1748,6 +2111,7 @@ mod tests {
                 ceiling: NetworkGrantMode::Offline,
             },
             DenialReason::PublicWithBrokered,
+            DenialReason::UnenforceableDeny { target: "x".into() },
             DenialReason::NotInCatalog { target: "x".into() },
             DenialReason::Unenforceable { detail: "x".into() },
             DenialReason::ExpiryTooShort {
