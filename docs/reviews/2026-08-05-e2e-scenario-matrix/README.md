@@ -129,10 +129,28 @@ feature is broken.
 = 300), with the corrected rationale recorded in the file. Applied via
 `deploy-app.sh`; the live pod now carries `FLUIDBOX_NETPOL_WAIT_SECS=240`.
 
+**Regression test against the real failure.** The empty sandbox node was
+terminated to force the exact cold-start condition (`sandbox nodes = 0`), then
+the same `approved` run was launched:
+
+```
+t=0s   sandboxNodes=0  pod=Pending  unscheduled
+t=50s  sandboxNodes=1  pod=Pending  unscheduled     <- node appears
+t=70s  sandboxNodes=1  pod=Pending  on=ip-10-42-12-116
+t=90s  sandboxNodes=1  pod=Running  on=ip-10-42-12-116
+```
+
+**90 seconds** from launch to Running — comfortably past the old 60s deadline
+(so the old value would have failed again) and comfortably inside the new 240s.
+The run completed, the egress probe returned `REACHED`, and no
+"not verified within" error appeared anywhere in the ledger. Fix confirmed
+against the failure it was written for, not merely against the arithmetic.
+
 **Recommended follow-up (code, not config):** start the deadline once the pod is
 scheduled/Running rather than at grant preparation. The timeout would then mean
 what its comment says — a bound on CNI programming — and would not need to
-absorb EC2 boot latency on any cluster.
+absorb EC2 boot latency on any cluster. 240s is a correct mitigation for this
+deployment's node shape; it is not a general answer for a slower one.
 
 ## 6. Deny, and the per-run offline override (both driven through the UI)
 
@@ -179,3 +197,11 @@ proxy (`/api/fluidbox/*`) from the signed-in owner session, i.e. the same
 authority and code path the UI uses. Deny and the offline override were driven by
 real clicks. Sandbox-side probes ran as ordinary agent tool calls and are visible
 in each run's timeline.
+
+## 9. Final state of the drill org
+
+Policy `init` v11 and agent `test` were restored to the posture the 2026-08-04
+acceptance left them in: ceiling **public**, **require a human to authorize each
+run**, empty allow/deny; the agent declares `public` with no targets. The
+intermediate `approved` catalogs and deny lists used above exist only in the
+policy's immutable version history, which is the point of that history.
