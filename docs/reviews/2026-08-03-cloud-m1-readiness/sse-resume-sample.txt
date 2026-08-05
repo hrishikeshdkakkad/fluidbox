@@ -1,0 +1,3 @@
+event: probe.open
+data: {"t":1785788622027,"resumed_from":42}
+id: 43

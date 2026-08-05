@@ -1,0 +1,19 @@
+{
+    "ResultsByTime": [
+        {
+            "TimePeriod": {
+                "Start": "2026-08-01",
+                "End": "2026-08-03"
+            },
+            "Total": {
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        }
+    ],
+    "DimensionValueAttributes": []
+}

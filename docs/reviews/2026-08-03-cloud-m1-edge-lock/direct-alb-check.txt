@@ -1,0 +1,7 @@
+# direct-ALB refusal check — 2026-08-03T21:41:33Z
+cloudfront: dw87mc37yx8wp.cloudfront.net
+alb:        k8s-fluidbox-fluidbox-7545184813-1979996906.us-east-1.elb.amazonaws.com
+GET https://dw87mc37yx8wp.cloudfront.net/v1/health -> 200
+GET http://k8s-fluidbox-fluidbox-7545184813-1979996906.us-east-1.elb.amazonaws.com/v1/health -> 000timeout/refused
+GET http://k8s-fluidbox-fluidbox-7545184813-1979996906.us-east-1.elb.amazonaws.com/v1/health (bad header) -> 000timeout/refused
+verdict: PASS

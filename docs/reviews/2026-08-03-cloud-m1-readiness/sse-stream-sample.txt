@@ -1,0 +1,120 @@
+event: probe.open
+data: {"t":1785788200792,"resumed_from":0}
+id: 1
+
+event: probe.tick
+data: {"t":1785788210795,"seq":2}
+id: 2
+
+event: probe.tick
+data: {"t":1785788220796,"seq":3}
+id: 3
+
+event: probe.tick
+data: {"t":1785788230798,"seq":4}
+id: 4
+
+event: probe.tick
+data: {"t":1785788240799,"seq":5}
+id: 5
+
+event: probe.tick
+data: {"t":1785788250801,"seq":6}
+id: 6
+
+event: probe.tick
+data: {"t":1785788260801,"seq":7}
+id: 7
+
+event: probe.tick
+data: {"t":1785788270803,"seq":8}
+id: 8
+
+event: probe.tick
+data: {"t":1785788280804,"seq":9}
+id: 9
+
+event: probe.tick
+data: {"t":1785788290807,"seq":10}
+id: 10
+
+event: probe.tick
+data: {"t":1785788300808,"seq":11}
+id: 11
+
+event: probe.tick
+data: {"t":1785788310810,"seq":12}
+id: 12
+
+event: probe.tick
+data: {"t":1785788320813,"seq":13}
+id: 13
+
+event: probe.tick
+data: {"t":1785788330815,"seq":14}
+id: 14
+
+event: probe.tick
+data: {"t":1785788340816,"seq":15}
+id: 15
+
+event: probe.tick
+data: {"t":1785788350818,"seq":16}
+id: 16
+
+event: probe.tick
+data: {"t":1785788360820,"seq":17}
+id: 17
+
+event: probe.tick
+data: {"t":1785788370821,"seq":18}
+id: 18
+
+event: probe.tick
+data: {"t":1785788380824,"seq":19}
+id: 19
+
+event: probe.tick
+data: {"t":1785788390825,"seq":20}
+id: 20
+
+event: probe.tick
+data: {"t":1785788400827,"seq":21}
+id: 21
+
+event: probe.tick
+data: {"t":1785788410827,"seq":22}
+id: 22
+
+event: probe.tick
+data: {"t":1785788420829,"seq":23}
+id: 23
+
+event: probe.tick
+data: {"t":1785788430830,"seq":24}
+id: 24
+
+event: probe.tick
+data: {"t":1785788440833,"seq":25}
+id: 25
+
+event: probe.tick
+data: {"t":1785788450834,"seq":26}
+id: 26
+
+event: probe.tick
+data: {"t":1785788460914,"seq":27}
+id: 27
+
+event: probe.tick
+data: {"t":1785788470914,"seq":28}
+id: 28
+
+event: probe.tick
+data: {"t":1785788480917,"seq":29}
+id: 29
+
+event: probe.tick
+data: {"t":1785788490919,"seq":30}
+id: 30
+

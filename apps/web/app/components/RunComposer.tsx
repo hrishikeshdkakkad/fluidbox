@@ -11,11 +11,13 @@ import {
   ConnectionRequirement,
   connectionMatchesConnector,
   isToolConnection,
+  NetworkRequest,
   ownerBadge,
   PolicySummary,
   Revision,
   TriggerSubscription,
 } from "../lib/api";
+import { MODE_LABEL } from "../lib/network";
 import { AddServerWizard } from "../app/capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
 import { CopyBlock, TemplateChips } from "./AutomationContract";
@@ -80,6 +82,9 @@ interface RunComposerDraft {
   pubComment: boolean;
   pubCheck: boolean;
   capabilityKeepList: string;
+  /** The per-run "offline only" narrowing; optional so pre-narrowing drafts
+   *  still validate (no `version` bump, no validator requirement). */
+  offlineOnly?: boolean;
 }
 
 function isRunComposerDraft(value: unknown): value is RunComposerDraft {
@@ -151,6 +156,12 @@ export function RunComposer({
   const [selectedAgentName, setSelectedAgentName] = useState("");
   const [revisionLoading, setRevisionLoading] = useState(false);
   const [revisionTouched, setRevisionTouched] = useState(false);
+  // A run may only NARROW what the agent declared, so the sole choice this
+  // control offers is inherit-or-offline. `declaredNetwork` is the selected
+  // agent's latest-revision declaration, captured from the same fetch that
+  // shreds the revision into the fields above (see the revision effect).
+  const [offlineOnly, setOfflineOnly] = useState(false);
+  const [declaredNetwork, setDeclaredNetwork] = useState<NetworkRequest | null>(null);
 
   const [newAgentName, setNewAgentName] = useState("");
   const [description, setDescription] = useState("");
@@ -250,13 +261,14 @@ export function RunComposer({
       pubComment,
       pubCheck,
       capabilityKeepList,
+      offlineOnly,
     }),
     [
       mode, task, autonomous, agentChoice, selectedAgentName, revisionTouched, newAgentName,
       description, harness, model, systemPrompt, policyName, policyOverride, workspace, pins, requirements, bindings, kind,
       automationName, allowTask, allowWorkspace, callbackUrl, concurrency, cron, timezone,
       missedPolicy, connection, repositories, evOpened, evReopened, evSync, pubComment, pubCheck,
-      capabilityKeepList,
+      capabilityKeepList, offlineOnly,
     ]
   );
   // Loading an existing revision is not user input. Only persist agent fields
@@ -292,6 +304,7 @@ export function RunComposer({
     evSync ||
     !pubComment ||
     pubCheck ||
+    offlineOnly ||
     capabilityKeepList.trim().length > 0;
   const restoreDraft = useCallback((saved: RunComposerDraft) => {
     if (!isRunComposerDraft(saved)) return;
@@ -329,6 +342,7 @@ export function RunComposer({
     setPubComment(saved.pubComment);
     setPubCheck(saved.pubCheck);
     setCapabilityKeepList(saved.capabilityKeepList);
+    setOfflineOnly(saved.offlineOnly ?? false);
   }, []);
   const clearDraft = useSessionDraft({
     key: draftKey,
@@ -376,6 +390,11 @@ export function RunComposer({
     if (agentChoice !== "existing" || !selectedAgentName || revisionTouched) return;
     const selected = agents.find((candidate) => candidate.name === selectedAgentName);
     if (!selected) return;
+    // Reset before the load: a pending/failed load must never show the previous
+    // agent's declaration, and a per-run narrowing must never carry to a
+    // different agent. The fetch below reinstates the real declaration.
+    setDeclaredNetwork(null);
+    setOfflineOnly(false);
     let active = true;
     const start = window.setTimeout(() => {
       setRevisionLoading(true);
@@ -393,6 +412,7 @@ export function RunComposer({
             setRequirements(latest.connection_requirements ?? []);
             setBindings({}); // re-resolve automatically for the new agent
             setAgentPolicyId(latest.policy_id);
+            setDeclaredNetwork(latest.network ?? null);
           }
           setRevisionTouched(false);
         })
@@ -466,6 +486,10 @@ export function RunComposer({
     setPins([]);
     setRequirements([]); // a new agent declares its requirements in the editor
     setBindings({});
+    // A new agent has no declaration; the server creates it offline. Clear any
+    // narrowing carried from a previously selected agent.
+    setDeclaredNetwork(null);
+    setOfflineOnly(false);
     setRevisionTouched(false);
     setPendingAgentSwitch(null);
   };
@@ -694,6 +718,8 @@ export function RunComposer({
           agent: runAgentName,
           task: task.trim(),
           autonomous,
+          // Narrow-only: the sole network override this UI can send is offline.
+          ...(offlineOnly ? { network: { mode: "offline", targets: [], duration_secs: null } } : {}),
         };
         if (Object.keys(explicit).length > 0) body.bindings = explicit;
         await apiPost("/sessions", body);
@@ -1542,6 +1568,41 @@ export function RunComposer({
                 </details>
               )}
             </>
+          </ComposerSection>
+        )}
+
+        {!agentOnly && mode === "once" && (
+          <ComposerSection index={5} title="Network access" hint="Where this run may reach.">
+            {!declaredNetwork || declaredNetwork.mode === "offline" ? (
+              <p className="helper">
+                This agent declares no network access, so the run is offline. Add a declaration on
+                the agent to change that.
+              </p>
+            ) : (
+              <>
+                <label className="field">
+                  <input
+                    type="radio"
+                    name="run-network-access"
+                    checked={!offlineOnly}
+                    onChange={() => setOfflineOnly(false)}
+                  />
+                  <span>Inherit from agent · {MODE_LABEL[declaredNetwork.mode]}</span>
+                </label>
+                <label className="field">
+                  <input
+                    type="radio"
+                    name="run-network-access"
+                    checked={offlineOnly}
+                    onChange={() => setOfflineOnly(true)}
+                  />
+                  <span>Offline only (this run)</span>
+                </label>
+                <p className="helper">
+                  A run may narrow what the agent declared, never widen it.
+                </p>
+              </>
+            )}
           </ComposerSection>
         )}
         </div>

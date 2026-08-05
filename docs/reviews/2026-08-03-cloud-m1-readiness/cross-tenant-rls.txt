@@ -1,0 +1,6 @@
+# §9-11 cross-tenant denial at the RLS floor — 2026-08-03T17:52:17Z
+owner sees (no RLS, superuser): 2 rows
+runtime role + GUC=A:           1
+runtime role + GUC=B:           1
+runtime role, NO GUC:           0
+runtime role + GUC=A, explicitly selecting B's tenant_id: 0

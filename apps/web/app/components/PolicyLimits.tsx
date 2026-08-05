@@ -15,11 +15,17 @@ import { useState } from "react";
 import {
   ApprovalScope,
   EgressMode,
+  NetworkGrantMode,
+  NetworkPolicy,
   PolicyAction,
   PolicyContent,
+  TargetRule,
 } from "../lib/api";
 import { coerceCap, coerceTtlSecs } from "../lib/policy-caps";
+import { MODE_HINT, MODE_LABEL, MODE_ORDER, networkOf } from "../lib/network";
+import { useHarnesses } from "../lib/harnesses";
 import { VERB } from "./PermissionMatrix";
+import { TargetRuleEditor } from "./TargetRuleEditor";
 
 /** A cap the policy did not set. `spec::Budgets` is four `Option`s, so an unset
  *  cap arrives as `null` — no ceiling of that kind, which is not zero. */
@@ -138,6 +144,12 @@ export function PolicyLimits({
 }) {
   const set = (patch: Partial<PolicyContent>) => onChange({ ...content, ...patch });
   const { budgets, approvals, autonomy, egress, defaults } = content;
+  // The deployment's RESOLVED network posture (GET /harnesses). Called at the
+  // component top level — the rules of hooks forbid it inside the IIFE below.
+  // null = an older server that does not report it, or a catalog that failed to
+  // load; the ceiling then stays editable (today's behaviour). A live enforcer
+  // that reports no egress support disables what a run could never be granted.
+  const { network } = useHarnesses();
 
   return (
     <>
@@ -220,6 +232,105 @@ export function PolicyLimits({
         </label>
       </div>
       <p className="helper">If nobody answers in time: {VERB[approvals.timeout_action]}.</p>
+
+      {(() => {
+        const net = networkOf(content);
+        const setNet = (patch: Partial<NetworkPolicy>) =>
+          set({ network: { ...net, ...patch } });
+        return (
+          <>
+            <div className="sectitle">Where a sandbox may reach</div>
+            <p className="helper" style={{ marginBottom: 4 }}>
+              The ceiling for every run on this policy. An agent may ask for less, never more.
+            </p>
+
+            <label className="field">
+              <span className="lab">Ceiling</span>
+              <select
+                className="inp"
+                value={net.max_mode}
+                disabled={network !== null && !network.supports_egress_grants}
+                onChange={(e) => {
+                  const max_mode = e.target.value as NetworkGrantMode;
+                  // Change ONLY the ceiling — the catalog stays. Core checks an
+                  // approved-mode agent declaration against `policy.allow` on
+                  // every request, even under a `public` ceiling (network.rs
+                  // target-catalog subset), so clearing it would break existing
+                  // approved agents with not_in_catalog denials at run creation.
+                  // (A public REQUEST carries no targets, but that is a request
+                  // rule, not a policy rule.)
+                  setNet({ max_mode });
+                }}
+              >
+                {MODE_ORDER.map((m) => (
+                  <option key={m} value={m}>
+                    {MODE_LABEL[m]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {network !== null && !network.supports_egress_grants && (
+              <p className="helper warn">
+                This deployment has no network enforcer ({network.enforcer}), so any ceiling above
+                Offline would be refused when a run is created. Install Cilium and set
+                FLUIDBOX_NETWORK_ENFORCER to enable it.
+              </p>
+            )}
+            <p className="helper">{MODE_HINT[net.max_mode]}</p>
+
+            {net.max_mode === "public" && (
+              <p className="helper warn">
+                Public grants reach anything the deployment&rsquo;s deny wall does not forbid.
+                On a deployment fronted by a CDN, that wall cannot enumerate every address of
+                your own public API, so a run could in principle reach it. Sandbox tokens are
+                scoped to the internal plane and the load balancer refuses unsigned origin
+                traffic, so the exposure is limited to unauthenticated endpoints — but prefer
+                Approved targets where you can name them.
+              </p>
+            )}
+
+            {net.max_mode === "approved" && (
+              <>
+                <div className="sectitle">Allowed targets</div>
+                <TargetRuleEditor
+                  value={net.allow}
+                  onChange={(allow: TargetRule[]) => setNet({ allow })}
+                />
+              </>
+            )}
+
+            {net.max_mode !== "offline" && (
+              <>
+                <label className="field">
+                  <span className="lab">Require a human to authorize each run</span>
+                  <input
+                    type="checkbox"
+                    checked={net.require_approval}
+                    onChange={(e) => setNet({ require_approval: e.target.checked })}
+                  />
+                </label>
+                <p className="helper">
+                  The run parks in <code>awaiting_authorization</code> and appears in the
+                  timeline for approval before it gets any egress.
+                </p>
+
+                <label className="field">
+                  <span className="lab">Max grant lifetime (seconds)</span>
+                  <input
+                    className="inp"
+                    type="number"
+                    value={net.max_grant_secs ?? ""}
+                    placeholder="default"
+                    onChange={(e) =>
+                      setNet({ max_grant_secs: e.target.value === "" ? null : Number(e.target.value) })
+                    }
+                  />
+                </label>
+              </>
+            )}
+          </>
+        );
+      })()}
 
       <div className="sectitle">Unattended runs</div>
       <label className="check">

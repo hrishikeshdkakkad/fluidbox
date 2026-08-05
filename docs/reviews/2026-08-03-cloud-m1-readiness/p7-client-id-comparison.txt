@@ -1,0 +1,3 @@
+# WorkOS authorize-leg client_id comparison 2026-08-03T17:22:26Z
+connect app client_01KZ49JD6RHKP71APAQWMNSNAG -> https://error.workos.com/sso/client-id-invalid
+authkit env client_01KGA8ECKMDH8GWPZR00QGPTBZ -> https://euphoric-grape-60-staging.authkit.app/redirect-uri-invalid?invalid_redirect_uri=http%3A%2F%2F127.0.0.1%3A8790%2Fv1%2Fauth%2Fcallback&client_id=client_01KGA8ECKMDH8GWPZR00QGPTBZ

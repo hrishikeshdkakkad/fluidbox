@@ -1,0 +1,29 @@
+- main [ref=f10e3]:
+  - generic [ref=f10e4]:
+    - generic [ref=f10e8]:
+      - generic [ref=f10e9]:
+        - img "hrishi-test" [ref=f10e10]
+        - heading "Welcome" [level=1] [ref=f10e11]
+        - paragraph [ref=f10e13]: Log in to hrishi-test to continue to Fluidbox Cloud M1.
+      - generic [ref=f10e14]:
+        - generic [ref=f10e15]:
+          - generic [ref=f10e18]:
+            - generic [ref=f10e20]:
+              - generic [ref=f10e21]: Email address *
+              - textbox "Email address" [ref=f10e22]
+            - generic [ref=f10e24]:
+              - generic [ref=f10e25]: Password *
+              - textbox "Password" [ref=f10e26]
+              - switch "Show password" [ref=f10e27] [cursor=pointer]
+          - paragraph [ref=f10e28]:
+            - link "Reset password" [ref=f10e29] [cursor=pointer]:
+              - /url: /u/login/password-reset-start/Username-Password-Authentication?state=hKFo2SBLeWlneXNibXdGekFxSGRsSE1WME1MNWFJeDlpWnV6caFur3VuaXZlcnNhbC1sb2dpbqN0aWTZIC1tVFJfVG1MblQ2OUdURnEtLTNGb2NpY0RBN3AyU0Jwo2NpZNkgRHBYUDdETkk0UUFpQzB5TGk4b1dyV3RpSkkwOURGY1Y
+          - button "Continue" [ref=f10e31] [cursor=pointer]
+        - paragraph [ref=f10e33]:
+          - text: Don't have an account?
+          - link "Sign up" [ref=f10e34] [cursor=pointer]:
+            - /url: /u/signup?state=hKFo2SBLeWlneXNibXdGekFxSGRsSE1WME1MNWFJeDlpWnV6caFur3VuaXZlcnNhbC1sb2dpbqN0aWTZIC1tVFJfVG1MblQ2OUdURnEtLTNGb2NpY0RBN3AyU0Jwo2NpZNkgRHBYUDdETkk0UUFpQzB5TGk4b1dyV3RpSkkwOURGY1Y
+        - generic [ref=f10e35]: Or
+        - button "Continue with Google" [ref=f10e39] [cursor=pointer]
+    - link "Link to the Auth0 website" [ref=f10e42] [cursor=pointer]:
+      - /url: https://auth0.com/?utm_source=lock&utm_campaign=badge&utm_medium=widget
