@@ -64,11 +64,26 @@ sandbox:
 
 netpol:
   requireEnforced: true
-  # AWS VPC CNI standard mode programs policy asynchronously (~1–20s measured);
-  # 60s is the proven observation deadline. Kept at 60 under Cilium too: the
-  # deadline is an upper bound on an observation loop, not a tuning knob, and
-  # Cilium programs faster — a smaller number only buys a flakier gate.
-  waitSeconds: 60
+  # AWS VPC CNI standard mode programs policy asynchronously (~1–20s measured),
+  # and Cilium programs faster still — so 60s was ample for the CNI itself.
+  #
+  # 60s was NEVERTHELESS WRONG ON THIS DEPLOYMENT, and the reasoning above is
+  # what hid it: the deadline is an upper bound on an *observation loop*, but
+  # the clock starts when the grant is prepared — BEFORE the sandbox pod is
+  # schedulable. Our sandbox nodegroup runs min_size = 0 (platform/eks.tf), so
+  # the first run after any idle period must wait for a cold EC2 node to boot
+  # and join before a CiliumEndpoint can exist at all. The whole budget goes to
+  # EC2, none to the CNI, and the run FAILS CLOSED with
+  # "…not verified within 60s (policy: accepted…; endpoint: no endpoint)".
+  # Observed 2026-08-04: node Ready at 01:27:51, deadline expired 01:27:52 —
+  # missed by one second, and the identical run passed on the warm node.
+  #
+  # 240s covers a cold ARM node boot + join + CNI programming with margin, and
+  # stays well under FLUIDBOX_K8S_INIT_GRACE_SECS (300). This does not weaken
+  # the gate: it still fails closed, it just stops charging EC2 boot time to a
+  # CNI budget. The real fix is to start the deadline once the pod is
+  # scheduled — see docs/reviews/2026-08-05-e2e-scenario-matrix/README.md.
+  waitSeconds: 240
 
 # ── Governed sandbox network access ──────────────────────────────────────────
 # Requires BOTH: chart >= 0.5.0 (the netgrant templates land there) and the
