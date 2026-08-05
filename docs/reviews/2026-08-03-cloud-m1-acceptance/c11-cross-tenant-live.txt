@@ -1,0 +1,15 @@
+# §9-11 cross-tenant denial at the ENFORCED FLOOR — LIVE Neon (cloud), 2026-08-03T22:06:07Z
+# pool role is fluidbox_runtime (non-owner); neondb_owner carries BYPASSRLS, which is WHY the split exists
+owner view (BYPASSRLS, sees all):        2
+runtime role + GUC=default:              SET
+SET
+2
+runtime role + GUC=fluidzero:            SET
+SET
+0
+runtime role, NO GUC (must be 0):        SET
+0
+GUC=fluidzero asking for default's rows: SET
+SET
+0
+runtime role posture: false/false/false (super/bypassrls/login — all must be f)

@@ -118,22 +118,27 @@ export default function Runs() {
           <div className="ops-metric">
             <span className="metric-label">Active</span>
             <strong>{hasSnapshot ? active : "—"}</strong>
-            <small>{hasSnapshot ? (active === 1 ? "sandbox running" : "sandboxes running") : "control plane unavailable"}</small>
+            {/* Only claim the control plane is unavailable once a read has
+              * actually FAILED. `hasSnapshot` is false during the normal first
+              * fetch too, so keying the copy on it alone made a healthy system
+              * announce an outage on every cold load — and contradicted the
+              * status pill above, which correctly says "Checking". */}
+            <small>{hasSnapshot ? (active === 1 ? "sandbox running" : "sandboxes running") : offline ? "control plane unavailable" : "checking…"}</small>
           </div>
           <div className={`ops-metric ${approvals.length ? "attention" : ""}`}>
             <span className="metric-label">Needs Review</span>
             <strong>{hasSnapshot ? approvals.length : "—"}</strong>
-            <small>{hasSnapshot ? (approvals.length ? "decision required" : "no pending decisions") : "status unavailable"}</small>
+            <small>{hasSnapshot ? (approvals.length ? "decision required" : "no pending decisions") : offline ? "status unavailable" : "checking…"}</small>
           </div>
           <div className="ops-metric">
             <span className="metric-label">Completed</span>
             <strong>{hasSnapshot ? done : "—"}</strong>
-            <small>{hasSnapshot ? "recent runs" : "history unavailable"}</small>
+            <small>{hasSnapshot ? "recent runs" : offline ? "history unavailable" : "checking…"}</small>
           </div>
           <div className="ops-metric">
             <span className="metric-label">Success Rate</span>
             <strong>{hasSnapshot ? completionRate : "—"}</strong>
-            <small>{hasSnapshot ? "terminal runs" : "history unavailable"}</small>
+            <small>{hasSnapshot ? "terminal runs" : offline ? "history unavailable" : "checking…"}</small>
           </div>
         </div>
       </section>

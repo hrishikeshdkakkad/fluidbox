@@ -1,0 +1,2 @@
+NAME                                            READY   STATUS     RESTARTS   AGE   IP             NODE                          NOMINATED NODE   READINESS GATES
+fluidbox-019fc992-2951-7ad1-9f2e-3f3afd9baedc   0/2     Init:0/2   0          1s    10.42.14.217   ip-10-42-8-252.ec2.internal   <none>           <none>

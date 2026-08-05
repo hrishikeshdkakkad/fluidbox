@@ -1,0 +1,24 @@
+HTTP/2 302 
+date: Mon, 03 Aug 2026 17:21:52 GMT
+content-type: text/plain; charset=utf-8
+content-length: 68
+location: https://error.workos.com/sso/client-id-invalid
+cf-ray: a257004f5a4343ae-MCI
+cf-cache-status: DYNAMIC
+server: cloudflare
+set-cookie: initiate_login_context=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT
+strict-transport-security: max-age=31536000; includeSubDomains; preload
+vary: Origin, Accept, Accept-Encoding
+access-control-allow-credentials: true
+content-security-policy: default-src 'self';base-uri 'self';block-all-mixed-content;font-src 'self' https: data:;frame-ancestors 'self';img-src 'self' data:;object-src 'none';script-src 'self';script-src-attr 'none';style-src 'self' https: 'unsafe-inline';upgrade-insecure-requests
+expect-ct: max-age=0
+referrer-policy: no-referrer
+x-content-type-options: nosniff
+x-dns-prefetch-control: off
+x-download-options: noopen
+x-envoy-upstream-service-time: 5
+x-frame-options: SAMEORIGIN
+x-permitted-cross-domain-policies: none
+x-request-id: bd9bbe84-a79a-4929-a507-59e61f0afe12
+x-xss-protection: 0
+

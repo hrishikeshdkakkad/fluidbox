@@ -1,0 +1,139 @@
+# Fluidbox Cloud M1 — Idle & Light-Use Cost Model (re-verification)
+
+> ## ⚠️ REVISED 2026-08-03 BY A LIVE FAILURE: idle floor is now ≈ **$156/mo**, not $131
+>
+> The system node had to move from **t4g.medium → t4g.large** (+$24.53/mo).
+> This was not a preference: the DB-backed LiteLLM image was **OOMKilled
+> (exit 137) before logging a line** on the t4g.medium. That node has ~3.2 GiB
+> allocatable, kube-system already requested ~1.6 GiB, and node limits were
+> already 186% overcommitted — so ~1.6 GiB remained for a container that runs
+> prisma at startup.
+>
+> The original recipe's "t4g.medium + LiteLLM 2Gi" was validated with the
+> chart's **bundled** LiteLLM. M1 cannot use that one: per-tenant virtual keys
+> are a Postgres-backed LiteLLM feature, and hosted + shared-key mode is a
+> deliberate 503 in core. The heavier image is a requirement, so the bigger
+> node is too.
+>
+> **Every figure below still describes the t4g.medium model.** Add $24.53 to
+> the node line, plus $0.80 for EBS (the real idle footprint is 50 GiB — a
+> 40 GiB node root plus the 10 GiB archive PVC — not the 40 GiB modelled;
+> confirmed against deployed inventory 2026-08-03). Idle ≈ **$157/mo**,
+> light use ≈ **$163/mo**.
+> The band in the M1 brief (§11, $130–140) is therefore **exceeded by ~$16**,
+> and that is a real finding rather than an estimation error — the brief's band
+> was computed before anyone tried to run a DB-backed LiteLLM beside the server
+> on one 4 GiB node.
+
+**Milestone:** M1.0 gate proof — "Re-verify the idle and light-use cost model, including public IPv4 and ALB costs" (brief §6 M1.0, §9 criterion 17).
+**Date:** 2026-08-03 · **Region:** us-east-1 · **Pricing source:** AWS Price List API, pulled live this date.
+**Claimed floor (brief §11):** ≈ **$130–140 / month**.
+
+Unit prices in the "live?" = yes rows were fetched live from the AWS Pricing API (publication dates 2025-08 through 2026-08-03; the CloudWatch Logs list was published today). Rows marked "no" are AWS free-tier/policy facts or minor storage rates not separately re-queried — flagged inline. Quantities (LCU count, log GB, transfer GB) are operator estimates regardless of whether the unit price was verified.
+
+## 1. Idle floor (no runs in flight; sandbox nodegroup at zero)
+
+| Component | Unit price (live?) | Monthly math | Monthly $ |
+|---|---|---|---|
+| EKS control plane, standard support | $0.10 /cluster-hr — **yes** | 0.10 × 730 | **73.00** |
+| System node — 1× t4g.medium, Linux on-demand | $0.0336 /hr — **yes** | 0.0336 × 730 | **24.53** |
+| ALB — load-balancer hours | $0.0225 /hr — **yes** | 0.0225 × 730 | **16.43** |
+| ALB — LCU (near-idle, ~0.05 LCU avg) | $0.008 /LCU-hr — **yes** (rate) | 0.008 × 730 × 0.05 | **0.30** |
+| Public IPv4, in-use × 3 (1 node + 2 ALB AZ) | $0.005 /hr — **yes** | 0.005 × 730 × 3 | **10.95** |
+| EBS gp3 — 30 GiB root + 10 GiB archive PVC | $0.08 /GB-mo — **yes** | 0.08 × 40 | **3.20** |
+| KMS — 1 customer-managed key | $1.00 /key-mo — **yes** | 1 key (+ ~$0.03/10k req, trivial) | **1.00** |
+| CloudWatch Logs — ingestion (EKS control plane) | $0.50 /GB — **yes** | ~2 GB (first 5 GB/mo free) | **1.00** |
+| CloudWatch Logs — archived storage | $0.03 /GB-mo — no (not re-queried) | ~few GB | **0.10** |
+| S3 — state + trail buckets | $0.023 /GB-mo — **yes** | ~4 GB × 0.023 | **0.10** |
+| CloudFront | $0.085 /GB — **yes** (rate) | <1 TB, covered by 1 TB/mo always-free | **0.00** |
+| CloudTrail — fluidbox-owned trail (SECOND management-events copy: the account's pre-existing `serverless_trail` consumes the free first copy) | $2.00 /100k events — no (policy rate) | light account activity, ~50k/mo | **~1.00** |
+| Regional data transfer out to internet | $0.09 /GB — no (not re-queried) | <5 GB, covered by 100 GB/mo free | **0.00** |
+| Sandbox nodegroup (idle) | — | scale-to-zero by design | **0.00** |
+| **Idle-floor total** | | | **≈ 131.6** |
+
+**Verdict: PASS.** Computed idle floor ≈ **$131.6/mo** (incl. ~$1 for the fluidbox-owned second CloudTrail copy — see `deploy/cloud/terraform/bootstrap/cloudtrail.tf` for why an owned trail was chosen over adopting another project's), at the **low end of the claimed $130–140 band** (in the range, not over). If the CloudWatch Logs ingestion and ALB LCU fall entirely into free tier / round to zero, the floor is ~$129; if logs run a little heavier, ~$131. No line item moved materially versus the brief's §11 numbers:
+
+- EKS $73.00 (claim $73), node $24.53 (claim $24.50), public IPv4 $10.95 (claim $11) — all within pennies.
+- ALB is **$16.43 hours + ~$0.30 idle LCU ≈ $16.7** (claim $16.50); at true idle the LCU is negligible, so ALB alone is ~$16.4, slightly **below** the bundled claim.
+- The brief's "EBS + KMS + logs + CloudFront ≈ $5–15" bucket lands at its **low end (~$5.4)**: EBS $3.20 + KMS $1.00 + logs ~$1.10 + S3 $0.10, with CloudFront, CloudTrail, and regional egress all $0 under always-on free tiers.
+
+## 2. Light use (5–10 orgs) scenario
+
+Add usage-driven deltas on top of the idle floor (sandbox nodegroup wakes for runs, more edge/LCU traffic, more logs):
+
+| Delta | Math | Monthly $ |
+|---|---|---|
+| Sandbox node — ~2 hr/day of 1× t4g.medium (+transient EBS) | 0.0336 × 2 × 30 (+~0.05) | **~2.05** |
+| ALB LCU bump (bursty run traffic, ~0.5–1 LCU active) | ~+3 | **~3.00** |
+| CloudWatch Logs bump (container + audit, +2–3 GB) | ~+1.25 | **~1.25** |
+| CloudFront / regional egress | still inside 1 TB & 100 GB free tiers | **0.00** |
+| **Light-use total** | idle 130.6 + ~6.3 | **≈ 137 / mo** |
+
+Still **within the $130–140 band**. Sandbox delta ~$2 matches the brief's $1.50–2.50 estimate.
+
+## 3. Cost levers / denial-of-wallet notes
+
+All of these already exist in the product or the AWS setup; they are the mitigations that bound spend for an invited, trusted cohort (brief §7):
+
+- **Two-level AWS budgets** — a tag-filtered Fluidbox budget plus an account-wide budget as a second circuit breaker (brief §6 M1.0).
+- **Per-tenant rolling LLM budget + per-run monetary and wall-clock budgets** — Core-side, cap the largest variable cost (model spend) before it happens.
+- **Global sandbox ResourceQuota + scale-from-zero nodegroup** — sandbox compute is $0 while idle and cannot exceed the cluster quota.
+- **Per-tenant egress-rate controls** — bound outbound abuse (denial-of-wallet via egress) per tenant/user/connection/host.
+- **Log retention + ECR/S3 lifecycle rules** — keep CloudWatch Logs ingestion/storage and image/object storage from creeping (brief §6 M1.0).
+- **Operator run cancellation + manual tenant containment** — stop active runs and deactivate access (with the documented limitation that containment is not yet a durable suspend).
+
+## 4. Honest note on the fixed floor
+
+The ~$130 idle floor is the deliberate price of running the **unchanged Kubernetes and Core primitives** in M1 (PLAN rev 3, brief §11): a standard EKS control plane ($73), one always-on system node, and an always-on ALB with its public IPv4 addresses together account for ~$125 of the ~$130 and are fixed whether or not any customer is active. M1's contract is "deploy today's Fluidbox safely," so none of these are optimized away here. The **~$13-idle serverless-core alternative** (scale-to-zero Core, no persistent EKS/ALB floor) is explicitly **deferred to M4** (brief §3 "Explicitly deferred"; §13). M1 accepts the fixed floor in exchange for zero Core/chart changes.
+
+## 5. Caveats and non-AWS costs
+
+- **NAT gateway is assumed absent.** This model puts the system/sandbox nodes in **public subnets** (the node carries a public IP — that is the 3rd billed IPv4). A private-subnet topology instead would drop the node's public IP (−$3.65/mo) but add a **NAT gateway ≈ $0.045/hr = ~$32.85/mo + $0.045/GB** processing — a material ~**+$30/mo**. Hold the public-subnet topology to keep the floor as modeled.
+- **The tag-filtered budget under-reports unless node ASGs propagate the tag.**
+  EKS managed-node-group tags do **not** reach the EC2 instances or their
+  volumes, so `default_tags` alone would leave the single biggest line item
+  (the always-on t4g.medium, $24.53) outside a `project=fluidbox` filter. The
+  platform stack therefore sets `project=fluidbox` on both node ASGs with
+  `propagate_at_launch = true`. **Residual:** EBS volumes are tagged from the
+  launch template's TagSpecifications, which the EKS-managed template does not
+  carry, so gp3 storage (~$3.20/mo) can still fall outside the filter. The
+  account-wide breaker is unfiltered and catches everything — which is exactly
+  why it is the primary control and the tag-filtered budget is the secondary.
+- **Not live-verified (flagged above):** CloudWatch Logs archived-storage rate ($0.03/GB-mo), regional data-transfer-out rate ($0.09/GB), CloudTrail first-trail-free and the CloudFront 1 TB / regional 100 GB always-free allowances — these are AWS free-tier/policy facts, not Pricing-API line items, and drive several $0 rows.
+- **External (informational, not AWS, not from the Pricing API):** Neon $0–19/mo, WorkOS $0 (under 1M MAU), Vercel Hobby/Pro $0–20/mo. Not included in the AWS floor above.
+
+## 6. Measuring this on a SHARED account (added 2026-08-03)
+
+`471112572248` is not a fluidbox-only account — it carries four other projects.
+Measured 2026-08-01/02, before fluidbox existed on it, the daily baseline was
+**~$5.7/day (~$170/mo) of non-fluidbox spend**:
+
+| service | $/day | ours? |
+|---|---|---|
+| Amazon Elastic Container Service | 1.84 | **no** — fluidbox runs on EKS, not ECS |
+| EC2 – Other | 1.12 | shared |
+| Amazon RDS | 0.87 | **no** — fluidbox uses Neon |
+| Elastic Load Balancing | 0.54 | shared |
+| Amazon VPC | 0.48 | shared |
+| EC2 – Compute | 0.30 | shared |
+| KMS / Secrets Manager / S3 / ECR | ~0.35 | shared |
+
+Three consequences, and they are the whole reason §9-17 stayed open:
+
+1. **An account-wide total is never fluidbox's idle cost.** The $600 breaker is
+   deliberately unfiltered — it is the "investigate the whole account" number,
+   not an attribution tool.
+2. **Attribution requires the `project` cost-allocation tag to be ACTIVE.**
+   While it is Inactive, AWS does not break cost down by it at all, so the
+   tag-filtered budget reads $0.00 and no measured fluidbox figure exists. This
+   is a config gap, not merely a calendar one.
+3. **One slice is measurable with no tag at all: Amazon EKS.** It appears
+   nowhere in the pre-fluidbox baseline above, so any EKS spend on this account
+   is ours by construction. `cloud-m1-acceptance.sh 17` reports it as a floor
+   to sanity-check this model against while the tag is pending. Shared services
+   (ELB, EC2, VPC, KMS, S3) cannot be attributed this way and still need the tag.
+
+So the honest reading of §9-17 is: the modelled figure (~$156/mo) is reconciled
+against real deployed inventory, an EKS-only floor becomes available roughly 24h
+after deployment, and the complete measured number needs the tag active plus a
+full idle month.

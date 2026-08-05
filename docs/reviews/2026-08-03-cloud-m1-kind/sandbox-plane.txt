@@ -1,0 +1,9 @@
+NAME                                                            POD-SELECTOR                AGE
+networkpolicy.networking.k8s.io/fluidbox-sandbox-default-deny   <none>                      3m28s
+networkpolicy.networking.k8s.io/fluidbox-sandbox-egress         fluidbox.dev/managed=true   3m28s
+
+NAME                                   REQUEST                                                           LIMIT   AGE
+resourcequota/fluidbox-sandbox-quota   pods: 1/20, requests.cpu: 550m/10, requests.memory: 1088Mi/20Gi           3m28s
+
+NAME                                 CREATED AT
+limitrange/fluidbox-sandbox-limits   2026-08-03T17:54:47Z

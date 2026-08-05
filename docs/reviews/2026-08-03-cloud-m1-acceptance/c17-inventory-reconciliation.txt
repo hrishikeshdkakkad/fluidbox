@@ -1,0 +1,71 @@
+# §9-17 — modelled vs ACTUALLY DEPLOYED inventory (2026-08-03T22:20Z)
+
+An empirical idle floor needs a full idle month; that cannot be produced today.
+What CAN be reconciled now is the model's line items against the resources that
+actually exist — which is where a cost model usually goes wrong.
+
+| line | model | actually deployed | verdict |
+|---|---|---|---|
+| EKS cluster | 1 @ $73/mo | 1 (`fluidbox-cloud`) | matches |
+| System node | 1 × t4g.large @ $49/mo | 1 × **t4g.large** (`i-0bc04d06…`) | matches the REVISED model |
+| Sandbox nodes at idle | 0 | 0 when idle — proven reaching `desired=0, nodes=0` at 22:01:26Z (§9-15). One was running at capture time because a run had just woken it | matches |
+| ALB | 1 @ ~$16.4/mo | 1 (`k8s-fluidbox-…`) | matches |
+| **NAT gateways in our VPC** | **0 (structural)** | **0** | **matches — see note** |
+| EBS | 40 GiB ($3.20) | 10 GiB archive PVC + 40 GiB node root = **50 GiB** ($4.00) | model UNDERCOUNTS by ~$0.80/mo |
+| KMS CMK | 1 @ $1/mo | 1 (`alias/fluidbox-cloud-kek`) | matches |
+| CloudFront | 1 | 1 | matches |
+
+## The NAT line, checked rather than assumed
+
+A first pass counted 1 NAT gateway account-wide and would have read as a
+model violation. It is `nat-1d0c58bf66f36fed7` in `vpc-049fc9d234e6210be` —
+the **forceplatforms** VPC, another project's, exactly as the 2026-08-03
+account survey recorded. Our VPC (`vpc-0a2a2e6b472e38740`) has **zero**.
+The no-NAT decision — the single largest modelled cost risk at ~$32/mo —
+holds.
+
+## Corrections this reconciliation produced
+
+1. **Node class**: t4g.LARGE, not the brief's t4g.medium, forced by the
+   DB-backed LiteLLM OOMKill. +$24.53/mo.
+2. **EBS**: the model counted 40 GiB but the real footprint at idle is 50 GiB
+   (a 40 GiB node root plus the 10 GiB archive PVC). +$0.80/mo.
+
+Revised idle floor ≈ **$157/mo** against the brief's $130–140 band.
+
+## What remains, honestly
+
+The EMPIRICAL figure. Cost Explorer lags ~24h and a floor is a monthly
+quantity, so no amount of work today produces it. The reconciliation available
+today — model corrected against real inventory — is done; measuring it against
+a full idle month is a calendar dependency, not a task.
+
+Re-run when a month has passed: scripts/cloud/cloud-m1-acceptance.sh 17
+
+## First empirical attempt (2026-08-03T22:22Z) — data not yet available
+
+Pulled daily UnblendedCost for the account to see whether a first signal was
+extractable rather than waiting a month:
+
+    2026-07-28  $6.14      2026-08-01  $7.66
+    2026-07-29  $6.58      2026-08-02  $5.68
+    2026-07-30  $6.96      2026-08-03  $1.54   <- deployment day
+    2026-07-31  $5.78
+
+**Today's figure is not usable.** $1.54 against a ~$6.5/day baseline for the
+account's OTHER projects is proof of incompleteness, not of cheapness: Cost
+Explorer lags, and the platform only came up around 20:50Z. Grouping by
+service confirms it — **EKS does not appear at all**, and EC2-Compute shows
+$0.06, far below one hour of a running t4g.large.
+
+Fragments that ARE attributable to this deployment appear: KMS $0.062 (the CMK
+created today), ECR $0.013 (the replay image push), ELB $0.158 (our ALB). They
+are partial-day and interleaved with other projects, so they support no
+reconciliation.
+
+**Conclusion: the empirical idle floor is a calendar dependency.** It needs a
+full idle month with the `project` cost-allocation tag ACTIVE (it is currently
+Inactive — AWS refuses to activate a tag it has never seen on billed usage;
+re-apply bootstrap with `-var activate_cost_allocation_tag=true` about a day
+from now). Until then the reconciliation of record is the inventory check
+above: model corrected to ~$157/mo and matched line-for-line to what exists.
