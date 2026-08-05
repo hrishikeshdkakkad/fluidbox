@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { PolicyContent, TargetRule } from "./api";
+import { NetworkRequest, PolicyContent, TargetRule } from "./api";
 import {
   describeTarget,
   MODE_ORDER,
   networkOf,
   OFFLINE_NETWORK,
+  OFFLINE_REQUEST,
   portsLabel,
+  requestOf,
+  summarizeRequest,
 } from "./network";
 
 const base = { name: "p" } as unknown as PolicyContent;
@@ -74,5 +77,51 @@ describe("mode ordering", () => {
     // Pinned because the selectors render in this order and a reader will
     // take the order as meaning "increasingly permissive". It does.
     expect(MODE_ORDER).toEqual(["offline", "approved", "public"]);
+  });
+});
+
+describe("requestOf", () => {
+  it("reads an absent revision declaration as offline, never as unknown", () => {
+    // The server documents `network` on a revision as "omitted means offline"
+    // (api.rs), so an absent field is a FACT, not a gap — unlike a policy read
+    // that FAILED, which must stay unknown.
+    expect(requestOf(undefined)).toEqual(OFFLINE_REQUEST);
+    expect(requestOf(null)).toEqual(OFFLINE_REQUEST);
+    expect(requestOf(OFFLINE_REQUEST).mode).toBe("offline");
+  });
+
+  it("returns the stored declaration untouched when present", () => {
+    const r: NetworkRequest = { mode: "public", targets: [], duration_secs: null };
+    expect(requestOf(r)).toBe(r);
+  });
+});
+
+describe("summarizeRequest", () => {
+  it("names the mode for offline and public, which carry no targets", () => {
+    expect(summarizeRequest({ mode: "offline", targets: [], duration_secs: null })).toBe("Offline");
+    expect(summarizeRequest({ mode: "public", targets: [], duration_secs: null })).toBe("Public");
+  });
+
+  it("counts targets under approved, singular and plural", () => {
+    const t: TargetRule = {
+      kind: "dns",
+      pattern: { kind: "exact", name: "pypi.org" },
+      ports: [{ from: 443, to: 443 }],
+      protocol: "tcp",
+    };
+    expect(summarizeRequest({ mode: "approved", targets: [t], duration_secs: null })).toBe(
+      "Approved targets · 1 target",
+    );
+    expect(summarizeRequest({ mode: "approved", targets: [t, t], duration_secs: null })).toBe(
+      "Approved targets · 2 targets",
+    );
+  });
+
+  it("says an approved declaration with no targets grants nothing", () => {
+    // Not cosmetic: approved+[] is inert, and reading it as plain "Approved
+    // targets" would suggest the agent has egress it does not have.
+    expect(summarizeRequest({ mode: "approved", targets: [], duration_secs: null })).toBe(
+      "Approved targets · none yet",
+    );
   });
 });

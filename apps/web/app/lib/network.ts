@@ -1,7 +1,14 @@
 // Presentation helpers for sandbox network grants. Formatting and ordering
 // ONLY — what a policy MEANS is resolved server-side by /policies/preview.
 
-import { NetworkGrantMode, NetworkPolicy, PolicyContent, PortSpec, TargetRule } from "./api";
+import {
+  NetworkGrantMode,
+  NetworkPolicy,
+  NetworkRequest,
+  PolicyContent,
+  PortSpec,
+  TargetRule,
+} from "./api";
 
 /** The fail-safe section a policy has when it has never configured egress. */
 export const OFFLINE_NETWORK: NetworkPolicy = {
@@ -48,4 +55,28 @@ export function describeTarget(t: TargetRule): string {
         ? t.pattern.name
         : `*.${t.pattern.suffix}`;
   return `${where} ${t.protocol.toUpperCase()} ${portsLabel(t.ports)}`;
+}
+
+/** What a revision declares when it declares nothing. The server documents the
+ *  field as "omitted means offline" (api.rs), so an ABSENT declaration is a
+ *  known fact — unlike a policy read that FAILED, which must stay "unknown". */
+export const OFFLINE_REQUEST: NetworkRequest = {
+  mode: "offline",
+  targets: [],
+  duration_secs: null,
+};
+
+/** Every read of a revision's declaration goes through this, for the same
+ *  reason `networkOf` exists for a policy: the field is routinely absent. */
+export function requestOf(network: NetworkRequest | null | undefined): NetworkRequest {
+  return network ?? OFFLINE_REQUEST;
+}
+
+/** One line for a chip or a header row. `approved` carries its target count
+ *  because an approved declaration with NO targets grants nothing, and
+ *  rendering it as a bare "Approved targets" would imply egress it lacks. */
+export function summarizeRequest(n: NetworkRequest): string {
+  if (n.mode !== "approved") return MODE_LABEL[n.mode];
+  if (n.targets.length === 0) return `${MODE_LABEL[n.mode]} \u00b7 none yet`;
+  return `${MODE_LABEL[n.mode]} \u00b7 ${n.targets.length} target${n.targets.length === 1 ? "" : "s"}`;
 }
