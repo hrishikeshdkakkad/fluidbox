@@ -11,13 +11,15 @@ import {
   ConnectionRequirement,
   connectionMatchesConnector,
   isToolConnection,
+  NetworkGrantMode,
   NetworkRequest,
   ownerBadge,
   PolicySummary,
   Revision,
   TriggerSubscription,
 } from "../lib/api";
-import { MODE_LABEL } from "../lib/network";
+import { MODE_LABEL, MODE_ORDER, OFFLINE_REQUEST } from "../lib/network";
+import { TargetRuleEditor } from "./TargetRuleEditor";
 import { AddServerWizard } from "../app/capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
 import { CopyBlock, TemplateChips } from "./AutomationContract";
@@ -85,6 +87,9 @@ interface RunComposerDraft {
   /** The per-run "offline only" narrowing; optional so pre-narrowing drafts
    *  still validate (no `version` bump, no validator requirement). */
   offlineOnly?: boolean;
+  /** The new agent's declared egress. Optional for the same reason as
+   *  `offlineOnly`: drafts stored before this field must still validate. */
+  agentNetwork?: NetworkRequest;
 }
 
 function isRunComposerDraft(value: unknown): value is RunComposerDraft {
@@ -162,6 +167,11 @@ export function RunComposer({
   // shreds the revision into the fields above (see the revision effect).
   const [offlineOnly, setOfflineOnly] = useState(false);
   const [declaredNetwork, setDeclaredNetwork] = useState<NetworkRequest | null>(null);
+  // The NEW agent's declaration. Distinct from `declaredNetwork` above, which
+  // is what an EXISTING agent already declares: this one is authored here,
+  // because agent creation had no way to declare egress and a created agent
+  // therefore started offline with nothing on screen saying so.
+  const [agentNetwork, setAgentNetwork] = useState<NetworkRequest>(OFFLINE_REQUEST);
 
   const [newAgentName, setNewAgentName] = useState("");
   const [description, setDescription] = useState("");
@@ -262,13 +272,14 @@ export function RunComposer({
       pubCheck,
       capabilityKeepList,
       offlineOnly,
+      agentNetwork,
     }),
     [
       mode, task, autonomous, agentChoice, selectedAgentName, revisionTouched, newAgentName,
       description, harness, model, systemPrompt, policyName, policyOverride, workspace, pins, requirements, bindings, kind,
       automationName, allowTask, allowWorkspace, callbackUrl, concurrency, cron, timezone,
       missedPolicy, connection, repositories, evOpened, evReopened, evSync, pubComment, pubCheck,
-      capabilityKeepList, offlineOnly,
+      capabilityKeepList, offlineOnly, agentNetwork,
     ]
   );
   // Loading an existing revision is not user input. Only persist agent fields
@@ -305,6 +316,7 @@ export function RunComposer({
     !pubComment ||
     pubCheck ||
     offlineOnly ||
+    agentNetwork.mode !== "offline" ||
     capabilityKeepList.trim().length > 0;
   const restoreDraft = useCallback((saved: RunComposerDraft) => {
     if (!isRunComposerDraft(saved)) return;
@@ -343,6 +355,7 @@ export function RunComposer({
     setPubCheck(saved.pubCheck);
     setCapabilityKeepList(saved.capabilityKeepList);
     setOfflineOnly(saved.offlineOnly ?? false);
+    setAgentNetwork(saved.agentNetwork ?? OFFLINE_REQUEST);
   }, []);
   const clearDraft = useSessionDraft({
     key: draftKey,
@@ -680,6 +693,10 @@ export function RunComposer({
           // embedded add-server flow); the server revalidates each. Omitted when
           // empty so plain agents are unaffected.
           ...(requirements.length > 0 ? { connection_requirements: requirements } : {}),
+          // WYSIWYG, like the fields above: an omitted `network` means offline
+          // server-side, so sending it explicitly is what makes the control on
+          // screen the thing that actually takes effect.
+          network: agentNetwork,
         });
         createdAgent = response.agent;
         runAgentName = response.agent.name;
@@ -1568,6 +1585,55 @@ export function RunComposer({
                 </details>
               )}
             </>
+          </ComposerSection>
+        )}
+
+        {agentOnly && agentChoice === "new" && (
+          <ComposerSection
+            index={5}
+            title="Network access"
+            hint="Where sandboxes running this agent may reach."
+          >
+            <p className="helper" style={{ marginBottom: 6 }}>
+              This is the agent&rsquo;s <strong>declaration</strong>. The governing policy caps it,
+              and a single run may narrow it further — never widen it. Left at Offline, the agent
+              has no egress at all.
+            </p>
+            <label className="field">
+              <span className="lab">Mode</span>
+              <select
+                className="inp"
+                value={agentNetwork.mode}
+                onChange={(e) => {
+                  const nextMode = e.target.value as NetworkGrantMode;
+                  // A public declaration must carry NO targets — core refuses
+                  // that pairing as a narrowing the datapath would not apply.
+                  setAgentNetwork({
+                    ...agentNetwork,
+                    mode: nextMode,
+                    targets: nextMode === "public" ? [] : agentNetwork.targets,
+                  });
+                }}
+              >
+                {MODE_ORDER.map((m) => (
+                  <option key={m} value={m}>
+                    {MODE_LABEL[m]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {agentNetwork.mode === "approved" && (
+              <TargetRuleEditor
+                value={agentNetwork.targets}
+                onChange={(targets) => setAgentNetwork({ ...agentNetwork, targets })}
+              />
+            )}
+            {agentNetwork.mode === "public" && (
+              <p className="helper">
+                A public declaration carries no targets — it reaches everything the
+                deployment&rsquo;s deny wall permits.
+              </p>
+            )}
           </ComposerSection>
         )}
 
