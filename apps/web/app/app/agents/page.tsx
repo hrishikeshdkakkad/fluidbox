@@ -30,7 +30,13 @@ import {
   draftToInput,
 } from "../../components/WorkspacePicker";
 import { TargetRuleEditor } from "../../components/TargetRuleEditor";
-import { MODE_LABEL, MODE_ORDER, networkOf } from "../../lib/network";
+import {
+  MODE_LABEL,
+  MODE_ORDER,
+  networkOf,
+  requestOf,
+  summarizeRequest,
+} from "../../lib/network";
 
 export default function AgentsPage() {
   return (
@@ -79,6 +85,27 @@ function Agents() {
     const first = window.setTimeout(() => void load(), 0);
     return () => clearTimeout(first);
   }, [load]);
+
+  // Warm the revisions for every agent so the collapsed row can state what the
+  // agent DECLARES. `GET /agents` carries only id/name/description, so without
+  // this the declaration is invisible until you expand — which is how an agent
+  // silently sat offline. O(agents) cached GETs on mount; a failure is
+  // deliberately silent because the row renders nothing rather than guessing.
+  useEffect(() => {
+    let live = true;
+    for (const a of agents) {
+      if (revs[a.id]) continue;
+      void loadRevs(a.id).catch(() => {
+        if (!live) return;
+      });
+    }
+    return () => {
+      live = false;
+    };
+    // `revs` is intentionally absent: including it would re-run on every load
+    // and re-request agents already in flight.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agents, loadRevs]);
 
   const toggle = async (id: string) => {
     if (open === id) {
@@ -194,7 +221,18 @@ function Agents() {
                     <span className="mono" style={{ fontSize: 12.5, color: "var(--accent)" }}>
                       {a.name}
                     </span>
-                    <span className="task mut">{a.description || "—"}</span>
+                    <span className="task mut">
+                      {a.description || "—"}
+                      {/* The current revision's declaration, stated where an
+                          operator actually looks. Rendered only once the
+                          revisions are known — an unknown declaration shows
+                          nothing rather than claiming "Offline". */}
+                      {revs[a.id]?.[0] && (
+                        <span className="chip" style={{ marginLeft: 8 }}>
+                          network <b>{summarizeRequest(requestOf(revs[a.id][0].network))}</b>
+                        </span>
+                      )}
+                    </span>
                   </button>
                   {open === a.id && (
                     <div
@@ -235,6 +273,9 @@ function Agents() {
                               bundles <b>{bundleRefsLabel(r.capability_bundles)}</b>
                             </span>
                           )}
+                          <span className="chip">
+                            network <b>{summarizeRequest(requestOf(r.network))}</b>
+                          </span>
                           <span className="chip">image {short(r.runner_image, 24)}</span>
                         </div>
                       ))}
