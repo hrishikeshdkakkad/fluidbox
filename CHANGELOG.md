@@ -4,6 +4,33 @@ All notable, user-visible changes to fluidbox are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
+## [0.6.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.5.1...v0.6.0) (2026-08-05)
+
+
+### Added
+
+* **api:** report the resolved network enforcer so the dashboard cannot offer what it cannot enforce ([82d880d](https://github.com/hrishikeshdkakkad/fluidbox/commit/82d880d33941f52db86df1b66b1af60981df0d96))
+* **cloud:** turn on governed network access — chart 0.5.1 + the Cilium enforcer ([e94729a](https://github.com/hrishikeshdkakkad/fluidbox/commit/e94729a560bad8997e5e117a1bf76c0e89917a5b))
+* network-grant dashboard UI — govern sandbox egress from the dashboard ([5f6287e](https://github.com/hrishikeshdkakkad/fluidbox/commit/5f6287e9dba42312f119bcee28ab64dd4d9f36ad))
+* **web:** authorize a parked network grant from the timeline ([ca0b2da](https://github.com/hrishikeshdkakkad/fluidbox/commit/ca0b2da9457c054c6c262a35a53cb32b86bfd0c8))
+* **web:** declare an agent's network needs on a revision ([13ee4a6](https://github.com/hrishikeshdkakkad/fluidbox/commit/13ee4a6c6aaa3b91ef04c496246df8ed3c4dc098))
+* **web:** edit the sandbox egress ceiling in Governance ([e0c9957](https://github.com/hrishikeshdkakkad/fluidbox/commit/e0c9957495fca3fae6f3ed1580b087f85ba22fb6))
+* **web:** narrow a single run to offline from the composer ([b0d0ff0](https://github.com/hrishikeshdkakkad/fluidbox/commit/b0d0ff02abc727e0e2417e2021db645d71e029fa))
+* **web:** shared target editor for network grant rules ([c39895f](https://github.com/hrishikeshdkakkad/fluidbox/commit/c39895f601daf04e3cec0a5b5f8aa642b3bf3a7d))
+* **web:** type mirrors and presentation helpers for network grants ([4b6fa7d](https://github.com/hrishikeshdkakkad/fluidbox/commit/4b6fa7d0a3e2860795dea95950d935d684938913))
+
+
+### Fixed
+
+* **web,api:** review fixes — preserve the allow catalog across ceiling switches, never fabricate a declaration, persist and reset the run narrowing choice, pin enforcer delegation ([21108b4](https://github.com/hrishikeshdkakkad/fluidbox/commit/21108b450205eb4d454ebb982e0134382409bc31))
+
+
+### Documentation
+
+* **cloud:** record the Cilium cutover, its two upstream bugs, and the last mile ([33b0524](https://github.com/hrishikeshdkakkad/fluidbox/commit/33b05244ece125566cb48e85cde23a29e363b6f0))
+* **plan:** implementation plan for the network-grant dashboard UI ([8dffed5](https://github.com/hrishikeshdkakkad/fluidbox/commit/8dffed518567350de3db3276018b738189454052))
+* **spec:** governed sandbox egress, selectable in the dashboard ([395bdab](https://github.com/hrishikeshdkakkad/fluidbox/commit/395bdab4478583bec3a2d0be1c5a173f622e0c86))
+
 ## [0.5.1](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.5.0...v0.5.1) (2026-08-04)
 
 
