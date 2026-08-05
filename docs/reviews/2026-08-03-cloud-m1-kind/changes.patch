@@ -1,0 +1,18 @@
+diff --git a/app.js b/app.js
+index ba0a0b6..0cd436d 100644
+--- a/app.js
++++ b/app.js
+@@ -1,5 +1,5 @@
+ // demo-service: the tiny app the five-minute demo repairs.
+ function greet(name) {
+-  return "Hello, name!";
++  return "Hello, " + name + "!";
+ }
+ module.exports = { greet };
+diff --git a/deploy.log b/deploy.log
+new file mode 100644
+index 0000000..32ec16e
+--- /dev/null
++++ b/deploy.log
+@@ -0,0 +1 @@
++[deploy] 2026-08-03T17:55:47Z released demo build to demo-target

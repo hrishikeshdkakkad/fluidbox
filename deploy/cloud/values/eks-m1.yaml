@@ -1,0 +1,127 @@
+# Fluidbox Cloud M1 — static chart values for the UNCHANGED released chart.
+# Dynamic values (SG id, KMS ARN, public URL, staged SSO flip) are overlaid by
+# deploy/cloud/terraform/app/fluidbox.tf; secrets never appear in either.
+#
+# NOTE the ingress conditions annotation (the rotating CloudFront origin
+# header check) is deliberately ABSENT here: scripts/cloud/rotate-origin-secret.sh
+# owns it via kubectl annotate, and helm's three-way merge preserves
+# out-of-band annotations across upgrades.
+
+fullnameOverride: fluidbox
+
+web:
+  # The dashboard lives on Vercel in M1 — the chart's bundled web stays off.
+  enabled: false
+
+litellm:
+  # External DB-backed LiteLLM is composed by the app stack (tenant virtual
+  # keys need LiteLLM's own Postgres, which the bundled template does not wire).
+  enabled: false
+
+llm:
+  upstreamUrl: "http://litellm.fluidbox.svc.cluster.local:4000"
+
+server:
+  replicas: 1
+  archivePvc:
+    storageClass: gp3
+  # Chart default, restated because it is load-bearing on Neon: the pool SET
+  # ROLEs to the NOLOGIN runtime role, making RLS the enforced tenant floor.
+  runtimeRole: "fluidbox_runtime"
+
+ingress:
+  enabled: true
+  className: alb
+  host: ""
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /v1/health
+    # SSE keepalive is 15s; 120s idle keeps a quiet stream alive with margin.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=120,routing.http.drop_invalid_header_fields.enabled=true
+    # Tag-filtered budget coverage for the controller-created ALB.
+    alb.ingress.kubernetes.io/tags: project=fluidbox,fluidbox-cloud=m1
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+    # alb.ingress.kubernetes.io/security-groups is overlaid by terraform (the
+    # CloudFront-prefix-list frontend SG from the platform stack).
+
+sandbox:
+  egressProfile: zeroEgress
+  # Pin sandboxes to the tainted scale-from-zero nodegroup.
+  nodeSelector:
+    fluidbox.dev/role: sandbox
+  tolerations:
+    - key: fluidbox.dev/sandbox
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  quota:
+    enabled: true
+    pods: "20"
+    requestsCpu: "10"
+    requestsMemory: "20Gi"
+
+netpol:
+  requireEnforced: true
+  # AWS VPC CNI standard mode programs policy asynchronously (~1–20s measured);
+  # 60s is the proven observation deadline. Kept at 60 under Cilium too: the
+  # deadline is an upper bound on an observation loop, not a tuning knob, and
+  # Cilium programs faster — a smaller number only buys a flakier gate.
+  waitSeconds: 60
+
+# ── Governed sandbox network access ──────────────────────────────────────────
+# Requires BOTH: chart >= 0.5.0 (the netgrant templates land there) and the
+# platform stack on var.cni = "cilium". The server-side switch is separate and
+# deliberate — FLUIDBOX_NETWORK_ENFORCER, overlaid by terraform. Turning THIS
+# on alone changes no run's authority: it only creates the wall, the controlled
+# resolver, and the standing control-plane allow that every sandbox sits under.
+#
+# sandbox.egressProfile stays zeroEgress ON PURPOSE. Cilium unions allows
+# across k8s NetworkPolicy and CiliumNetworkPolicy, so the :8788-only k8s
+# policy remains a second, CNI-independent floor while per-run CNPs add
+# exactly the granted targets on top. Deny still wins across every object.
+networkGrants:
+  enabled: true
+  # This VPC is 10.42.0.0/16 and pod IPs come from it (ENI IPAM), so the
+  # default RFC1918 set already covers every in-cluster address. Restated
+  # rather than inherited because it is load-bearing: reaching another
+  # tenant's pod by address is lateral movement, not egress.
+  clusterCIDRs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  # The deployment's OWN public addresses, so a `public` grant cannot hairpin
+  # back into the public API. These are the internet-facing ALB's current
+  # public IPs (2026-08-04).
+  #
+  # RESIDUAL, stated plainly: ALB public IPs are AWS-managed and CHANGE when
+  # the load balancer scales or is replaced, and this is a static file — so
+  # this list can go stale silently. It is also incomplete for the real
+  # front door, which is CloudFront (a large managed prefix list, not
+  # enumerable here). Consequence: `public` mode is NOT certified on this
+  # deployment. The drill runs `approved`, where every target is named
+  # explicitly and the hairpin cannot arise. Raising any policy to `public`
+  # here requires closing this first.
+  deploymentPublicCIDRs:
+    - 34.239.225.98/32
+    - 100.59.117.29/32
+  upstreamResolvers:
+    - 1.1.1.1
+    - 8.8.8.8
+  # REQUIRED (the chart refuses to render without it): sandbox pods run
+  # `dnsPolicy: None`, whose nameserver list must be literal IPs written before
+  # the Service exists. 172.20.0.53 mirrors kube-dns at 172.20.0.10 in this
+  # cluster's 172.20.0.0/16 service CIDR — chosen to be legible rather than
+  # merely free. A Service's clusterIP is IMMUTABLE, so if a release ever
+  # allocated one dynamically, the Service must be deleted before the upgrade
+  # that pins this.
+  dnsClusterIP: 172.20.0.53
+  # Two replicas: this resolver is in the path of every granted run, and it
+  # lands on the single system node alongside Core and LiteLLM (the template
+  # sets no nodeSelector, and the sandbox nodegroup is tainted).
+  dnsReplicas: 2
+  egressGateway:
+    # Off: it is SNAT + attribution, never the boundary, and it needs a
+    # dedicated labelled nodegroup plus an EIP that would bill silently.
+    enabled: false

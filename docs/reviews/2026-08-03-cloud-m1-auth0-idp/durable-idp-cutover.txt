@@ -1,0 +1,68 @@
+§9-4 re-proven on a DURABLE issuer — Dex (operator's laptop) → Auth0 (hosted).
+2026-08-03, against the live deployment.
+
+WHY THIS WAS NEEDED
+§9-4 already passed, but on an IdP that was a Dex container on the operator's
+laptop behind an ngrok tunnel. A reboot would have broken sign-in for the whole
+org. The criterion was satisfied; the deployment was not durable.
+
+WHAT WAS DONE (Auth0 CLI, tenant hrishi-test.jp.auth0.com)
+  1. App "Fluidbox Cloud M1" — regular_web, oidc_conformant, RS256,
+     callback https://fluidbox-cloud-dashboard.vercel.app/v1/auth/callback
+     client_id DpXP7DNI4QAiC0yLi8oWrWtiJI09DFcV
+     (the client secret went to core's custody and appears in no file here)
+  2. Drill user hrishidkakkad@gmail.com, PATCHed to email_verified=true —
+     `auth0 users create` has no such flag and core's default floor requires it.
+  3. Org fluidzero MIGRATED off Dex to issuer https://hrishi-test.jp.auth0.com/
+     (trailing slash — that is Auth0's `iss`), token_endpoint_auth
+     client_secret_post, accepted on the first attempt. Migrate auto-activates:
+     gen 3 active, gen 2 (Dex) and gen 1 (WorkOS) retired.
+  4. Dex-era owner owner@fluidzero.test DEACTIVATED — its issuer is retired, so
+     it could never authenticate again; leaving it active left a stale
+     privileged principal.
+
+CONFORMANCE — Auth0 needs ZERO claim overrides, unlike Entra
+  code_challenge_methods_supported : ['S256','plain']   (Entra advertises none)
+  token_endpoint_auth_methods      : client_secret_basic|post|private_key_jwt
+  id_token_signing_alg             : RS256 present
+  claims_supported                 : email AND email_verified NATIVE
+The last line is the whole reason this was the easy path: core requires a true
+`email_verified` for the require_email_verified floor and UNCONDITIONALLY for
+bootstrap-owner promotion. Auth0 emits it; Entra needs xms_edov mapped in.
+
+AUTHORIZE REQUEST core built (via the Vercel origin)
+  302 -> https://hrishi-test.jp.auth0.com/authorize
+  response_type=code  scope="openid profile email"  code_challenge_method=S256
+  nonce present  state present  code_challenge present
+  redirect_uri=https://fluidbox-cloud-dashboard.vercel.app/v1/auth/callback
+  Set-Cookie: __Host-fbx_login_* ; HttpOnly; SameSite=Lax; Secure; Path=/
+             — on the VERCEL origin, which is the requirement.
+
+FULL BROWSER LOGIN (Playwright, real end-to-end)
+  Vercel login start -> Auth0 Universal Login ("Log in | Fluidbox Cloud M1")
+  -> credentials -> back to the Vercel origin.
+  GET /v1/auth/me  200
+    {"auth_kind":"browser","org":{"slug":"fluidzero"},"roles":["member"],
+     "user":{"email":"hrishidkakkad@gmail.com","name":"Hrishikesh Kakkad"}}
+  JIT-provisioned at default_role=member, as designed.
+  After promote_owner: roles ["member","owner"].
+  GET /app renders ("Overview · fluidbox").
+
+DURABILITY PROOF — the point of the exercise
+  `docker rm -f dex`  (container removed; :8787 refuses connections)
+  login start STILL 302s to https://hrishi-test.jp.auth0.com/authorize
+  The org's identity no longer depends on the operator's laptop or ngrok.
+
+NOTE — core correctly refused a bootstrap arm
+  The first migrate attempt also passed bootstrap_owner_email and got:
+    409 "an active owner already exists; deactivate it before arming a
+         bootstrap owner"
+  That is the right guard. Promotion is therefore a separate admin act
+  (promote_owner in lib.sh), which also works for issuers that never emit a
+  true email_verified.
+
+IDEMPOTENCE
+  A second full run of auth0-idp-setup.sh reuses the app and detects that the
+  active config already points at this issuer + client, then exits as a NO-OP.
+  Verified: generation stayed at 3. Without that guard a re-run would MIGRATE,
+  and a generation bump is a real event that invalidates sessions.

@@ -1,0 +1,100 @@
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "deployer_role_arn" {
+  type    = string
+  default = "arn:aws:iam::471112572248:role/fluidbox-cloud/fluidbox-cloud-deployer"
+}
+
+variable "chart_version" {
+  description = "The released fluidbox chart (OCI, ghcr) — UNCHANGED by M1. Images default to the chart appVersion (multi-arch on GHCR). 0.5.0 is the first release carrying the network-grants machinery (#121) AND the Cilium enforcer (#122); 0.4.0 predates both, so the netgrant templates and FLUIDBOX_NETWORK_ENFORCER do not exist below it."
+  type        = string
+  default     = "0.5.1"
+}
+
+variable "network_enforcer" {
+  description = "FLUIDBOX_NETWORK_ENFORCER — 'none' (offline-only; any wider grant refused at create time) or 'cilium'. Requires var.cni = 'cilium' on the platform stack: the enforcer probes cilium.io/v2 with the server's own RBAC and a boot with an explicit 'cilium' on a cluster that does not serve it is a REFUSAL, not a downgrade."
+  type        = string
+  default     = "none"
+  validation {
+    condition     = contains(["none", "cilium"], var.network_enforcer)
+    error_message = "network_enforcer must be 'none' or 'cilium'."
+  }
+}
+
+variable "public_url" {
+  description = <<-EOT
+    FLUIDBOX_PUBLIC_URL — the browser/AS-facing origin. STAGED on purpose:
+      M1.1 (first apply): "" — no browser flows yet; the replay acceptance
+             drives the admin API through CloudFront with a bearer token.
+      after the edge stack: "https://<cloudfront-domain>" if CLI/PAT OAuth
+             surfaces are wanted on the API host.
+      M1.2 (Vercel dashboard live): "https://<vercel-origin>" — the login
+             callback + __Host-fbx_web cookie land on the Vercel origin via
+             the sso rewrites. NEVER a host.docker.internal-ish internal URL.
+    Changing it is a helm values change (terraform apply), not a chart change.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "require_sso" {
+  description = <<-EOT
+    STAGED (see docs/hosted/cloud-onboarding-checklist.md): false for the M1.1
+    platform gate — single-user mode lets the admin token drive the no-cost
+    replay acceptance end to end. Flip to true in the M1.2 onboarding apply:
+    multi-user identity on, admin token confined to /v1/admin/* (exactly the
+    operator onboarding surface), browsers authenticate per-org OIDC.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "litellm_image" {
+  description = "DB-backed LiteLLM image (the -database variant carries the prisma client that /key/* virtual keys need). Pin a digest for production parity with the compose files."
+  type        = string
+  default     = "ghcr.io/berriai/litellm-database:main-stable"
+}
+
+variable "llm_tenant_models" {
+  description = "FLUIDBOX_LLM_TENANT_MODELS (CSV allowlist on minted tenant keys). Anthropic stays haiku-only (the standing cost-discipline agreement); the three codex-catalog GPT models were added 2026-08-04 (owner-approved) with the $5/30d rolling tenant budget as the backstop. Changing this does NOT touch already-minted keys — rotate via POST /v1/admin/orgs/{slug}/llm-key/rotate."
+  type        = string
+  default     = "claude-haiku-4-5,gpt-5.4-mini,gpt-5.4,gpt-5.6-sol"
+}
+
+variable "llm_tenant_max_budget" {
+  description = "FLUIDBOX_LLM_TENANT_MAX_BUDGET (USD, rolling window below)."
+  type        = string
+  default     = "5"
+}
+
+variable "llm_tenant_budget_duration" {
+  description = "FLUIDBOX_LLM_TENANT_BUDGET_DURATION — rolling, NOT calendar-month (documented quota gap)."
+  type        = string
+  default     = "30d"
+}
+
+variable "default_model" {
+  type    = string
+  default = "claude-haiku-4-5"
+}
+
+variable "helm_timeout_seconds" {
+  description = "helm wait budget: Neon boot migrations + image pull on a cold node."
+  type        = number
+  default     = 900
+}
+
+variable "litellm_memory_limit" {
+  description = "LiteLLM container memory limit. 4Gi, not the bundled image's 2Gi: the DB-backed variant runs prisma at startup and was OOMKilled at 2Gi on a node that was only 22% committed (2026-08-03, live)."
+  type        = string
+  default     = "4Gi"
+}
+
+variable "litellm_memory_request" {
+  description = "LiteLLM memory request (scheduling floor; the limit above is what prisma actually needs at boot)."
+  type        = string
+  default     = "1Gi"
+}

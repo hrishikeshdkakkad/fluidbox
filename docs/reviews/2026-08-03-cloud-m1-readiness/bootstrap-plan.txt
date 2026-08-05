@@ -1,0 +1,57 @@
+# bootstrap terraform plan (READ-ONLY, no apply) — 2026-08-03T17:40:12Z
+# aws provider 6.57.1, account 471112572248, us-east-1
+
+Plan: 28 to add, 0 to change, 0 to destroy.
+
+## resources to create
+  # aws_budgets_budget.account_breaker will be created
+  # aws_budgets_budget.fluidbox will be created
+  # aws_ce_cost_allocation_tag.project[0] will be created
+  # aws_cloudtrail.fluidbox will be created
+  # aws_cloudwatch_event_rule.root_activity will be created
+  # aws_cloudwatch_event_target.root_activity_sns will be created
+  # aws_iam_policy.deployer_iam will be created
+  # aws_iam_policy.deployer_infra will be created
+  # aws_iam_role.deployer will be created
+  # aws_iam_role_policy_attachment.deployer_iam will be created
+  # aws_iam_role_policy_attachment.deployer_infra will be created
+  # aws_iam_user.operator will be created
+  # aws_iam_user_policy.operator will be created
+  # aws_s3_bucket.tfstate will be created
+  # aws_s3_bucket.trail will be created
+  # aws_s3_bucket_lifecycle_configuration.tfstate will be created
+  # aws_s3_bucket_lifecycle_configuration.trail will be created
+  # aws_s3_bucket_ownership_controls.trail will be created
+  # aws_s3_bucket_policy.tfstate_tls_only will be created
+  # aws_s3_bucket_policy.trail will be created
+  # aws_s3_bucket_public_access_block.tfstate will be created
+  # aws_s3_bucket_public_access_block.trail will be created
+  # aws_s3_bucket_server_side_encryption_configuration.tfstate will be created
+  # aws_s3_bucket_server_side_encryption_configuration.trail will be created
+  # aws_s3_bucket_versioning.tfstate will be created
+  # aws_sns_topic.alerts will be created
+  # aws_sns_topic_policy.alerts will be created
+  # aws_sns_topic_subscription.alerts_email will be created
+
+## budget cost_filter as planned
+      + cost_filter (known after apply)
+
+      + cost_types (known after apply)
+
+      + notification {
+--
+      + cost_filter {
+          + name   = "TagKeyValue"
+          + values = [
+              + "user:project$fluidbox",
+            ]
+
+## cost allocation tag as planned
+    }
+
+  # aws_ce_cost_allocation_tag.project[0] will be created
+  + resource "aws_ce_cost_allocation_tag" "project" {
+      + id      = (known after apply)
+      + status  = "Active"
+      + tag_key = "project"
+      + type    = (known after apply)

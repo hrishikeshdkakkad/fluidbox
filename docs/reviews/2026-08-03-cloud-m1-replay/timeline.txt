@@ -1,0 +1,20 @@
+[  2] created -> provisioning
+[  3] provisioning -> initializing
+[  4] workspace.initialized: {"base_commit": "99658b58ae21df3dd2bb6cb6f122acdd41d25b82", "files": 5}
+[  7] tool.requested: {"input_digest": "sha256:2447798c1f5cc192", "summary": "./run_tests.sh", "tool": "Bash", "tool_call_id": "rp_001"}
+[  8] tool.decision: {"original_verdict": null, "reason": null, "source": "policy", "tool": "Bash", "tool_call_id": "rp_001", "verdict": "allow"}
+[ 11] tool.requested: {"input_digest": "sha256:ef68c93cc5a917e0", "summary": "Edit: /workspace/app.js", "tool": "Edit", "tool_call_id": "rp_002"}
+[ 12] tool.decision: {"original_verdict": null, "reason": null, "source": "policy", "tool": "Edit", "tool_call_id": "rp_002", "verdict": "allow"}
+[ 14] initializing -> running
+[ 16] tool.requested: {"input_digest": "sha256:2447798c1f5cc192", "summary": "./run_tests.sh", "tool": "Bash", "tool_call_id": "rp_003"}
+[ 17] tool.decision: {"original_verdict": null, "reason": null, "source": "policy", "tool": "Bash", "tool_call_id": "rp_003", "verdict": "allow"}
+[ 20] tool.requested: {"input_digest": "sha256:5f4faddb4235fb5a", "summary": "curl -s https://status.demo.internal/health", "tool": "Bash", "tool_call_id": "rp_004"}
+[ 21] tool.decision: {"original_verdict": null, "reason": "shell command matches deny pattern \"\\\\bcurl\\\\b\"", "source": "policy", "tool": "Bash", "tool_call_id": "rp_004", "ver
+[ 23] tool.requested: {"input_digest": "sha256:f1f1973f29125e6d", "summary": "./deploy.sh", "tool": "Bash", "tool_call_id": "rp_005"}
+[ 24] >>> operator decision submitted: approved_once
+[ 25] approval.decided: {"approval_id": "019fc992-5115-7c13-b7f6-dfe5838a8e04", "decided_by": "operator", "decision": "approved_once", "tool_call_id": "rp_005"}
+[ 26] tool.decision: {"original_verdict": null, "reason": "human:operator", "source": "human", "tool": "Bash", "tool_call_id": "rp_005", "verdict": "allow"}
+[ 29] running -> finalizing
+[ 31] finalizing -> completed
+[ 32] run.result: {"outcome": "completed", "summary": "Replay complete: 4 executed, 1 denied."}
+terminal status: completed

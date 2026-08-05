@@ -1,0 +1,14 @@
+# Copy to terraform.auto.tfvars (gitignored) and fill in. Only operator_cidrs
+# has no default — the EKS API endpoint allowlist is a decision, not a fallback.
+
+# Your workstation's public IP (curl -4 ifconfig.me), /32:
+operator_cidrs = ["203.0.113.10/32"]
+
+# kubernetes_version    = "1.35"   # standard support until 2027-03-26
+# sandbox_nodes_max     = 4
+
+# CNI. "vpc-cni" (default) is the original M1 recipe. "cilium" is the
+# substrate governed sandbox network grants REQUIRE — nothing above `offline`
+# can be enforced without it. See cilium.tf for the ENI-mode rationale and,
+# on a LIVE cluster, the mandatory node-recycle step after the apply.
+# cni = "cilium"

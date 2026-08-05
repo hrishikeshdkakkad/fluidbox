@@ -1,0 +1,87 @@
+{
+    "Budget": {
+        "BudgetName": "fluidbox-cloud-monthly",
+        "BudgetLimit": {
+            "Amount": "50.0",
+            "Unit": "USD"
+        },
+        "CostFilters": {
+            "TagKeyValue": [
+                "user:project$fluidbox"
+            ]
+        },
+        "CostTypes": {
+            "IncludeTax": true,
+            "IncludeSubscription": true,
+            "UseBlended": false,
+            "IncludeRefund": true,
+            "IncludeCredit": true,
+            "IncludeUpfront": true,
+            "IncludeRecurring": true,
+            "IncludeOtherSubscription": true,
+            "IncludeSupport": true,
+            "IncludeDiscount": true,
+            "UseAmortized": false
+        },
+        "TimeUnit": "MONTHLY",
+        "TimePeriod": {
+            "Start": "2026-07-31T19:00:00-05:00",
+            "End": "2087-06-14T19:00:00-05:00"
+        },
+        "CalculatedSpend": {
+            "ActualSpend": {
+                "Amount": "0.0",
+                "Unit": "USD"
+            }
+        },
+        "BudgetType": "COST",
+        "LastUpdatedTime": "2026-08-03T15:05:21.088000-05:00",
+        "HealthStatus": {
+            "Status": "HEALTHY",
+            "LastUpdatedTime": "2026-08-03T15:05:14.534000-05:00"
+        }
+    }
+}
+{
+    "Budget": {
+        "BudgetName": "fluidbox-account-breaker",
+        "BudgetLimit": {
+            "Amount": "600.0",
+            "Unit": "USD"
+        },
+        "CostTypes": {
+            "IncludeTax": true,
+            "IncludeSubscription": true,
+            "UseBlended": false,
+            "IncludeRefund": true,
+            "IncludeCredit": true,
+            "IncludeUpfront": true,
+            "IncludeRecurring": true,
+            "IncludeOtherSubscription": true,
+            "IncludeSupport": true,
+            "IncludeDiscount": true,
+            "UseAmortized": false
+        },
+        "TimeUnit": "MONTHLY",
+        "TimePeriod": {
+            "Start": "2026-07-31T19:00:00-05:00",
+            "End": "2087-06-14T19:00:00-05:00"
+        },
+        "CalculatedSpend": {
+            "ActualSpend": {
+                "Amount": "14.875",
+                "Unit": "USD"
+            },
+            "ForecastedSpend": {
+                "Amount": "178.835",
+                "Unit": "USD"
+            }
+        },
+        "BudgetType": "COST",
+        "LastUpdatedTime": "2026-08-03T15:05:21.934000-05:00",
+        "HealthStatus": {
+            "Status": "HEALTHY",
+            "LastUpdatedTime": "2026-08-03T15:05:14.516000-05:00"
+        }
+    }
+}
