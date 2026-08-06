@@ -5,12 +5,20 @@
 // target is REACHABLE is resolved server-side.
 
 import { FqdnPattern, L4Protocol, TargetRule } from "../lib/api";
-import { describeTarget } from "../lib/network";
+import {
+  DEFAULT_PORT,
+  MAX_PORT,
+  MIN_PORT,
+  describeTarget,
+  portsLabel,
+  singleRange,
+  withPortEdge,
+} from "../lib/network";
 
 export const EMPTY_TARGET: TargetRule = {
   kind: "dns",
   pattern: { kind: "wildcard", suffix: "" },
-  ports: [{ from: 443, to: 443 }],
+  ports: [{ from: DEFAULT_PORT, to: DEFAULT_PORT }],
   protocol: "tcp",
 };
 
@@ -41,10 +49,11 @@ export function TargetRuleEditor({
       )}
 
       {value.map((t, i) => {
-        // This editor authors a single port range; a rule that arrived via the
-        // API with several ranges is shown read-only so an edit cannot silently
-        // discard the extra ranges (it would rewrite `ports` to just ports[0]).
-        const multiRange = t.ports.length > 1;
+        // This editor authors a single port range. A rule it cannot represent
+        // — SEVERAL ranges, or NONE at all (which means "any port") — is shown
+        // read-only and blank, because rendering either as a concrete pair
+        // both misstates the rule and narrows it on the first keystroke.
+        const range = singleRange(t.ports);
         return (
         <div className="agent-creator-grid" key={i}>
           <label className="field">
@@ -103,12 +112,14 @@ export function TargetRuleEditor({
             <input
               className="inp"
               type="number"
-              disabled={disabled || multiRange}
-              value={t.ports[0]?.from ?? 443}
-              onChange={(e) => {
-                const from = Number(e.target.value);
-                patch(i, { ...t, ports: [{ from, to: Math.max(from, t.ports[0]?.to ?? from) }] });
-              }}
+              min={MIN_PORT}
+              max={MAX_PORT}
+              disabled={disabled || range === null}
+              value={range?.from ?? ""}
+              placeholder={portsLabel(t.ports)}
+              onChange={(e) =>
+                patch(i, { ...t, ports: withPortEdge(t.ports, "from", e.target.value) })
+              }
             />
           </label>
 
@@ -117,16 +128,22 @@ export function TargetRuleEditor({
             <input
               className="inp"
               type="number"
-              disabled={disabled || multiRange}
-              value={t.ports[0]?.to ?? 443}
+              min={MIN_PORT}
+              max={MAX_PORT}
+              disabled={disabled || range === null}
+              value={range?.to ?? ""}
+              placeholder={portsLabel(t.ports)}
               onChange={(e) =>
-                patch(i, { ...t, ports: [{ from: t.ports[0]?.from ?? 443, to: Number(e.target.value) }] })
+                patch(i, { ...t, ports: withPortEdge(t.ports, "to", e.target.value) })
               }
             />
           </label>
 
-          {multiRange && (
-            <p className="helper">Multiple port ranges — shown read-only; edit via the API.</p>
+          {range === null && (
+            <p className="helper">
+              {t.ports.length === 0 ? "Any port" : "Multiple port ranges"} — shown read-only; edit
+              via the API.
+            </p>
           )}
 
           <button type="button" className="btn ghost" disabled={disabled} onClick={() => remove(i)}>

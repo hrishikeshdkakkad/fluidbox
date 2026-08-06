@@ -22,7 +22,14 @@ import {
   TargetRule,
 } from "../lib/api";
 import { coerceCap, coerceTtlSecs } from "../lib/policy-caps";
-import { MODE_HINT, MODE_LABEL, MODE_ORDER, networkOf } from "../lib/network";
+import {
+  MODE_HINT,
+  MODE_LABEL,
+  MODE_ORDER,
+  OFFLINE_NETWORK,
+  isCeilingOptionAllowed,
+  networkOf,
+} from "../lib/network";
 import { useHarnesses } from "../lib/harnesses";
 import { VERB } from "./PermissionMatrix";
 import { TargetRuleEditor } from "./TargetRuleEditor";
@@ -235,8 +242,17 @@ export function PolicyLimits({
 
       {(() => {
         const net = networkOf(content);
-        const setNet = (patch: Partial<NetworkPolicy>) =>
-          set({ network: { ...net, ...patch } });
+        const setNet = (patch: Partial<NetworkPolicy>) => {
+          const next = { ...net, ...patch };
+          // The server OMITS this section when it is at its default, so writing
+          // the synthesized default back would make the draft differ from the
+          // wire form and light up "unsaved changes" for an edit that reverted
+          // to exactly what is stored. `undefined` drops out of JSON.stringify,
+          // which is what the governance page compares.
+          const isDefault = JSON.stringify(next) === JSON.stringify(OFFLINE_NETWORK);
+          set({ network: isDefault ? undefined : next });
+        };
+        const supportsGrants = network === null || network.supports_egress_grants;
         return (
           <>
             <div className="sectitle">Where a sandbox may reach</div>
@@ -249,7 +265,6 @@ export function PolicyLimits({
               <select
                 className="inp"
                 value={net.max_mode}
-                disabled={network !== null && !network.supports_egress_grants}
                 onChange={(e) => {
                   const max_mode = e.target.value as NetworkGrantMode;
                   // Change ONLY the ceiling — the catalog stays. Core checks an
@@ -262,8 +277,12 @@ export function PolicyLimits({
                   setNet({ max_mode });
                 }}
               >
+                {/* Without an enforcer a ceiling may only be LOWERED. Disabling
+                    the whole control also blocked bringing a too-permissive
+                    stored ceiling back down — locking an admin out of the one
+                    remediation this guard exists to make possible. */}
                 {MODE_ORDER.map((m) => (
-                  <option key={m} value={m}>
+                  <option key={m} value={m} disabled={!isCeilingOptionAllowed(m, net.max_mode, supportsGrants)}>
                     {MODE_LABEL[m]}
                   </option>
                 ))}
@@ -272,8 +291,8 @@ export function PolicyLimits({
             {network !== null && !network.supports_egress_grants && (
               <p className="helper warn">
                 This deployment has no network enforcer ({network.enforcer}), so any ceiling above
-                Offline would be refused when a run is created. Install Cilium and set
-                FLUIDBOX_NETWORK_ENFORCER to enable it.
+                Offline would be refused when a run is created — you can still LOWER this one.
+                Install Cilium and set FLUIDBOX_NETWORK_ENFORCER to enable it.
               </p>
             )}
             <p className="helper">{MODE_HINT[net.max_mode]}</p>
@@ -314,18 +333,17 @@ export function PolicyLimits({
                   timeline for approval before it gets any egress.
                 </p>
 
-                <label className="field">
-                  <span className="lab">Max grant lifetime (seconds)</span>
-                  <input
-                    className="inp"
-                    type="number"
-                    value={net.max_grant_secs ?? ""}
-                    placeholder="default"
-                    onChange={(e) =>
-                      setNet({ max_grant_secs: e.target.value === "" ? null : Number(e.target.value) })
-                    }
-                  />
-                </label>
+                {/* A CapField for the reason every other numeric knob here is
+                    one: a raw type=number reports "" for `-`, `1e` and `1.`
+                    alike, and `Number()` turns a half-typed entry into a value
+                    the u64 parser rejects with an opaque 400. */}
+                <CapField
+                  label="Max grant lifetime (seconds)"
+                  hint={net.max_grant_secs == null ? "default" : duration(net.max_grant_secs)}
+                  value={net.max_grant_secs}
+                  integer
+                  onChange={(max_grant_secs) => setNet({ max_grant_secs })}
+                />
               </>
             )}
           </>
