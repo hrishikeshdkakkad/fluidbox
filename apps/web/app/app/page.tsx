@@ -11,6 +11,7 @@ import {
   Session,
   workspaceLabel,
 } from "../lib/api";
+import { ApprovalActions } from "../components/ApprovalActions";
 import { AutomationPanel } from "../components/AutomationPanel";
 import { ResourceOverview } from "../components/ResourceOverview";
 import { AddServerWizard } from "./capabilities/AddServerWizard";
@@ -177,23 +178,10 @@ export default function Runs() {
                     </Link>
                   </div>
                 </div>
-                <div className="acts">
-                  {/* A parked network grant is inherently per-run, so "Whole
-                      session" is meaningless for it — the same collapse the
-                      session timeline makes. Presentation only: the decision
-                      value stays `approved_once`. */}
-                  <button className="btn human sm" type="button" onClick={() => decide(approval.id, "approved_once")}>
-                    {approval.tool === "network.grant" ? "Authorize" : "Approve once"}
-                  </button>
-                  {approval.tool !== "network.grant" && (
-                    <button className="btn sm" type="button" onClick={() => decide(approval.id, "approved_session")}>
-                      Whole session
-                    </button>
-                  )}
-                  <button className="btn sm ghost danger" type="button" onClick={() => decide(approval.id, "denied")}>
-                    Deny
-                  </button>
-                </div>
+                <ApprovalActions
+                  tool={approval.tool}
+                  onDecide={(decision) => decide(approval.id, decision)}
+                />
               </div>
             ))}
           </div>

@@ -11,15 +11,20 @@ import {
   ConnectionRequirement,
   connectionMatchesConnector,
   isToolConnection,
-  NetworkGrantMode,
   NetworkRequest,
   ownerBadge,
   PolicySummary,
   Revision,
   TriggerSubscription,
 } from "../lib/api";
-import { MODE_LABEL, MODE_ORDER, OFFLINE_REQUEST } from "../lib/network";
-import { TargetRuleEditor } from "./TargetRuleEditor";
+import {
+  MODE_LABEL,
+  OFFLINE_REQUEST,
+  agentSelectionChanged,
+  requestForWire,
+  runNetworkOverride,
+} from "../lib/network";
+import { NetworkRequestEditor } from "./NetworkRequestEditor";
 import { AddServerWizard } from "../app/capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
 import { CopyBlock, TemplateChips } from "./AutomationContract";
@@ -167,6 +172,10 @@ export function RunComposer({
   // shreds the revision into the fields above (see the revision effect).
   const [offlineOnly, setOfflineOnly] = useState(false);
   const [declaredNetwork, setDeclaredNetwork] = useState<NetworkRequest | null>(null);
+  /** Which agent `declaredNetwork` (and the narrowing chosen against it)
+   *  belongs to. A ref, not state: it decides what the load effect below may
+   *  reset without being a reason to re-run it. */
+  const loadedDeclarationFor = useRef<string | null>(null);
   // The NEW agent's declaration. Distinct from `declaredNetwork` above, which
   // is what an EXISTING agent already declares: this one is authored here,
   // because agent creation had no way to declare egress and a created agent
@@ -355,6 +364,11 @@ export function RunComposer({
     setPubCheck(saved.pubCheck);
     setCapabilityKeepList(saved.capabilityKeepList);
     setOfflineOnly(saved.offlineOnly ?? false);
+    // The restored narrowing belongs to the restored agent. Recording that here
+    // is what lets the load effect fetch this agent's declaration WITHOUT
+    // reading the restore as a change of selection — which is precisely how a
+    // reload used to throw the operator's "offline only" choice away.
+    loadedDeclarationFor.current = saved.selectedAgentName || null;
     setAgentNetwork(saved.agentNetwork ?? OFFLINE_REQUEST);
   }, []);
   const clearDraft = useSessionDraft({
@@ -406,8 +420,16 @@ export function RunComposer({
     // Reset before the load: a pending/failed load must never show the previous
     // agent's declaration, and a per-run narrowing must never carry to a
     // different agent. The fetch below reinstates the real declaration.
-    setDeclaredNetwork(null);
-    setOfflineOnly(false);
+    //
+    // Only when the selection ACTUALLY MOVED, though. This effect also re-runs
+    // when the agent list arrives and when a draft is restored, and resetting
+    // then silently discarded the operator's "offline only" choice — the run
+    // launched with the agent's full declared egress and nothing said so.
+    if (agentSelectionChanged(loadedDeclarationFor.current, selectedAgentName)) {
+      setDeclaredNetwork(null);
+      setOfflineOnly(false);
+    }
+    loadedDeclarationFor.current = selectedAgentName;
     let active = true;
     const start = window.setTimeout(() => {
       setRevisionLoading(true);
@@ -696,7 +718,7 @@ export function RunComposer({
           // WYSIWYG, like the fields above: an omitted `network` means offline
           // server-side, so sending it explicitly is what makes the control on
           // screen the thing that actually takes effect.
-          network: agentNetwork,
+          network: requestForWire(agentNetwork),
         });
         createdAgent = response.agent;
         runAgentName = response.agent.name;
@@ -731,12 +753,13 @@ export function RunComposer({
         const explicit = Object.fromEntries(
           Object.entries(bindings).filter(([, connId]) => connId)
         );
+        // Narrow-only: the sole network override this UI can send is offline.
+        const narrowing = runNetworkOverride(offlineOnly);
         const body: Record<string, unknown> = {
           agent: runAgentName,
           task: task.trim(),
           autonomous,
-          // Narrow-only: the sole network override this UI can send is offline.
-          ...(offlineOnly ? { network: { mode: "offline", targets: [], duration_secs: null } } : {}),
+          ...(narrowing ? { network: narrowing } : {}),
         };
         if (Object.keys(explicit).length > 0) body.bindings = explicit;
         await apiPost("/sessions", body);
@@ -1588,58 +1611,32 @@ export function RunComposer({
           </ComposerSection>
         )}
 
-        {agentOnly && agentChoice === "new" && (
+        {/* ONE network section, because a given run has only one question to
+            answer. Creating an agent (either path) DECLARES; running an
+            existing one may only NARROW what that agent already declared.
+            Gating the declaration editor on `agentOnly` meant the inline
+            new-agent path created the agent offline and then told the operator
+            to "add a declaration on the agent" — which that flow cannot do. */}
+        {(agentChoice === "new" || (!agentOnly && mode === "once")) && (
           <ComposerSection
-            index={5}
+            index={agentOnly ? 3 : 5}
             title="Network access"
-            hint="Where sandboxes running this agent may reach."
+            hint={
+              agentChoice === "new"
+                ? "Where sandboxes running this agent may reach."
+                : "Where this run may reach."
+            }
           >
-            <p className="helper" style={{ marginBottom: 6 }}>
-              This is the agent&rsquo;s <strong>declaration</strong>. The governing policy caps it,
-              and a single run may narrow it further — never widen it. Left at Offline, the agent
-              has no egress at all.
-            </p>
-            <label className="field">
-              <span className="lab">Mode</span>
-              <select
-                className="inp"
-                value={agentNetwork.mode}
-                onChange={(e) => {
-                  const nextMode = e.target.value as NetworkGrantMode;
-                  // A public declaration must carry NO targets — core refuses
-                  // that pairing as a narrowing the datapath would not apply.
-                  setAgentNetwork({
-                    ...agentNetwork,
-                    mode: nextMode,
-                    targets: nextMode === "public" ? [] : agentNetwork.targets,
-                  });
-                }}
-              >
-                {MODE_ORDER.map((m) => (
-                  <option key={m} value={m}>
-                    {MODE_LABEL[m]}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {agentNetwork.mode === "approved" && (
-              <TargetRuleEditor
-                value={agentNetwork.targets}
-                onChange={(targets) => setAgentNetwork({ ...agentNetwork, targets })}
-              />
-            )}
-            {agentNetwork.mode === "public" && (
-              <p className="helper">
-                A public declaration carries no targets — it reaches everything the
-                deployment&rsquo;s deny wall permits.
-              </p>
-            )}
-          </ComposerSection>
-        )}
-
-        {!agentOnly && mode === "once" && (
-          <ComposerSection index={5} title="Network access" hint="Where this run may reach.">
-            {!declaredNetwork || declaredNetwork.mode === "offline" ? (
+            {agentChoice === "new" ? (
+              <>
+                <p className="helper" style={{ marginBottom: 6 }}>
+                  This is the agent&rsquo;s <strong>declaration</strong>. The governing policy caps
+                  it, and a single run may narrow it further — never widen it. Left at Offline, the
+                  agent has no egress at all.
+                </p>
+                <NetworkRequestEditor value={agentNetwork} onChange={setAgentNetwork} />
+              </>
+            ) : !declaredNetwork || declaredNetwork.mode === "offline" ? (
               <p className="helper">
                 This agent declares no network access, so the run is offline. Add a declaration on
                 the agent to change that.
