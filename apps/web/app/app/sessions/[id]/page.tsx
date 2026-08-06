@@ -15,6 +15,7 @@ import {
   EventRow,
   workspaceLabel,
 } from "../../../lib/api";
+import { ApprovalActions } from "../../../components/ApprovalActions";
 import { Pill, AutoPill, DiffView, LoadingRows, short } from "../../../components/bits";
 import { useSmartPolling } from "../../../lib/useSmartPolling";
 
@@ -241,55 +242,11 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
               </p>
             )}
           </div>
-          <div className="acts">
-            {a.tool === "network.grant" ? (
-              <>
-                <button
-                  className="btn human sm"
-                  type="button"
-                  disabled={actingOn === a.id}
-                  onClick={() => decide(a.id, "approved_once")}
-                >
-                  Authorize
-                </button>
-                <button
-                  className="btn sm ghost danger"
-                  type="button"
-                  disabled={actingOn === a.id}
-                  onClick={() => decide(a.id, "denied")}
-                >
-                  Deny
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  className="btn human sm"
-                  type="button"
-                  disabled={actingOn === a.id}
-                  onClick={() => decide(a.id, "approved_once")}
-                >
-                  Approve once
-                </button>
-                <button
-                  className="btn sm"
-                  type="button"
-                  disabled={actingOn === a.id}
-                  onClick={() => decide(a.id, "approved_session")}
-                >
-                  Whole session
-                </button>
-                <button
-                  className="btn sm ghost danger"
-                  type="button"
-                  disabled={actingOn === a.id}
-                  onClick={() => decide(a.id, "denied")}
-                >
-                  Deny
-                </button>
-              </>
-            )}
-          </div>
+          <ApprovalActions
+            tool={a.tool}
+            busy={actingOn === a.id}
+            onDecide={(decision) => decide(a.id, decision)}
+          />
         </div>
       ))}
 

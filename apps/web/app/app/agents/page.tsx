@@ -29,11 +29,11 @@ import {
   specToDraft,
   draftToInput,
 } from "../../components/WorkspacePicker";
-import { TargetRuleEditor } from "../../components/TargetRuleEditor";
+import { NetworkRequestEditor } from "../../components/NetworkRequestEditor";
 import {
   MODE_LABEL,
-  MODE_ORDER,
   networkOf,
+  requestForWire,
   requestOf,
   summarizeRequest,
 } from "../../lib/network";
@@ -372,7 +372,10 @@ function AddRevision({
     JSON.stringify(workspace) !== JSON.stringify(specToDraft(current?.default_workspace)) ||
     JSON.stringify(pins) !== JSON.stringify(current?.capability_bundles ?? []) ||
     JSON.stringify(requirements) !== JSON.stringify(current?.connection_requirements ?? []) ||
-    JSON.stringify(network) !==
+    // Compare what would actually be SENT: targets typed under `approved` are
+    // kept in state across a mode toggle, and a declaration that sends none is
+    // not an edit just because they are still held.
+    JSON.stringify(requestForWire(network)) !==
       JSON.stringify(current?.network ?? { mode: "offline", targets: [], duration_secs: null });
 
   const submit = async () => {
@@ -402,7 +405,11 @@ function AddRevision({
         // `current` revision (still loading / failed load) `network` is the
         // offline default, and sending it would OVERWRITE the agent's real
         // declaration — the server inherits only when the field is ABSENT.
-        ...(current ? { network } : {}),
+        // `requestForWire` decides what the mode is allowed to carry: core
+        // REFUSES public+targets, and ACCEPTS offline+targets — which would
+        // store authority the editor stopped showing the moment the mode left
+        // `approved`.
+        ...(current ? { network: requestForWire(network) } : {}),
       });
       onAdded();
     } catch (e) {
@@ -486,35 +493,7 @@ function AddRevision({
         <strong>{ceiling ? MODE_LABEL[ceiling] : "unknown"}</strong>
         {ceiling ? null : " — could not read the policy; a run will still enforce it."}
       </p>
-      <label className="field">
-        <span className="lab">Mode</span>
-        <select
-          className="inp"
-          value={network.mode}
-          onChange={(e) => {
-            const mode = e.target.value as NetworkGrantMode;
-            setNetwork({ ...network, mode, targets: mode === "public" ? [] : network.targets });
-          }}
-        >
-          {MODE_ORDER.map((m) => (
-            <option key={m} value={m}>
-              {MODE_LABEL[m]}
-            </option>
-          ))}
-        </select>
-      </label>
-      {network.mode === "approved" && (
-        <TargetRuleEditor
-          value={network.targets}
-          onChange={(targets) => setNetwork({ ...network, targets })}
-        />
-      )}
-      {network.mode === "public" && (
-        <p className="helper">
-          A public declaration carries no targets — core refuses that pairing, because listing
-          targets beside &ldquo;everything&rdquo; reads as a narrowing the datapath would not apply.
-        </p>
-      )}
+      <NetworkRequestEditor value={network} onChange={setNetwork} />
       {err && <div className="err">{err}</div>}
       <div className="spread" style={{ marginTop: 14 }}>
         <span className="helper">Inherits image · budgets.</span>

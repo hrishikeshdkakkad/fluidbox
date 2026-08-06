@@ -72,6 +72,98 @@ export function requestOf(network: NetworkRequest | null | undefined): NetworkRe
   return network ?? OFFLINE_REQUEST;
 }
 
+/** The port a fresh target starts on, and the range the wire can carry: a
+ *  `PortSpec` is a pair of `u16`s server-side and core refuses port 0
+ *  outright, so both ends of an edit have to land inside this. */
+export const DEFAULT_PORT = 443;
+export const MIN_PORT = 1;
+export const MAX_PORT = 65535;
+
+export type PortEdge = "from" | "to";
+
+/** The one range a two-box editor can represent. `null` for a rule naming NO
+ *  ports (which means "any port", not 443) and for one naming SEVERAL, because
+ *  showing either as a concrete pair misstates the rule and editing it would
+ *  silently rewrite `ports` to just the pair on screen. */
+export function singleRange(ports: PortSpec[]): PortSpec | null {
+  return ports.length === 1 ? ports[0] : null;
+}
+
+/** What a typed port MEANS, or `null` for "the field is mid-edit". Kept apart
+ *  from the edit below for the reason `policy-caps.ts` exists: `Number("")` is
+ *  `0`, and 0 is a port core refuses — so an empty field must never reach the
+ *  model as a value. Anything usable is clamped into the wire's range and
+ *  floored, never rounded. */
+function parsePort(raw: string): number | null {
+  const t = raw.trim();
+  if (t === "") return null;
+  const n = Number(t);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(Math.max(Math.floor(n), MIN_PORT), MAX_PORT);
+}
+
+/** Immutable single-range edit that cannot produce a range the server will
+ *  reject: raising `from` carries `to` up with it and lowering `to` carries
+ *  `from` down, so the pair can never invert, and an unusable entry leaves the
+ *  range untouched. Both edges go through this — having only one of them clamp
+ *  is how `443-80` reached the API and failed the whole save. */
+export function withPortEdge(ports: PortSpec[], edge: PortEdge, raw: string): PortSpec[] {
+  const value = parsePort(raw);
+  if (value === null) return ports;
+  const current = singleRange(ports) ?? { from: value, to: value };
+  return [
+    edge === "from"
+      ? { from: value, to: Math.max(value, current.to) }
+      : { from: Math.min(value, current.from), to: value },
+  ];
+}
+
+/** What actually leaves the browser. ONLY `approved` carries targets: core
+ *  refuses public+targets outright, and it ACCEPTS offline+targets — which is
+ *  worse, because the editor hides the target list for offline, so the stored
+ *  declaration would keep authority nobody saw or approved.
+ *
+ *  Deliberately applied at submit rather than on the mode select, so toggling
+ *  modes while deciding does not destroy the targets already typed. */
+export function requestForWire(n: NetworkRequest): NetworkRequest {
+  return { ...n, targets: n.mode === "approved" ? n.targets : [] };
+}
+
+/** The per-run override, whose whole authority is to NARROW: offline is the
+ *  only thing this UI can ask for, and `undefined` means "inherit whatever the
+ *  agent declared". */
+export function runNetworkOverride(offlineOnly: boolean): NetworkRequest | undefined {
+  return offlineOnly ? OFFLINE_REQUEST : undefined;
+}
+
+/** Whether the composer must drop the declaration on screen AND the per-run
+ *  narrowing chosen against it.
+ *
+ *  TRUE only when the selection actually moved to a DIFFERENT agent. The
+ *  revision-load effect also re-runs when the agent list arrives or a draft is
+ *  restored; resetting on those re-runs silently discarded the operator's
+ *  "offline only" choice and launched the run with the agent's full declared
+ *  egress — a widening nothing on screen reported. A narrowing is meaningless
+ *  against a declaration it was never chosen against, which is why the agent
+ *  identity, not the effect firing, is what decides. */
+export function agentSelectionChanged(loadedFor: string | null, selected: string): boolean {
+  return loadedFor !== selected;
+}
+
+/** Whether a ceiling is selectable. A deployment whose provider cannot enforce
+ *  egress must not be able to RAISE the ceiling — but it must always be able
+ *  to LOWER one it already carries (set via the API, or left behind when an
+ *  enforcer was removed). Disabling the control outright locked an admin out
+ *  of remediating exactly the too-permissive policy it meant to guard. */
+export function isCeilingOptionAllowed(
+  option: NetworkGrantMode,
+  current: NetworkGrantMode,
+  supportsEgressGrants: boolean,
+): boolean {
+  if (supportsEgressGrants) return true;
+  return MODE_ORDER.indexOf(option) <= MODE_ORDER.indexOf(current);
+}
+
 /** One line for a chip or a header row. `approved` carries its target count
  *  because an approved declaration with NO targets grants nothing, and
  *  rendering it as a bare "Approved targets" would imply egress it lacks. */
