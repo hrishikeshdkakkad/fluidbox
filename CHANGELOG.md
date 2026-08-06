@@ -4,6 +4,29 @@ All notable, user-visible changes to fluidbox are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
+## [0.7.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.6.0...v0.7.0) (2026-08-06)
+
+
+### Added
+
+* **web:** make an agent's declared egress visible, and declarable at creation ([44bc3f7](https://github.com/hrishikeshdkakkad/fluidbox/commit/44bc3f799bb823f77dc8ed1d14db3b91903643aa))
+* **web:** make an agent's declared egress visible, and declarable at creation ([e417112](https://github.com/hrishikeshdkakkad/fluidbox/commit/e4171121e814a2d5273a0786760d232fa0523290))
+
+
+### Fixed
+
+* **cloud,web:** cold-start enforcement deadline + collapse the grant card on Overview ([1d6373e](https://github.com/hrishikeshdkakkad/fluidbox/commit/1d6373eef04811437d8a3d135edb6beb63470774))
+* **cloud,web:** cold-start enforcement deadline + E2E scenario matrix evidence ([2f25b2f](https://github.com/hrishikeshdkakkad/fluidbox/commit/2f25b2f9bf362b494adcfc23c5a8da4884961e6d))
+* **web:** close the network-grant UI review findings ([78adc96](https://github.com/hrishikeshdkakkad/fluidbox/commit/78adc96ba411f2796075358b6def9067a5f72be5))
+* **web:** close the network-grant UI review findings ([10a7166](https://github.com/hrishikeshdkakkad/fluidbox/commit/10a7166346b484b980850c0d6f61ceb73ef06ac2))
+
+
+### Documentation
+
+* **cloud:** cold-start regression test confirms the netpol deadline fix ([9218025](https://github.com/hrishikeshdkakkad/fluidbox/commit/9218025e0270d7e180a4ec8e4908c1d046e56e0e))
+* **cloud:** live acceptance — a granted run reaches the internet ([9fb474e](https://github.com/hrishikeshdkakkad/fluidbox/commit/9fb474e9246dadfc137daad7971bba58ff4335e1))
+* **cloud:** network-grant UI live acceptance evidence ([94bcc6d](https://github.com/hrishikeshdkakkad/fluidbox/commit/94bcc6dc56239192ef23907e36a754437d551add))
+
 ## [0.6.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.5.1...v0.6.0) (2026-08-05)
 
 
