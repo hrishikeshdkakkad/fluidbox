@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { PageEcho } from "../components/PageEcho";
 import Link from "next/link";
 
 const REPO = "https://github.com/hrishikeshdkakkad/fluidbox";
@@ -41,7 +42,7 @@ export default function SecurityPage() {
   return (
     <div className="st">
       <section className="site-container site-section tight">
-        <div className="site-kicker">security</div>
+        <PageEcho en="security" es="seguridad" jp="セキュリティ" sc="安全" />
         <h1 className="site-h2" style={{ maxWidth: 720 }}>
           Containment and accountability are the product.
         </h1>

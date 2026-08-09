@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { PageEcho } from "../components/PageEcho";
 import Link from "next/link";
 
 const REPO = "https://github.com/hrishikeshdkakkad/fluidbox";
@@ -14,7 +15,7 @@ export default function PricingPage() {
   return (
     <div className="st">
       <section className="site-container site-section tight">
-      <div className="site-kicker">pricing</div>
+      <PageEcho en="pricing" es="precios" jp="価格" sc="价格" />
       <h1 className="site-h2" style={{ maxWidth: 700 }}>
         The control plane is free. Someone operating it for you is what will
         cost money.
