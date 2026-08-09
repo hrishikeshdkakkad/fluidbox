@@ -100,39 +100,50 @@ export default function HomePage() {
       {/* ── Hero: the thesis, and the film that shows it ── */}
       <section className="st-hero">
         <div className="site-container hero">
+          {/* kernel.sh signature: the wordmark at architectural scale, its
+              lower half cropped by the container. Decorative. */}
+          <div className="hero-wordmark" aria-hidden>
+            <span>fluidbox</span>
+          </div>
           <div className="hero-kicker">
             <span className="signal" aria-hidden />
-            The open-source control plane for AI agents
+            the open-source control plane for ai agents
           </div>
           <h1 className="hero-title">
-            Agents do the work. You keep the{" "}
-            <span className="tt">veto</span>.
+            <span style={{ display: "block" }}>agents do the work.</span>
+            <span style={{ display: "block" }}>
+              you keep the <span className="tt">veto</span>.
+              <span className="hero-chips" aria-hidden>
+                <span className="hero-chip">mit</span>
+                <span className="hero-chip">self-hosted</span>
+              </span>
+            </span>
           </h1>
           <p className="hero-sub">
-            fluidbox runs your AI agents in disposable sandboxes, checks every
+            fluidbox runs your ai agents in disposable sandboxes, checks every
             action against your rules, and keeps a complete record of every
             run — so you can hand them real work without holding your breath.
           </p>
           <div className="hero-ctas">
             <Link className="btn primary" href="/docs/getting-started">
-              Get Started <span className="arr">→</span>
+              get started <span className="arr">→</span>
             </Link>
             <Link className="btn" href="/product">
-              See How It Works
+              see how it works
             </Link>
           </div>
           <div className="hero-meta">
             <span>
-              <strong>MIT</strong> open source
+              <strong>mit</strong> open source
             </span>
             <span>
               <strong>~5 min</strong> to first run
             </span>
             <span>
-              <strong>Your infra</strong> — self-hosted
+              <strong>your infra</strong> — self-hosted
             </span>
             <span>
-              <strong>Docker + K8s</strong> deploys
+              <strong>docker + k8s</strong> deploys
             </span>
           </div>
 

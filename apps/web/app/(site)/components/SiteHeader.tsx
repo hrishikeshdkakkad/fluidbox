@@ -37,18 +37,18 @@ export function SiteHeader() {
       <div className="site-announce">
         <div className="site-container site-announce-inner">
           <span>
-            New: v0.3 — Kubernetes-native sandboxes and the multi-user control
-            plane. <Link href="/changelog">Read the changelog ›</Link>
+            new: v0.3 — kubernetes-native sandboxes and the multi-user control
+            plane. <Link href="/changelog">read the changelog ›</Link>
           </span>
           <nav className="site-announce-links" aria-label="Utility">
             <a href={REPO} target="_blank" rel="noreferrer">
-              GitHub
+              github
             </a>
             <a href={`${REPO}/blob/main/ROADMAP.md`} target="_blank" rel="noreferrer">
-              Roadmap
+              roadmap
             </a>
             <a href={`${REPO}/discussions`} target="_blank" rel="noreferrer">
-              Talk to us
+              talk to us
             </a>
           </nav>
         </div>
