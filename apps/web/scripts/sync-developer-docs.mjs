@@ -162,8 +162,13 @@ const releases = [];
     const nl = part.indexOf("\n");
     const headline = part.slice(0, nl).trim();
     const body = part.slice(nl + 1).trim();
-    // "[0.3.0] — 2026-07-24" | "[Unreleased]"
-    const m = headline.match(/^\[([^\]]+)\](?:\s*[—-]\s*(.*))?$/);
+    // Two heading shapes coexist: hand-written "[0.3.0] — 2026-07-24" /
+    // "[Unreleased]", and release-please's linked "[0.6.0](compare-url)
+    // (2026-08-05)". Both must yield a bare version + date, never raw
+    // markdown in the version slot.
+    const linked = headline.match(/^\[([^\]]+)\]\([^)]*\)\s*\(([^)]*)\)\s*$/);
+    const plain = headline.match(/^\[([^\]]+)\](?:\s*[—-]\s*(.*))?$/);
+    const m = linked ?? plain;
     const version = m ? m[1] : headline;
     const date = m && m[2] ? m[2].trim() : null;
     releases.push({ version, date, md: body });

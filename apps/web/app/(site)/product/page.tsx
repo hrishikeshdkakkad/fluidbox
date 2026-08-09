@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { PageEcho } from "../components/PageEcho";
 import Link from "next/link";
 import { GateStrip } from "../components/GateStrip";
 
@@ -87,7 +88,7 @@ export default function ProductPage() {
   return (
     <div className="st">
       <section className="site-container site-section tight">
-        <div className="site-kicker">product</div>
+        <PageEcho en="product" es="producto" jp="製品" sc="产品" />
         <h1 className="site-h2" style={{ maxWidth: 720 }}>
           A control plane that answers, afterwards, exactly what an agent did —
           and why it was allowed to.
