@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { PageEcho } from "../components/PageEcho";
 import { RELEASES } from "../docs/generated/changelog";
 import { MarkdownView } from "../docs/MarkdownView";
 
@@ -15,7 +16,7 @@ export default function ChangelogPage() {
   return (
     <div className="st">
       <section className="site-container site-section tight">
-      <div className="site-kicker">changelog</div>
+      <PageEcho en="changelog" es="registro" jp="変更履歴" sc="更新日志" />
       <h1 className="site-h2">What shipped, when, and why.</h1>
       <p className="site-lead">
         Generated from the repository&apos;s{" "}
