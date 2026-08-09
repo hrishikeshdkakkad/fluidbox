@@ -4,6 +4,12 @@ All notable, user-visible changes to fluidbox are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
+## [Unreleased]
+
+### Changed
+
+- **The web surface — marketing site, docs, and dashboard — is rebranded to a kernel.sh-inspired design language.** Warm beige canvas with charcoal dark passages (the dashboard's dark theme becomes the charcoal variant, and light is now the default), Inter + IBM Plex Mono replacing Geist, ultra-light lowercase chrome type with positive letter-spacing, hairline borders instead of shadows, and a single chartreuse accent that floods interactive surfaces on hover. Presentation only: no API, route, or behavior changes, and code/user content keep their original case. `apps/web/app/kernel.css` replaces `geist.css` as the dashboard skin layer.
+
 ## [0.6.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.5.1...v0.6.0) (2026-08-05)
 
 
@@ -440,8 +446,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 * **threat-model:** two Phase F residuals narrowed, honestly ([#34](https://github.com/hrishikeshdkakkad/fluidbox/issues/34)) ([c1982d7](https://github.com/hrishikeshdkakkad/fluidbox/commit/c1982d7ef34f44448de806d25b55a8a499208c33))
 * update multi-user release README ([646ac3d](https://github.com/hrishikeshdkakkad/fluidbox/commit/646ac3d419411235503d7d25c53aefa1a1269e07))
 * **web:** run-composer pickers — unleak connections, one card vocabulary, working + new ([#42](https://github.com/hrishikeshdkakkad/fluidbox/issues/42)) ([a9ead8f](https://github.com/hrishikeshdkakkad/fluidbox/commit/a9ead8f187779d09e61853619b225220c5b7d812))
-
-## [Unreleased]
 
 ## [0.4.0-rc.1] — 2026-07-30 (release candidate, not published)
 
