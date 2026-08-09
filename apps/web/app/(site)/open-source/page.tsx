@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { PageEcho } from "../components/PageEcho";
 import Link from "next/link";
 
 const REPO = "https://github.com/hrishikeshdkakkad/fluidbox";
@@ -25,7 +26,7 @@ export default function OpenSourcePage() {
   return (
     <div className="st">
       <section className="site-container site-section tight">
-        <div className="site-kicker">open source</div>
+        <PageEcho en="open source" es="código abierto" jp="オープンソース" sc="开源" />
         <h1 className="site-h2" style={{ maxWidth: 720 }}>
           Governance infrastructure only earns trust when you can read it.
         </h1>

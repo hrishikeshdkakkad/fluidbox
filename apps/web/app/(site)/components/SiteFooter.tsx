@@ -87,11 +87,16 @@ export function SiteFooter() {
           ))}
         </div>
         <div className="site-footer-bottom">
-          <span>fluidbox — MIT licensed, built in the open.</span>
+          <span>fluidbox — mit licensed, built in the open.</span>
           <a href={REPO} target="_blank" rel="noreferrer">
             github.com/hrishikeshdkakkad/fluidbox
           </a>
         </div>
+      </div>
+      {/* kernel.sh signature: the wordmark at architectural scale, cropped
+          by the footer's lower edge. Decorative. */}
+      <div className="footer-wordmark" aria-hidden>
+        <span>fluidbox</span>
       </div>
     </footer>
   );

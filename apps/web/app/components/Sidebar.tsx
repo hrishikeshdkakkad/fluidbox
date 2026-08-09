@@ -183,7 +183,7 @@ export function Sidebar({
                 style={{
                   fontSize: 11.5,
                   color: "var(--ds-gray-800)",
-                  fontFamily: "var(--font-geist-mono), monospace",
+                  fontFamily: "var(--font-mono)",
                   maxWidth: 150,
                   overflow: "hidden",
                   textOverflow: "ellipsis",

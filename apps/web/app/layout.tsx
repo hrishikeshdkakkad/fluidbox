@@ -1,18 +1,35 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { IBM_Plex_Mono, Inter, Noto_Sans_JP, Noto_Sans_SC } from "next/font/google";
 import "./globals.css";
-import "./geist.css";
+import "./kernel.css";
 import { webMode } from "./lib/proxy-auth";
 import { THEME_INIT_SCRIPT } from "./lib/theme";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+// The kernel.sh type stack: Inter for everything, IBM Plex Mono for code and
+// labels, Noto JP/SC only for the decorative multilingual title echoes.
+const interSans = Inter({
+  variable: "--font-inter",
   subsets: ["latin"],
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const plexMono = IBM_Plex_Mono({
+  variable: "--font-plex-mono",
+  weight: ["300", "400", "500"],
   subsets: ["latin"],
+});
+
+const notoJp = Noto_Sans_JP({
+  variable: "--font-noto-jp",
+  weight: ["300"],
+  subsets: ["latin"],
+  preload: false,
+});
+
+const notoSc = Noto_Sans_SC({
+  variable: "--font-noto-sc",
+  weight: ["300"],
+  subsets: ["latin"],
+  preload: false,
 });
 
 /** Browser-facing base URL for canonical/OG metadata. Local default keeps
@@ -39,8 +56,8 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  colorScheme: "dark light",
-  themeColor: "#111318",
+  colorScheme: "light dark",
+  themeColor: "#f2f0e7",
 };
 
 // Static deployment configuration (see the proxy route): `sso` turns on the
@@ -58,8 +75,8 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable}`}
-      data-theme="dark"
+      className={`${interSans.variable} ${plexMono.variable} ${notoJp.variable} ${notoSc.variable}`}
+      data-theme="light"
       data-web-mode={WEB_MODE}
       suppressHydrationWarning
     >

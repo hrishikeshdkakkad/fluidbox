@@ -15,7 +15,7 @@ function currentTheme(): Theme {
 function syncBrowserChrome(theme: Theme) {
   document
     .querySelector<HTMLMetaElement>('meta[name="theme-color"]')
-    ?.setAttribute("content", theme === "dark" ? "#111318" : "#f4f2ed");
+    ?.setAttribute("content", theme === "dark" ? "#191a1c" : "#f2f0e7");
 }
 
 function applyTheme(theme: Theme, persist: boolean) {
