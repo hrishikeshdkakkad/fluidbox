@@ -11570,6 +11570,65 @@ mod tests {
     /// round-trips into typed `ConnectionRequirement`s (serde compatibility) and
     /// that `policy_mcp_tools` unions the converted requirement tools. Throwaway
     /// org; children-first cleanup BEFORE the asserts.
+    /// A tenant with NO policies is not merely empty: every run in it fails
+    /// closed at `create_run`, AFTER provisioning. `create_org` seeded nothing,
+    /// so every new org started in exactly that state. Throwaway org, and the
+    /// cleanup runs BEFORE the asserts so a failure cannot leak a tenant into a
+    /// database that already carries a thousand fixtures.
+    #[tokio::test]
+    async fn seed_tiers_for_tenant_gives_a_new_org_a_usable_policy_set() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let slug = format!("t-{}", Uuid::now_v7().simple());
+        let org = identity::create_org(&pool, &slug, None).await.unwrap();
+        let scope = TenantScope::assume(org.id);
+
+        crate::seed::seed_tiers_for_tenant(&pool, scope)
+            .await
+            .unwrap();
+        // Called twice on purpose: this runs on a path an operator can retry,
+        // so a second call must be a no-op rather than a second version.
+        crate::seed::seed_tiers_for_tenant(&pool, scope)
+            .await
+            .unwrap();
+
+        let mut found: Vec<(&str, bool, Option<i32>)> = Vec::new();
+        for name in ["default", "open", "standard", "governed"] {
+            match get_policy_by_name(&pool, scope, name).await.unwrap() {
+                Some(p) => {
+                    let v = latest_policy_version(&pool, scope, p.id)
+                        .await
+                        .unwrap()
+                        .map(|v| v.version);
+                    found.push((name, true, v));
+                }
+                None => found.push((name, false, None)),
+            }
+        }
+
+        // Children first — tenant FKs are NO ACTION, nothing cascades.
+        for stmt in [
+            "delete from policy_versions where tenant_id = $1",
+            "delete from policies where tenant_id = $1",
+            "delete from tenants where id = $1",
+        ] {
+            let _ = sqlx::query(stmt).bind(org.id).execute(&pool).await;
+        }
+
+        for (name, present, version) in found {
+            assert!(present, "new org is missing policy '{name}'");
+            assert_eq!(
+                version,
+                Some(1),
+                "policy '{name}' must have exactly version 1 — a missing version fails \
+                 every run closed, and a second version means seeding was not idempotent"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn convert_legacy_bundles_appends_requirements_and_repoints() {
         let Ok(url) = std::env::var("DATABASE_URL") else {

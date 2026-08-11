@@ -557,6 +557,26 @@ pub async fn create_org(
                     );
                 }
             }
+            // Seed `default` + the three tiers. Without this a new org holds NO
+            // policies, and every run in it fails closed at `create_run` — after
+            // provisioning, which is the expensive place to find out.
+            //
+            // Best-effort for the same reason the mint above is: the org already
+            // exists and is addressable, so failing the request here would leave
+            // an operator with an org they cannot see and cannot re-create (the
+            // slug is taken). Seeding is idempotent, so the repair is to run this
+            // path again rather than to unpick anything.
+            if let Err(e) =
+                fluidbox_db::seed::seed_tiers_for_tenant(&state.pool, TenantScope::assume(org.id))
+                    .await
+            {
+                tracing::warn!(
+                    "seeding policies for new org {} ({}) failed — runs in it fail closed at \
+                     create_run until it is re-seeded: {e}",
+                    slug,
+                    org.id
+                );
+            }
             Ok(Json(json!({ "org": org })))
         }
         identity::CreateOrgOutcome::SlugConflict => {
