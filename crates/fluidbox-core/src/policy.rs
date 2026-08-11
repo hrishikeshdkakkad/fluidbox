@@ -1591,6 +1591,42 @@ tools:
         assert!(matches!(v(&governed, odd()), Verdict::Deny { .. }));
     }
 
+    /// Migration 0029 embeds the tier documents as jsonb, and NOTHING validates
+    /// hand-written jsonb against the serde shape. A mismatch does not fail at
+    /// migration time — it fails at `create_run`, after the run is already
+    /// provisioned. So the two are pinned together here: edit one without the
+    /// other and this test fails instead of a run failing closed.
+    #[test]
+    fn migration_0029_jsonb_matches_the_yaml() {
+        let sql = include_str!("../../../migrations/0029_tiered_policies.sql");
+        for name in ["open", "standard", "governed"] {
+            let expected = serde_json::to_value(tier(name)).unwrap();
+
+            // The generator emits exactly one line per tier:
+            //     ('<name>', '<json>'::jsonb),
+            let prefix = format!("('{name}', '");
+            let line = sql
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("0029 has no single-line VALUES row for {name}"));
+            let body = &line[prefix.len()..];
+            let end = body
+                .find("'::jsonb")
+                .unwrap_or_else(|| panic!("{name}'s literal must be cast ::jsonb on one line"));
+            // SQL doubles an embedded quote; `standard` really does contain one
+            // ("this run's disposable workspace"), so this is exercised.
+            let literal = body[..end].replace("''", "'");
+
+            let actual: serde_json::Value = serde_json::from_str(&literal)
+                .unwrap_or_else(|e| panic!("{name} jsonb in 0029 is not valid JSON: {e}"));
+            assert_eq!(
+                actual, expected,
+                "0029's {name} jsonb has drifted from policies/{name}.yaml"
+            );
+        }
+    }
+
     /// The seed states an opinion about EVERY registered tool, and never
     /// `allow`s one that starts sub-execution.
     ///
