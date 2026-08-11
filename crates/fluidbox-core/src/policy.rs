@@ -1480,6 +1480,9 @@ tools:
 
     fn tier(name: &str) -> Policy {
         let yaml = match name {
+            // `default` is here because 0030 backfills it the same way 0029
+            // backfills the tiers, so the drift guard has to cover it too.
+            "default" => include_str!("../../../policies/default.yaml"),
             "open" => include_str!("../../../policies/open.yaml"),
             "standard" => include_str!("../../../policies/standard.yaml"),
             "governed" => include_str!("../../../policies/governed.yaml"),
@@ -1630,7 +1633,7 @@ tools:
     #[test]
     #[ignore = "generator: emits the literals for migrations/0029_tiered_policies.sql"]
     fn emit_tier_json() {
-        for name in ["open", "standard", "governed"] {
+        for name in ["default", "open", "standard", "governed"] {
             println!("{name}\t{}", serde_json::to_string(&tier(name)).unwrap());
         }
     }
@@ -1641,19 +1644,31 @@ tools:
     /// provisioned. So the two are pinned together here: edit one without the
     /// other and this test fails instead of a run failing closed.
     #[test]
-    fn migration_0029_jsonb_matches_the_yaml() {
-        let sql = include_str!("../../../migrations/0029_tiered_policies.sql");
-        for name in ["open", "standard", "governed"] {
+    fn migration_jsonb_matches_the_yaml() {
+        assert_migration_embeds(
+            include_str!("../../../migrations/0029_tiered_policies.sql"),
+            "0029",
+            &["open", "standard", "governed"],
+        );
+        assert_migration_embeds(
+            include_str!("../../../migrations/0030_default_policy_backfill.sql"),
+            "0030",
+            &["default"],
+        );
+    }
+
+    fn assert_migration_embeds(sql: &str, mig: &str, names: &[&str]) {
+        for name in names {
             let expected = serde_json::to_value(tier(name)).unwrap();
 
-            // The generator emits exactly one line per tier:
+            // The generator emits exactly one line per policy:
             //     ('<name>', '<json>'::jsonb),
             let prefix = format!("('{name}', '");
             let line = sql
                 .lines()
                 .map(str::trim)
                 .find(|l| l.starts_with(&prefix))
-                .unwrap_or_else(|| panic!("0029 has no single-line VALUES row for {name}"));
+                .unwrap_or_else(|| panic!("{mig} has no single-line VALUES row for {name}"));
             // The row must be EXACTLY `('<name>', '<json>'::jsonb)` with nothing
             // trailing. Stopping at the first `'::jsonb` and ignoring the rest
             // would let `… '::jsonb || '{"defaults":{"tool_action":"deny"}}'::jsonb`
@@ -1677,10 +1692,10 @@ tools:
             let literal = literal.replace("''", "'");
 
             let actual: serde_json::Value = serde_json::from_str(&literal)
-                .unwrap_or_else(|e| panic!("{name} jsonb in 0029 is not valid JSON: {e}"));
+                .unwrap_or_else(|e| panic!("{name} jsonb in {mig} is not valid JSON: {e}"));
             assert_eq!(
                 actual, expected,
-                "0029's {name} jsonb has drifted from policies/{name}.yaml"
+                "{mig}'s {name} jsonb has drifted from policies/{name}.yaml"
             );
         }
     }
