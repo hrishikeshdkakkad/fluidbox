@@ -558,14 +558,22 @@ pub async fn create_org(
                 }
             }
             // Seed `default` + the three tiers. Without this a new org holds NO
-            // policies, and every run in it fails closed at `create_run` — after
-            // provisioning, which is the expensive place to find out.
+            // policies and every run in it fails closed at `create_run`, where
+            // the policy is resolved.
             //
-            // Best-effort for the same reason the mint above is: the org already
-            // exists and is addressable, so failing the request here would leave
-            // an operator with an org they cannot see and cannot re-create (the
-            // slug is taken). Seeding is idempotent, so the repair is to run this
-            // path again rather than to unpick anything.
+            // Best-effort because the org row has ALREADY committed: failing the
+            // request here would leave an operator holding an org they can
+            // neither see nor re-create, since the slug is taken and a retry
+            // returns 409.
+            //
+            // That is a genuine trade, not a free one, and it is WEAKER than the
+            // LLM-key mint above it: that has a lazy retry on first use, this has
+            // none. A failure here is permanent until someone re-seeds the tenant
+            // by hand, and because seeding is one transaction per document a
+            // mid-way failure leaves it partially seeded. Hence the warning names
+            // the org and says what is broken. A durable fix (seed inside the
+            // creating transaction, or a reconciler) is a design change and is
+            // deliberately not smuggled in here.
             if let Err(e) =
                 fluidbox_db::seed::seed_tiers_for_tenant(&state.pool, TenantScope::assume(org.id))
                     .await
