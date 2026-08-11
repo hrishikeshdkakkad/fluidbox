@@ -108,6 +108,52 @@ pub async fn run(
     })
 }
 
+/// The tier documents, COMPILED IN rather than read from disk.
+///
+/// Org creation must not read `policies/` at request time: that would couple an
+/// API call to a readable directory on whichever replica happened to serve it,
+/// and fail differently there than it does at boot. `include_str!` resolves at
+/// build time, so the binary carries the same bytes the boot seeder ships.
+pub const TIER_DOCUMENTS: &[(&str, &str)] = &[
+    ("open", include_str!("../../../policies/open.yaml")),
+    ("standard", include_str!("../../../policies/standard.yaml")),
+    ("governed", include_str!("../../../policies/governed.yaml")),
+];
+
+/// Seed `default` plus the three tiers into ONE tenant.
+///
+/// A tenant with no policies is not merely empty — every run in it fails closed
+/// at `create_run`, AFTER provisioning. `create_org` never seeded anything, so
+/// each new org started in exactly that state; this is what closes it.
+///
+/// Idempotent by way of [`seed_policy_if_absent`]: calling it twice is a no-op,
+/// and a tenant that already holds a policy of one of these names keeps the one
+/// it has. That matters because this runs on a path an operator can retry.
+pub async fn seed_tiers_for_tenant(pool: &PgPool, scope: TenantScope) -> anyhow::Result<()> {
+    // The same bare fail-safe document `run` bootstraps with, so a tenant is
+    // never left without the policy agent revisions default to.
+    let bare = Policy::parse_yaml("name: default")
+        .map_err(|e| anyhow::anyhow!("the bare fail-safe policy does not parse: {e}"))?;
+    seed_policy_if_absent(
+        pool,
+        scope,
+        "default",
+        "name: default",
+        &serde_json::to_value(&bare)?,
+    )
+    .await?;
+
+    for (name, yaml) in TIER_DOCUMENTS {
+        // A compiled-in document that does not parse is a build-time mistake
+        // discovered at runtime, so name it rather than `?`-ing a bare serde
+        // error up to a caller with no idea what it was reading.
+        let parsed = Policy::parse_yaml(yaml)
+            .map_err(|e| anyhow::anyhow!("compiled-in policy '{name}' does not parse: {e}"))?;
+        seed_policy_if_absent(pool, scope, name, yaml, &serde_json::to_value(&parsed)?).await?;
+    }
+    Ok(())
+}
+
 /// Seed every `*.yaml` in `policies_dir`.
 ///
 /// Split out of [`run`] so the refusal rules below are testable against a
