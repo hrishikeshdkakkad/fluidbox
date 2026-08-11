@@ -44,7 +44,13 @@ tools:
     action: allow
 
   # The defining difference of this tier: a write is a decision a human makes.
-  # The path constraints still apply to the call a human approves.
+  #
+  # The `deny` globs below ARE hard constraints. The `allow` list is not: the
+  # engine routes any path outside it to RequireApproval independently of this
+  # rule's `action` (see policy.rs, "hardcoded Approve … INDEPENDENT of
+  # rule.action"), and this rule already asks for approval, so the allow list
+  # changes no verdict here. It is kept because it is the shape the Governance
+  # matrix displays and because a future action change would give it teeth.
   - match: ["Edit", "Write", "MultiEdit", "NotebookEdit"]
     action: approve
     risk: writes require a human under the governed tier
@@ -53,9 +59,20 @@ tools:
       deny: ["**/.env", "**/.env.*", "**/.git/config", "**/.git/hooks/**"]
 
   # Shell: a read-only toolbox, and `on_no_match: deny` rather than approve —
-  # under this tier an unrecognised command is refused, not escalated. The
-  # deny_regex list stays as a second floor for the exfiltration patterns, so a
-  # future widening of allow_prefixes cannot silently re-admit them.
+  # under this tier an unrecognised command is refused, not escalated.
+  #
+  # THE DENY LIST IS LOAD-BEARING, NOT BELT-AND-BRACES. A prefix match returns
+  # this rule's `allow` for the WHOLE command, so `find` and `pwd` in the list
+  # above would otherwise auto-approve `find /workspace -delete` and
+  # `pwd && rm -rf /workspace` — making this tier's central claim ("writes need
+  # a human") false. deny_regex is consulted BEFORE prefixes, so it is the only
+  # thing that can refuse a destructive tail on a benign head.
+  #
+  # Hence the metacharacter denies: chaining, pipes, redirection, and command
+  # substitution each turn a read-only head into an arbitrary command. That is
+  # stricter than `standard` on purpose — `standard` inherits `default`'s
+  # documented position that the sandbox, not the classifier, is the real
+  # boundary. `governed` makes a stronger promise and has to keep it.
   - match: ["Bash", "BashOutput", "KillShell"]
     action: allow
     shell:
@@ -73,6 +90,26 @@ tools:
         - "git diff"
         - "git log"
       deny_regex:
+        # Anything that composes a second command onto an allowed first one.
+        - "[;&|]"
+        - "[<>]"
+        - "\\$\\("
+        - "`"
+        # find/xargs flags that execute or delete without a second command.
+        - "-delete"
+        - "-exec"
+        - "-execdir"
+        - "-fprint"
+        - "-fls"
+        # Destructive or permission-changing verbs, wherever they appear.
+        - "\\brm\\b"
+        - "\\bdd\\b"
+        - "\\bmv\\b"
+        - "\\btee\\b"
+        - "\\btruncate\\b"
+        - "\\bchmod\\b"
+        - "\\bchown\\b"
+        # Exfiltration, as on every other tier.
         - "\\bcurl\\b"
         - "\\bwget\\b"
         - "\\bnc\\b"
