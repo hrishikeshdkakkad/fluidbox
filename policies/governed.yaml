@@ -1,0 +1,90 @@
+# The READ-MOSTLY tier. Writes need a human, autonomy is forbidden, the network
+# is offline, and the fallback is DENY rather than approve.
+#
+# KNOWN CONSEQUENCE, by design: `defaults.tool_action: deny` refuses any tool not
+# listed below — including tools a future CLI upgrade introduces. That is the
+# intended failure direction, but it is a standing maintenance obligation: when
+# the pinned CLI gains a tool, decide about it here rather than discovering the
+# denial in a run.
+name: governed
+defaults:
+  tool_action: deny
+egress:
+  mode: proxy-only
+network:
+  max_mode: offline
+budgets:
+  max_wall_clock_secs: 900
+  max_tokens: 300000
+  max_cost_usd: 1.0
+  max_tool_calls: 40
+approvals:
+  default_ttl_secs: 300
+  scope: once
+  timeout_action: deny
+autonomy:
+  permitted: false
+  on_approval_rule: deny
+tools:
+  # Reading and the agent's own bookkeeping. Deliberately SHORTER than the
+  # standard tier's list: no ToolSearch (it is the handle to deferred MCP
+  # tools), no Task* bookkeeping.
+  - match:
+      [
+        "Read",
+        "Glob",
+        "Grep",
+        "LS",
+        "TodoWrite",
+        "NotebookRead",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "AskUserQuestion",
+      ]
+    action: allow
+
+  # The defining difference of this tier: a write is a decision a human makes.
+  # The path constraints still apply to the call a human approves.
+  - match: ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+    action: approve
+    risk: writes require a human under the governed tier
+    paths:
+      allow: ["/workspace/**"]
+      deny: ["**/.env", "**/.env.*", "**/.git/config", "**/.git/hooks/**"]
+
+  # Shell: a read-only toolbox, and `on_no_match: deny` rather than approve —
+  # under this tier an unrecognised command is refused, not escalated. The
+  # deny_regex list stays as a second floor for the exfiltration patterns, so a
+  # future widening of allow_prefixes cannot silently re-admit them.
+  - match: ["Bash", "BashOutput", "KillShell"]
+    action: allow
+    shell:
+      allow_prefixes:
+        - "ls"
+        - "cat"
+        - "head"
+        - "tail"
+        - "wc"
+        - "grep"
+        - "rg"
+        - "find"
+        - "pwd"
+        - "git status"
+        - "git diff"
+        - "git log"
+      deny_regex:
+        - "\\bcurl\\b"
+        - "\\bwget\\b"
+        - "\\bnc\\b"
+        - "\\bssh\\b"
+        - "\\bscp\\b"
+        - "\\bsudo\\b"
+        - "/etc/passwd"
+      on_no_match: deny
+
+  # Listed explicitly rather than left to defaults.tool_action: an MCP call is
+  # worth a human decision and a `risk` string on the approval card, not a
+  # silent refusal an operator has to go read a policy to explain.
+  - match: ["mcp__*"]
+    action: approve
+    risk: unreviewed MCP tool
