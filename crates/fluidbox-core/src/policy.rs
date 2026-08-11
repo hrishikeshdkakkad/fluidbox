@@ -1591,6 +1591,50 @@ tools:
         assert!(matches!(v(&governed, odd()), Verdict::Deny { .. }));
     }
 
+    /// `governed` claims writes need a human. A shell prefix match returns the
+    /// rule's action for the WHOLE command, so a read-only-looking first token
+    /// with a destructive tail makes that claim false. Found by review, not by
+    /// the original tests — which is why it is pinned here.
+    #[test]
+    fn governed_shell_cannot_write_without_a_human() {
+        let governed = tier("governed");
+        let v = |c: &str| {
+            governed
+                .evaluate(&req("Bash", json!({"command": c})), Autonomy::Supervised)
+                .effective
+        };
+
+        // `find` and `pwd` are allowed prefixes; the tails are not read-only.
+        for cmd in [
+            "find /workspace -delete",
+            "pwd && rm -rf /workspace/project",
+            "cat /etc/hostname > /workspace/pwned",
+            "ls; rm -f /workspace/a.rs",
+            "grep -r x /workspace | tee /workspace/out",
+        ] {
+            assert!(
+                !matches!(v(cmd), Verdict::Allow),
+                "governed auto-allowed a writing command: {cmd:?}"
+            );
+        }
+
+        // …while the genuinely read-only toolbox still works unattended.
+        for cmd in ["ls -la", "git status", "grep -r needle /workspace"] {
+            assert!(
+                matches!(v(cmd), Verdict::Allow),
+                "governed should still allow ordinary reading: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "generator: emits the literals for migrations/0029_tiered_policies.sql"]
+    fn emit_tier_json() {
+        for name in ["open", "standard", "governed"] {
+            println!("{name}\t{}", serde_json::to_string(&tier(name)).unwrap());
+        }
+    }
+
     /// Migration 0029 embeds the tier documents as jsonb, and NOTHING validates
     /// hand-written jsonb against the serde shape. A mismatch does not fail at
     /// migration time — it fails at `create_run`, after the run is already
@@ -1610,13 +1654,27 @@ tools:
                 .map(str::trim)
                 .find(|l| l.starts_with(&prefix))
                 .unwrap_or_else(|| panic!("0029 has no single-line VALUES row for {name}"));
-            let body = &line[prefix.len()..];
-            let end = body
-                .find("'::jsonb")
-                .unwrap_or_else(|| panic!("{name}'s literal must be cast ::jsonb on one line"));
+            // The row must be EXACTLY `('<name>', '<json>'::jsonb)` with nothing
+            // trailing. Stopping at the first `'::jsonb` and ignoring the rest
+            // would let `… '::jsonb || '{"defaults":{"tool_action":"deny"}}'::jsonb`
+            // pass this test while postgres stored the merged object — the guard
+            // would certify a policy nobody wrote. Found in review.
+            let body = line
+                .strip_prefix(&prefix)
+                .expect("checked by starts_with above");
+            let body = body
+                .strip_suffix(',')
+                .unwrap_or(body)
+                .strip_suffix(')')
+                .unwrap_or_else(|| panic!("{name}'s VALUES row must end with `)` on its own line"));
+            let literal = body.strip_suffix("'::jsonb").unwrap_or_else(|| {
+                panic!(
+                    "{name}'s row must be a single '<json>'::jsonb literal with nothing appended"
+                )
+            });
             // SQL doubles an embedded quote; `standard` really does contain one
             // ("this run's disposable workspace"), so this is exercised.
-            let literal = body[..end].replace("''", "'");
+            let literal = literal.replace("''", "'");
 
             let actual: serde_json::Value = serde_json::from_str(&literal)
                 .unwrap_or_else(|e| panic!("{name} jsonb in 0029 is not valid JSON: {e}"));
