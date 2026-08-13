@@ -4,6 +4,38 @@ All notable, user-visible changes to fluidbox are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
+## [0.7.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.6.0...v0.7.0) (2026-08-13)
+
+
+### Added
+
+* **db:** backfill the default policy into every tenant (0030) ([f00fb91](https://github.com/hrishikeshdkakkad/fluidbox/commit/f00fb91906c3811148129f03379ff4c3588f0ee6))
+* **db:** backfill tiered policies into existing tenants (0029) ([f8efc38](https://github.com/hrishikeshdkakkad/fluidbox/commit/f8efc380ceb5e748c1e08b49a7d1901f7b7fb416))
+* **policy:** add open, standard, and governed seed policy tiers ([d3d6ab1](https://github.com/hrishikeshdkakkad/fluidbox/commit/d3d6ab1d33371f0e3fab4b656878feb03550ff39))
+* **policy:** rename the open tier to unrestricted (0031) ([0246036](https://github.com/hrishikeshdkakkad/fluidbox/commit/02460367c0a9540ee3991f16472f057e93089228))
+* **policy:** tiered seed policies — unrestricted / standard / governed ([7b4b088](https://github.com/hrishikeshdkakkad/fluidbox/commit/7b4b0885e6ab788461e796d3951389625cd06023))
+* **web:** make an agent's declared egress visible, and declarable at creation ([44bc3f7](https://github.com/hrishikeshdkakkad/fluidbox/commit/44bc3f799bb823f77dc8ed1d14db3b91903643aa))
+* **web:** make an agent's declared egress visible, and declarable at creation ([e417112](https://github.com/hrishikeshdkakkad/fluidbox/commit/e4171121e814a2d5273a0786760d232fa0523290))
+
+
+### Fixed
+
+* **cloud,web:** cold-start enforcement deadline + collapse the grant card on Overview ([1d6373e](https://github.com/hrishikeshdkakkad/fluidbox/commit/1d6373eef04811437d8a3d135edb6beb63470774))
+* **cloud,web:** cold-start enforcement deadline + E2E scenario matrix evidence ([2f25b2f](https://github.com/hrishikeshdkakkad/fluidbox/commit/2f25b2f9bf362b494adcfc23c5a8da4884961e6d))
+* **doctor:** repair the RLS check, which could never pass ([0fc1383](https://github.com/hrishikeshdkakkad/fluidbox/commit/0fc1383efe6db3b04a11a100c78f72194a3b0322))
+* **doctor:** repair the RLS check, which could never pass ([ab98009](https://github.com/hrishikeshdkakkad/fluidbox/commit/ab9800974125e62aaf017385093c2387a3b36677))
+* **orgs:** seed default and tiered policies when an org is created ([0315de9](https://github.com/hrishikeshdkakkad/fluidbox/commit/0315de9c9db4583ed9abb661e742922993b1cdc1))
+* **policy:** close the governed shell hole and three review findings ([509a42c](https://github.com/hrishikeshdkakkad/fluidbox/commit/509a42cbf8607b5f02e8559110e9d82ae85a7c0e))
+* **web:** close the network-grant UI review findings ([78adc96](https://github.com/hrishikeshdkakkad/fluidbox/commit/78adc96ba411f2796075358b6def9067a5f72be5))
+* **web:** close the network-grant UI review findings ([10a7166](https://github.com/hrishikeshdkakkad/fluidbox/commit/10a7166346b484b980850c0d6f61ceb73ef06ac2))
+
+
+### Documentation
+
+* **cloud:** cold-start regression test confirms the netpol deadline fix ([9218025](https://github.com/hrishikeshdkakkad/fluidbox/commit/9218025e0270d7e180a4ec8e4908c1d046e56e0e))
+* **cloud:** live acceptance — a granted run reaches the internet ([9fb474e](https://github.com/hrishikeshdkakkad/fluidbox/commit/9fb474e9246dadfc137daad7971bba58ff4335e1))
+* **cloud:** network-grant UI live acceptance evidence ([94bcc6d](https://github.com/hrishikeshdkakkad/fluidbox/commit/94bcc6dc56239192ef23907e36a754437d551add))
+
 ## [Unreleased]
 
 ### Changed
