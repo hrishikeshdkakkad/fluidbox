@@ -108,6 +108,60 @@ pub async fn run(
     })
 }
 
+/// The tier documents, COMPILED IN rather than read from disk.
+///
+/// Org creation must not read `policies/` at request time: that would couple an
+/// API call to a readable directory on whichever replica happened to serve it,
+/// and fail differently there than it does at boot. `include_str!` resolves at
+/// build time, so the binary carries the same bytes the boot seeder ships.
+/// `default` is included, and that is the point rather than an oversight.
+///
+/// Seeding a bare `name: default` here instead would hand every new org a
+/// DIFFERENT and weaker default than the one on disk: `Read` would escalate to
+/// a human, and `Agent`/`Task`/`Workflow` would become RequireApproval where
+/// the shipped document hard-DENIES them — one approval click authorising an
+/// unobserved nested tool tree. The boot path gets away with a bare fallback
+/// only because `seed_policies_from_dir` has already applied `default.yaml`
+/// before it runs; this path has no such predecessor.
+pub const TIER_DOCUMENTS: &[(&str, &str)] = &[
+    ("default", include_str!("../../../policies/default.yaml")),
+    (
+        "unrestricted",
+        include_str!("../../../policies/unrestricted.yaml"),
+    ),
+    ("standard", include_str!("../../../policies/standard.yaml")),
+    ("governed", include_str!("../../../policies/governed.yaml")),
+];
+
+/// Seed `default` plus the three tiers into ONE tenant.
+///
+/// A tenant with no policies is not merely empty — every run in it fails closed
+/// at `create_run`, where the policy is resolved (`run_service.rs`, before the
+/// session row and before any sandbox exists). `create_org` never seeded
+/// anything, so each new org started in exactly that state; this closes it.
+///
+/// Idempotent by way of [`seed_policy_if_absent`]: calling it twice is a no-op,
+/// and a tenant that already holds a policy of one of these names keeps the one
+/// it has.
+///
+/// NOT ATOMIC, and worth knowing: each document is its own transaction, so a
+/// mid-way failure leaves a partially-seeded tenant. Nothing here repairs that
+/// — there is no re-seed endpoint today, and re-POSTing the slug returns 409.
+/// Callers must treat a failure as needing operator attention, not as a state
+/// the system heals on its own.
+pub async fn seed_tiers_for_tenant(pool: &PgPool, scope: TenantScope) -> anyhow::Result<()> {
+    for (name, yaml) in TIER_DOCUMENTS {
+        // STRICT, matching `seed_policies_from_dir`. The lenient parser drops
+        // unknown keys silently, so a typo like `paths.denyy` would seed a
+        // WEAKER policy than the file appears to describe — and this path has
+        // no operator watching it the way a boot log has.
+        let parsed = Policy::parse_yaml_strict(yaml)
+            .map_err(|e| anyhow::anyhow!("compiled-in policy '{name}' does not parse: {e}"))?;
+        seed_policy_if_absent(pool, scope, name, yaml, &serde_json::to_value(&parsed)?).await?;
+    }
+    Ok(())
+}
+
 /// Seed every `*.yaml` in `policies_dir`.
 ///
 /// Split out of [`run`] so the refusal rules below are testable against a

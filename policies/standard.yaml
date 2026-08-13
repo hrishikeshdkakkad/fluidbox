@@ -1,0 +1,169 @@
+# The EVERYDAY tier. Mirrors the shipped `default` posture, with two deliberate
+# differences: network `approved` mode is available (inert until an operator
+# populates the catalog), and budgets are tighter.
+#
+# The shell classifier below is a byte-for-byte copy of `default.yaml`'s. That
+# list is ledger-derived from real runs and pinned by `seed_policy_semantics`;
+# it is duplicated rather than "improved" on purpose.
+name: standard
+defaults:
+  tool_action: approve
+egress:
+  mode: proxy-only
+network:
+  max_mode: approved
+  require_approval: true
+budgets:
+  max_wall_clock_secs: 3600
+  max_tokens: 2000000
+  max_cost_usd: 5
+  max_tool_calls: 200
+approvals:
+  default_ttl_secs: 600
+  scope: once
+  timeout_action: deny
+autonomy:
+  permitted: true
+  on_approval_rule: deny
+tools:
+  # Reading, searching, and the agent's own bookkeeping: none of these execute
+  # anything or leave the run.
+  - match:
+      [
+        "Read",
+        "Glob",
+        "Grep",
+        "LS",
+        "TodoWrite",
+        "NotebookRead",
+        "ToolSearch",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "AskUserQuestion",
+        "ReportFindings",
+        "TaskGet",
+        "TaskList",
+        "TaskOutput",
+        "CronList",
+      ]
+    action: allow
+
+  # Sub-execution: DENIED. These tools do not act themselves — they start an
+  # agent, workflow, skill, or background task that then calls tools of its own,
+  # and those nested calls may reach neither this gate nor the GateWitness
+  # tripwire. `approve` would be worse than it looks: one human click would
+  # authorise an unbounded, unobserved tool tree.
+  - match: ["Agent", "Task", "Workflow", "Skill", "TaskCreate"]
+    action: deny
+    risk: spawns sub-execution whose nested tool calls the gate may never see
+
+  # Edits are free inside the workspace; anything else asks a human. (These path
+  # globs are hygiene, not hard security: shell redirection via an allowed prefix
+  # can still write files. The real boundary is that the workspace is a
+  # disposable copy inside an isolated sandbox.)
+  - match: ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+    action: allow
+    paths:
+      allow: ["/workspace/**"]
+      deny: ["**/.env", "**/.env.*", "**/.git/config", "**/.git/hooks/**"]
+
+  # Shell: a benign toolbox is pre-approved; destructive or exfiltrating
+  # patterns are denied outright; everything else pauses for approval.
+  - match: ["Bash", "BashOutput", "KillShell"]
+    action: allow
+    shell:
+      allow_prefixes:
+        - "ls"
+        - "cat"
+        - "head"
+        - "tail"
+        - "wc"
+        - "grep"
+        - "rg"
+        - "find"
+        - "pwd"
+        - "echo"
+        - "which"
+        - "env | grep"
+        - "python"
+        - "python3"
+        - "pytest"
+        - "pip install -r"
+        - "node"
+        - "npm test"
+        - "npm run test"
+        - "npx jest"
+        - "npx vitest"
+        - "cargo test"
+        - "cargo build"
+        - "cargo check"
+        - "go test"
+        - "make test"
+        - "git status"
+        - "git diff"
+        - "git log"
+        - "git add"
+        - "git commit"
+        - "git show"
+        - "cd"
+        - "mkdir"
+        - "touch"
+        - "mv"
+        - "cp"
+        - "sed"
+        - "awk"
+        - "diff"
+        - "sort"
+        - "uniq"
+        - "cut"
+        - "tr"
+        - "stat"
+        - "file"
+        - "du"
+        - "printf"
+        - "basename"
+        - "dirname"
+        - "date"
+      deny_regex:
+        - "rm\\s+(-[a-z]+\\s+)*-[a-z]*r[a-z]*(\\s+-[a-z]+)*\\s+/\\*?(\\s|$)"
+        - "\\bcurl\\b"
+        - "\\bwget\\b"
+        - "\\bnc\\b"
+        - "\\bssh\\b"
+        - "\\bscp\\b"
+        - "git\\s+push\\b.*\\s(--force(-with-lease)?|-f)\\b"
+        - "\\bsudo\\b"
+        - "/etc/passwd"
+        - "\\bchmod\\s+777\\b"
+      on_no_match: approve
+
+  # Network tools: the sandbox has no business fetching the internet. `Monitor`
+  # belongs here rather than the allow list because it carries BOTH a shell
+  # surface and an outbound-WebSocket surface while being classified for neither.
+  - match: ["WebFetch", "WebSearch", "DesignSync", "Monitor"]
+    action: deny
+    risk: network egress from sandbox
+
+  # Effects that OUTLIVE the run or leave it. A run's workspace is disposable and
+  # its sandbox is torn down; a schedule, a wake-up, or a message to another
+  # agent is none of those.
+  - match:
+      [
+        "TaskStop",
+        "TaskUpdate",
+        "SendMessage",
+        "CronCreate",
+        "CronDelete",
+        "ScheduleWakeup",
+        "PushNotification",
+        "EnterWorktree",
+        "ExitWorktree",
+      ]
+    action: approve
+    risk: effect outside this run's disposable workspace
+
+  # MCP tools ask a human by default. Attaching a bundle makes tools AVAILABLE;
+  # this rule still judges every call (attach != allow).
+  - match: ["mcp__*"]
+    action: approve
+    risk: unreviewed MCP tool

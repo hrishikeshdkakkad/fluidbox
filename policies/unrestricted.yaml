@@ -1,0 +1,38 @@
+# The UNRESTRICTED tier: trusted internal automation, never untrusted input.
+#
+# THE NAME IS A CONTRACT, not a label. The dashboard's "Free rein" preset
+# resolves this policy by the literal name `unrestricted` (RunComposer.tsx) and
+# disables the preset when no such policy exists, rather than inventing one.
+# Renaming this file re-disables that button.
+#
+# `defaults.tool_action: allow` means there is nothing for a rule to add, which
+# is why `tools` is empty rather than omitted-by-oversight.
+#
+# ACCEPTED RISK, stated because it is a real one: this tier allows
+# Agent/Task/Workflow/Skill. `default` denies those as a SECURITY decision, not
+# ergonomics — nested tool calls may never surface as top-level tool_use blocks,
+# so they may reach neither the gate nor the GateWitness tripwire. One allow
+# here authorises an unobserved tool tree. That is this tier's purpose.
+#
+# Budgets are RETAINED on purpose. They are a runaway stop, not a restriction on
+# the agent's authority. Omitting them moves the failure from a clean
+# budget_exceeded terminal state to a hard 429 from LiteLLM's per-tenant cap.
+name: unrestricted
+defaults:
+  tool_action: allow
+egress:
+  mode: proxy-only
+network:
+  max_mode: public
+  allow_public_with_brokered: true
+budgets:
+  max_cost_usd: 25
+  max_wall_clock_secs: 7200
+approvals:
+  default_ttl_secs: 600
+  scope: session
+  timeout_action: deny
+autonomy:
+  permitted: true
+  on_approval_rule: allow
+tools: []
