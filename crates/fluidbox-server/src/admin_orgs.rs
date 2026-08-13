@@ -557,6 +557,34 @@ pub async fn create_org(
                     );
                 }
             }
+            // Seed `default` + the three tiers. Without this a new org holds NO
+            // policies and every run in it fails closed at `create_run`, where
+            // the policy is resolved.
+            //
+            // Best-effort because the org row has ALREADY committed: failing the
+            // request here would leave an operator holding an org they can
+            // neither see nor re-create, since the slug is taken and a retry
+            // returns 409.
+            //
+            // That is a genuine trade, not a free one, and it is WEAKER than the
+            // LLM-key mint above it: that has a lazy retry on first use, this has
+            // none. A failure here is permanent until someone re-seeds the tenant
+            // by hand, and because seeding is one transaction per document a
+            // mid-way failure leaves it partially seeded. Hence the warning names
+            // the org and says what is broken. A durable fix (seed inside the
+            // creating transaction, or a reconciler) is a design change and is
+            // deliberately not smuggled in here.
+            if let Err(e) =
+                fluidbox_db::seed::seed_tiers_for_tenant(&state.pool, TenantScope::assume(org.id))
+                    .await
+            {
+                tracing::warn!(
+                    "seeding policies for new org {} ({}) failed — runs in it fail closed at \
+                     create_run until it is re-seeded: {e}",
+                    slug,
+                    org.id
+                );
+            }
             Ok(Json(json!({ "org": org })))
         }
         identity::CreateOrgOutcome::SlugConflict => {
