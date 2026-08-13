@@ -135,8 +135,21 @@ else
                     "REVOKE $runtime_role FROM them, or pick a deployment-specific role name (Postgres roles are cluster-global; fluidbox's grants are database-local)"
                   # The effective role: exactly what the app pool's connections run
                   # as. Rolled back — the probe is a read.
-                  rls_attrs=$(psql "$db_url" -Atc \
-                    "begin; set local role \"$runtime_role\"; $role_probe; rollback;" 2>/dev/null)
+                  #
+                  # Fed on STDIN, not as `-Atc "begin; …; rollback;"`. psql prints
+                  # only the LAST result of a multi-statement -c string, so that
+                  # form returned the literal `ROLLBACK`, and every runtime-role
+                  # deployment was told its role was named ROLLBACK and bypassed
+                  # RLS. ON_ERROR_STOP keeps a failed SET ROLE yielding NOTHING,
+                  # which is what makes the refusal below fire instead of the
+                  # probe reporting the OWNER's attributes as the runtime role's.
+                  rls_attrs=$(psql "$db_url" -At -v ON_ERROR_STOP=1 2>/dev/null <<SQL | grep -vE '^(BEGIN|SET|COMMIT|ROLLBACK)$' | head -1
+begin;
+set local role "$runtime_role";
+$role_probe;
+rollback;
+SQL
+)
                   [ -n "$rls_attrs" ] || bad "cannot SET ROLE to '$runtime_role' from the DATABASE_URL role — the app pool SET ROLEs on EVERY connection, so the server cannot start" \
                     "GRANT $runtime_role TO CURRENT_USER; (run it as the database owner)"
                 fi;;
@@ -149,7 +162,13 @@ else
             # only single-role mode can reach here with nothing said.
             "")      [ -n "$runtime_role" ] || warn "could not read the connecting role's RLS attributes" \
                           "run: psql \"\$DATABASE_URL\" -Atc \"select rolsuper, rolbypassrls from pg_roles where rolname = current_user\"";;
-            *" f f") if [ -n "$runtime_role" ]; then
+            # `rolsuper::text` is the SQL boolean→text cast, which yields
+            # "true"/"false" — NOT psql's own "t"/"f" column rendering. The arm
+            # used to read *" f f", so it could never match and this check could
+            # never say "RLS-bound" in EITHER mode. It looked right only because
+            # the roles it was pointed at (a container superuser, Neon's owner)
+            # really do bypass RLS, so the wrong branch printed a true verdict.
+            *" false false") if [ -n "$runtime_role" ]; then
                        ok "pool's EFFECTIVE role '${rls_attrs%% *}' (via FLUIDBOX_RUNTIME_ROLE SET ROLE) is RLS-bound — 0018's policies enforce"
                      else
                        ok "DB role '${rls_attrs%% *}' is RLS-bound (not superuser, no BYPASSRLS)"
