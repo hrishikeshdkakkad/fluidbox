@@ -125,7 +125,10 @@ pub async fn run(
 /// before it runs; this path has no such predecessor.
 pub const TIER_DOCUMENTS: &[(&str, &str)] = &[
     ("default", include_str!("../../../policies/default.yaml")),
-    ("open", include_str!("../../../policies/open.yaml")),
+    (
+        "unrestricted",
+        include_str!("../../../policies/unrestricted.yaml"),
+    ),
     ("standard", include_str!("../../../policies/standard.yaml")),
     ("governed", include_str!("../../../policies/governed.yaml")),
 ];
