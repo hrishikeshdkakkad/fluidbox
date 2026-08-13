@@ -11596,7 +11596,7 @@ mod tests {
             .unwrap();
 
         let mut found: Vec<(&str, bool, Option<i32>)> = Vec::new();
-        for name in ["default", "open", "standard", "governed"] {
+        for name in ["default", "unrestricted", "standard", "governed"] {
             match get_policy_by_name(&pool, scope, name).await.unwrap() {
                 Some(p) => {
                     let v = latest_policy_version(&pool, scope, p.id)
