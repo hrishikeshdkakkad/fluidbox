@@ -35,15 +35,45 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  # LiteLLM runs in one of two shapes, chosen entirely by LITELLM_IMAGE +
+  # LITELLM_DATABASE_URL. Leave both unset and nothing here changes: the plain
+  # image, no database, FLUIDBOX_LLM_KEY_MODE=shared. That is still the default.
+  #
+  # Set both and this mirrors the hosted deployment (deploy/cloud/terraform/app/
+  # litellm.tf), which is what FLUIDBOX_LLM_KEY_MODE=tenant requires — per-tenant
+  # virtual keys live behind LiteLLM's /key/* endpoints, and those are a
+  # Postgres-BACKED feature. Two things must be true together, and only one of
+  # them is the connection string:
+  #
+  #   1. LITELLM_IMAGE must be the `litellm-database` variant. It is a DIFFERENT
+  #      image, not a flag — it bundles prisma and migrates its schema at boot.
+  #      The plain `litellm` image ignores DATABASE_URL and still answers
+  #      /key/generate with "DB not connected", which reads like a config typo.
+  #   2. LITELLM_DATABASE_URL must point at a DEDICATED database, never the
+  #      fluidbox app DB. Hosted uses a separate Neon instance; locally it is a
+  #      separate database on this same container — the one deliberate fidelity
+  #      gap (same server, distinct database).
+  #
+  # The boot migration is also why the hosted memory limit is 4Gi: the DB-backed
+  # image was OOMKilled twenty-five seconds into boot at 2Gi on a node only 22%
+  # committed. That is a cgroup ceiling, not node pressure — do not shrink it.
   litellm:
     image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-stable}
-    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "1"]
     ports:
       - "127.0.0.1:4000:4000"
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      # Empty when unset — precisely how the plain image already behaves.
+      DATABASE_URL: ${LITELLM_DATABASE_URL:-}
+    # Only meaningful in the DB-backed shape, harmless otherwise: the boot
+    # migration must not race the control-plane database's first-boot initdb
+    # when both services come up cold together.
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
     restart: unless-stopped
