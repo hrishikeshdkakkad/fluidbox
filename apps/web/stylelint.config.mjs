@@ -19,13 +19,30 @@
 // warnings. The scales are the contract; formatting is not.
 
 /** The only radius values in the system: two tokens plus three literals that
- *  are shapes rather than scale steps (pill, circle, square panel). */
-const RADIUS = ["/^var\\(--radius(-lg)?\\)$/", "999px", "50%", "0"];
+ *  are shapes rather than scale steps (pill, circle, square panel).
+ *
+ *  Expressed as one regex over 1-4 space-separated parts, because a per-corner
+ *  shorthand is legal CSS made of legal parts — `0 var(--radius) var(--radius)
+ *  0` (a tab joined to its neighbour) is correct, and an anchored single-value
+ *  pattern reported it as a violation. A rule that cries wolf on correct code
+ *  is how a gate gets switched off. */
+const RADIUS_PART = String.raw`(?:var\(--radius(?:-lg)?\)|999px|50%|0)`;
+const RADIUS = [`/^${RADIUS_PART}(?: +${RADIUS_PART}){0,3}$/`];
 
 /** Three breakpoints, no others. Keyed on the real feature names — keying on
  *  `width` would be a silent no-op, because no query in this codebase uses the
  *  range syntax. */
-const BREAKPOINTS = ["640px", "900px", "1280px"];
+const BREAKPOINTS = [
+  "640px",
+  "900px",
+  "1280px",
+  // The min-width COMPLEMENTS of the same three tiers. `min-width: 901px` is
+  // not a fourth breakpoint — it is "above the 900 tier", and spelling it any
+  // other way (`not all and (max-width: 900px)`) is less readable for no gain.
+  "641px",
+  "901px",
+  "1281px",
+];
 
 const config = {
   ignoreFiles: ["**/node_modules/**", ".next/**"],

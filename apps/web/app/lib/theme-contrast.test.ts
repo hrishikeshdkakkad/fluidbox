@@ -108,6 +108,27 @@ describe("accent and amber clear WCAG AA as text on the light canvas", () => {
   }
 });
 
+describe("the always-light marketing scope tracks the dashboard scale", () => {
+  // `.st` re-pins the semantic layer to light literals so marketing never
+  // flips with the theme. Restating rather than aliasing means it can DRIFT:
+  // --accent sat at the pre-fix #567a00 here long after the dashboard token
+  // moved, so the public site kept a 4.40:1 accent the product had fixed.
+  // These assertions are what make that drift a build failure.
+  const ST = new Map([
+    ...customProperties([globals, kernel], ":root"),
+    ...customProperties([globals], "\\.st"),
+  ]);
+
+  for (const ink of ["--ink", "--ink-2", "--ink-3", "--accent"] as const) {
+    for (const surface of ["--bg", "--surface", "--raised"] as const) {
+      it(`marketing: ${ink} on ${surface}`, () => {
+        const ratio = contrastRatio(opaque(ink, ST), opaque(surface, ST));
+        expect(ratio, `${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(AA_BODY);
+      });
+    }
+  }
+});
+
 describe("the diff viewer is legible in both themes", () => {
   // kernel.css re-declares `.diff` AFTER globals.css and therefore sets the
   // real panel background. Assert the winner is still what we think it is — if

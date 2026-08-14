@@ -104,6 +104,50 @@
   --radius: 4px;
   --radius-lg: 8px;
   --hairline: 0.5px;
+
+  /* Third-party brand marks. These are other companies' identities, not our
+     scale — they must NOT be tokenised into the palette or flipped by theme,
+     and they are the one legitimate literal ghetto besides the tokens
+     themselves. Named here so a component rule never carries a raw hex. */
+  --brand-mark-ink: #ffffff;
+  --brand-github: #20242b;
+  --brand-github-light: #292b2f;
+  --brand-notion: #f3f3f2;
+  --brand-notion-ink: #111214;
+  --brand-atlassian-from: #2684ff;
+  --brand-atlassian-to: #0754bb;
+  --brand-linear-from: #8a7cff;
+  --brand-linear-to: #4c3bcf;
+  --brand-sentry-from: #8a68d5;
+  --brand-sentry-to: #4f2d91;
+  --brand-stripe-from: #7767ff;
+  --brand-stripe-to: #5142d8;
+  --brand-workspace-from: #36cba8;
+  --brand-workspace-to: #187e96;
+  --brand-custom-from: #ef7c63;
+  --brand-custom-to: #a74169;
+
+  /* Simulated-terminal / ledger swatches for the marketing mockups. A fake
+     terminal has ONE look — these are picture, not interface, so they are
+     theme-exempt by design and never flip. The other sanctioned literal
+     ghetto (foundation-spec 2.1). */
+  --term-bg: #26282c;
+  --term-film-body: #191a1c;
+  --term-film-cover: #212225;
+  --term-red: #ff5f57;
+  --term-amber: #febc2e;
+  --term-green: #2ac840;
+  --term-teal: #6ef0c0;
+  --term-gold: #ffce6a;
+  --term-salmon: #ff8d84;
+  --term-accent: #9ccf1f;
+  --term-ink: #ecedf3;
+  --term-ink-strong: #edeef0;
+  --term-muted: #b0b1c0;
+  --term-detail: #9d9eae;
+  --term-meta: #85869a;
+  --term-kicker: #83888f;
+  --term-faint: #5c5d6e;
 }
 /* stylelint-enable color-no-hex, scale-unlimited/declaration-strict-value */
 
@@ -874,7 +918,7 @@ h1.title {
 .btn.human {
   border-color: var(--gold);
   background: var(--gold);
-  color: #1c2024;
+  color: var(--flood-ink);
 }
 
 .btn.human:hover {
@@ -1415,7 +1459,7 @@ pre.token,
   color: var(--ds-gray-800);
 }
 
-@media (max-width: 860px) {
+@media (max-width: 900px) {
   .main {
     padding: 32px 18px 72px;
   }
