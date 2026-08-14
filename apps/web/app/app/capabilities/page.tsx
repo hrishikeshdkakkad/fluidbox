@@ -41,6 +41,7 @@ import {
 import { OwnerPicker } from "../../components/OwnerPicker";
 import { useSmartPolling } from "../../lib/useSmartPolling";
 import { AddServerWizard } from "./AddServerWizard";
+import { ConfirmAction } from "../../components/ConfirmAction";
 
 type Tab = "store" | "bundles" | "connections";
 
@@ -135,7 +136,13 @@ function Capabilities() {
     <>
       <PageHead
         title="MCP"
-        sub="MCP tools your agents can call during a run. Connect a service once — every call still passes the permission gate. Attach ≠ allow."
+        // Signposts the three tabs rather than renaming them: connector,
+        // connection and bundle are genuinely different objects in the domain
+        // (a catalog entry, an authorized instance holding a credential, and
+        // stdio tools baked into the sandbox image), so collapsing them to one
+        // word would flatten a distinction the permission gate actually makes.
+        // What was missing was a sentence saying which is which.
+        sub="MCP tools your agents can call during a run. A Connection is a service the control plane calls on the agent's behalf, holding your credential outside the sandbox; a Bundle is tools packaged inside the sandbox image, with no credential at all. Connect once — every call still passes the permission gate. Attach ≠ allow."
       />
 
       <div className="tabs">
@@ -591,9 +598,13 @@ function ToolConnections({
                     Tools
                   </button>
                   {c.status === "active" ? (
-                    <button className="btn ghost sm danger" onClick={() => onRevoke(c.id)}>
-                      Revoke
-                    </button>
+                    <ConfirmAction
+                      label="Revoke"
+                      title="Revoke this connection?"
+                      body="The stored credential is destroyed and every agent that requires this connection fails closed from now on. Runs already frozen keep their tool snapshots, and history is untouched. Reconnecting later re-runs the authorization."
+                      confirmLabel="Revoke connection"
+                      onConfirm={() => onRevoke(c.id)}
+                    />
                   ) : c.auth_kind === "oauth" ? (
                     <button className="btn ghost sm" onClick={() => onReconnect(c.id)}>
                       Reconnect

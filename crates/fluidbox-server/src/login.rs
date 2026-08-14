@@ -385,14 +385,39 @@ fn page(
 
 /// The single neutral refusal shown for an unknown slug, an IdP-less org, a
 /// suspended org, and a discovery failure alike — it never enumerates orgs.
+///
+/// It REDIRECTS back to the sign-in form rather than terminating on a page.
+/// The terminal page had no way back, so a mistyped organization stranded the
+/// browser on bare system-ui HTML with only the back button for an exit.
+///
+/// The no-enumeration property is untouched: all four causes still produce one
+/// byte-identical response, and `?error=unavailable` carries no more
+/// information than the single sentence the old page already showed everyone.
+///
+/// The body is DELIBERATELY retained even though a browser following the 303
+/// never renders it. A non-browser caller does not follow redirects — notably
+/// scripts/identity-e2e.sh, which asserts that an IdP-less org and a
+/// never-created slug answer identically AND that the answer greps as
+/// 'not configured'. Dropping the body would break that proof of the
+/// anti-enumeration property while looking like a cosmetic change.
 fn neutral_unavailable() -> Response {
-    page(
-        StatusCode::OK,
+    let mut response = page(
+        StatusCode::SEE_OTHER,
         "Sign in",
         "<p>SSO is not configured for this organization.</p>",
         "default-src 'none'; style-src 'unsafe-inline'",
         &[],
-    )
+    );
+    // Relative on purpose. The browser only ever reaches this endpoint through
+    // the dashboard origin (the same-origin API proxy, or the /v1/* rewrite),
+    // so a relative Location resolves to the dashboard's own /login. An
+    // absolute URL would need public_url, which addresses the control plane in
+    // some deployments and would send the user somewhere with no login form.
+    response.headers_mut().insert(
+        axum::http::header::LOCATION,
+        axum::http::HeaderValue::from_static("/login?error=unavailable"),
+    );
+    response
 }
 
 fn too_many() -> Response {
