@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { gateDecision, APP_HOME, SESSION_COOKIE } from "./app/lib/auth-gate";
 import { webMode } from "./app/lib/proxy-auth";
+import { hintSetCookie } from "./app/lib/session-hint";
 import {
   assertAuthModeCompatible,
   requireWorkosEnv,
@@ -23,22 +24,34 @@ const WORKOS = AUTH === "workos" ? requireWorkosEnv(process.env) : null;
 
 export async function proxy(request: NextRequest) {
   const { pathname, search } = request.nextUrl;
-  const decision = gateDecision({
-    mode: MODE,
-    pathname,
-    search,
-    hasSession: request.cookies.has(SESSION_COOKIE),
-  });
+  const hasSession = request.cookies.has(SESSION_COOKIE);
+
+  // The public pages are statically generated, so they cannot ask the server
+  // who you are. This stamps a NON-CREDENTIAL boolean (see lib/session-hint)
+  // that a pre-paint script reads, which is what lets the marketing header
+  // show "Dashboard" instead of "Sign in" with no flash and without making
+  // every marketing page dynamic. Applied to whichever response we return.
+  const stamp = <T extends NextResponse>(response: T, signedIn: boolean): T => {
+    // append, not set: the WorkOS path already attaches its own Set-Cookie
+    // headers to this response and they must all survive.
+    response.headers.append("set-cookie", hintSetCookie(signedIn));
+    return response;
+  };
+
+  const decision = gateDecision({ mode: MODE, pathname, search, hasSession });
   if (decision.kind === "to-app") {
-    return NextResponse.redirect(new URL(APP_HOME, request.url));
+    return stamp(NextResponse.redirect(new URL(APP_HOME, request.url)), hasSession);
   }
   if (decision.kind === "to-login") {
     const url = new URL("/login", request.url);
     if (decision.next !== APP_HOME) url.searchParams.set("next", decision.next);
-    return NextResponse.redirect(url);
+    // Reaching /login means the session did not satisfy the gate, so clear the
+    // hint too — otherwise a lapsed session leaves the public header still
+    // claiming you are signed in.
+    return stamp(NextResponse.redirect(url), false);
   }
 
-  if (!WORKOS) return NextResponse.next();
+  if (!WORKOS) return stamp(NextResponse.next(), hasSession);
 
   // WorkOS web tier (FLUIDBOX_WEB_AUTH=workos). Imported lazily so `none`
   // deployments never load the SDK (which reads its env at module load).
@@ -56,11 +69,13 @@ export async function proxy(request: NextRequest) {
       // through to the app shell.
       return new NextResponse("authentication unavailable", { status: 503 });
     }
-    return handleAuthkitProxy(request, headers, { redirect: authorizationUrl });
+    return stamp(handleAuthkitProxy(request, headers, { redirect: authorizationUrl }), false);
   }
   // Session-refresh cookies (and the headers withAuth() consumes in server
   // components / route handlers) ride every response, public pages included.
-  return handleAuthkitProxy(request, headers);
+  // In workos mode the live AuthKit user is the truth for the hint, not the
+  // fluidbox session cookie.
+  return stamp(handleAuthkitProxy(request, headers), !!session.user);
 }
 
 export const config = {
