@@ -3,6 +3,7 @@ import { IBM_Plex_Mono, Inter, Noto_Sans_JP, Noto_Sans_SC } from "next/font/goog
 import "./globals.css";
 import "./kernel.css";
 import { webMode } from "./lib/proxy-auth";
+import { SESSION_HINT_INIT_SCRIPT } from "./lib/session-hint";
 import { THEME_INIT_SCRIPT } from "./lib/theme";
 
 // The kernel.sh type stack: Inter for everything, IBM Plex Mono for code and
@@ -82,6 +83,10 @@ export default function RootLayout({
     >
       <head>
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+        {/* Stamps data-session before first paint, the same way the theme is
+            stamped. This is what lets the STATICALLY generated marketing pages
+            show a signed-in header with no flash — see lib/session-hint. */}
+        <script dangerouslySetInnerHTML={{ __html: SESSION_HINT_INIT_SCRIPT }} />
       </head>
       <body>{children}</body>
     </html>
