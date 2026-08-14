@@ -22,6 +22,7 @@ import { useAuthMe } from "../../lib/useAuthMe";
 import { GitHubMark, LoadingRows, ModalShell, OwnerTag, PageHead } from "../../components/bits";
 import { OwnerPicker } from "../../components/OwnerPicker";
 import type { AuthMe } from "../../lib/api";
+import { ConfirmAction } from "../../components/ConfirmAction";
 
 export default function Integrations() {
   const me = useAuthMe();
@@ -250,9 +251,13 @@ export default function Integrations() {
                         </button>
                       </>
                     )}
-                    <button className="btn ghost sm danger" onClick={() => revokeReg(r.id)}>
-                      Revoke
-                    </button>
+                    <ConfirmAction
+                      label="Revoke"
+                      title="Revoke this GitHub App registration?"
+                      body="Every connection this registration custodies stops working immediately, and its sealed credentials are dropped. Run history and audit records remain — they are append-only. You can re-approve the registration later, which keeps the same connection ids."
+                      confirmLabel="Revoke registration"
+                      onConfirm={() => revokeReg(r.id)}
+                    />
                   </span>
                 </div>
               ))}
@@ -342,9 +347,13 @@ export default function Integrations() {
                     </button>
                   )}
                   {c.status === "active" && (
-                    <button className="btn ghost sm danger" onClick={() => revoke(c.id)}>
-                      Revoke
-                    </button>
+                    <ConfirmAction
+                      label="Revoke"
+                      title="Revoke this connection?"
+                      body="The stored credential is destroyed and any run that needs this connection fails closed from now on. Runs already frozen keep their snapshots, and history is untouched. Reconnecting later re-runs the authorization."
+                      confirmLabel="Revoke connection"
+                      onConfirm={() => revoke(c.id)}
+                    />
                   )}
                 </span>
               </div>
