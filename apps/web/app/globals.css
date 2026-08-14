@@ -8,6 +8,10 @@
   appears only where it identifies a resource or communicates live state.
 */
 
+/* stylelint-disable color-no-hex, scale-unlimited/declaration-strict-value --
+   The token layer is the ONE place a raw colour literal may appear. Every
+   other rule in this file must reach a colour through a custom property;
+   the gate enforces that, and this comment is the visible boundary. */
 :root {
   /* Warm paper scale: beige canvas, charcoal ink (kernel.sh palette). */
   --bg: #f2f0e7;
@@ -65,7 +69,12 @@
   --radius-lg: 8px;
   --hairline: 0.5px;
 }
+/* stylelint-enable color-no-hex, scale-unlimited/declaration-strict-value */
 
+/* stylelint-disable color-no-hex, scale-unlimited/declaration-strict-value --
+   The token layer is the ONE place a raw colour literal may appear. Every
+   other rule in this file must reach a colour through a custom property;
+   the gate enforces that, and this comment is the visible boundary. */
 html[data-theme="dark"] {
   /* kernel.sh's dark sections: charcoal, not black. */
   --bg: #191a1c;
@@ -110,6 +119,7 @@ html[data-theme="dark"] {
   --skeleton-a: #26282c;
   --skeleton-b: #2f3237;
 }
+/* stylelint-enable color-no-hex, scale-unlimited/declaration-strict-value */
 
 * {
   box-sizing: border-box;
@@ -448,7 +458,9 @@ select,
   padding: 0 56px;
   margin: 0 auto;
   display: grid;
-  /* The NAV is the column that flexes; brand and actions size to their content.
+  /* The ACTIONS cluster is the column that yields; the nav takes max-content
+   * and cannot clip. See kernel.css .topbar-inner for the fit arithmetic —
+   * kernel loads second and is the value that actually applies.
    *
    * This used to be `minmax(180px, 1fr) auto minmax(180px, 1fr)`, which looks
    * symmetric but inverts the shrink behaviour: the middle track was `auto`, so
@@ -463,7 +475,7 @@ select,
    * `auto minmax(0, 1fr) auto` gives actions the width it actually needs and
    * lets the nav shrink (and scroll) instead. This is the same shape the
    * <=860px breakpoint already used, so the desktop rule was the outlier. */
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto max-content minmax(0, 1fr);
   align-items: center;
   gap: 20px;
 }
@@ -490,33 +502,33 @@ select,
 .masthead-nav {
   display: flex;
   align-items: center;
-  /* min-width:0 is what actually lets the 1fr track shrink — a grid item's
-   * automatic minimum size is its content, so without this the nav would still
-   * refuse to yield and we would be back to overlapping. Overflow scrolls
-   * rather than spilling over the actions cluster. */
-  min-width: 0;
-  overflow-x: auto;
-  justify-content: center;
-  scrollbar-width: none;
+  flex-wrap: nowrap;
   gap: 3px;
-  padding: 3px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: rgba(255, 254, 250, 0.64);
-}
-.masthead-nav::-webkit-scrollbar {
-  display: none;
+  /* `overflow-x: auto`, `justify-content: center`, `scrollbar-width: none` and
+   * the ::-webkit-scrollbar suppressor used to live here. Together they made
+   * the nav a hidden-scrollbar strip: centre justification splits any overflow
+   * across BOTH ends, so the first and last items lost equal slices and the
+   * scrollbar that would have revealed it was hidden. The nav column is now
+   * max-content (kernel.css) and cannot overflow, so all four are gone.
+   * The padding/border/border-radius/background that were also here were
+   * already reset to 0/transparent by kernel.css:250 — dead declarations,
+   * removed with them (they carried the only off-scale 9px radius here). */
 }
 /* The org name + email is the widest thing in the actions cluster and is
- * user-controlled, so it must never be allowed to set the header's width. */
-.masthead-actions [data-testid="session-shell"],
-.masthead-actions [data-testid="workos-session-shell"] {
+ * user-controlled, so it must never be allowed to set the header's width.
+ *
+ * These used to select on `[data-testid]`, which is a test hook rather than a
+ * styling hook — and at specificity 0,2,1 they quietly out-ranked every
+ * class-based rule, so the media query that hides this text on a narrow
+ * desktop was a silent no-op. Now that Sidebar.tsx carries real classes, they
+ * select on those. */
+.masthead-session {
   max-width: 170px;
   min-width: 0;
 }
-.masthead-actions [data-testid="session-shell"] span,
-.masthead-actions [data-testid="workos-session-shell"] span {
-  display: block;
+.masthead-session-id strong,
+.masthead-session-id small,
+.masthead-session-email {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2215,19 +2227,28 @@ a.row:hover,
   padding: 0 16px;
   white-space: pre;
 }
+/* Diff ink. These four sat on raw literals or on the base accent/amber, and
+   the panel they sit on is --raised (kernel.css re-declares `.diff` and wins),
+   NOT --surface. Measured against that real background the old values were
+   1.97:1 and 2.10:1 in dark — below even the 3:1 non-text floor, on the screen
+   where a person reviews what an agent changed.
+   The -dim step is used rather than --green/--red because those measure
+   3.91:1 and 4.17:1 here in light: the tinted row is darker than the canvas
+   the base tokens are tuned for. lib/theme-contrast.test.ts holds all eight
+   cells (add/del/hdr/at x light/dark) at >= 4.5:1. */
 .diff .add {
   background: rgba(76, 183, 130, 0.09);
-  color: #1f6b49;
+  color: var(--green-dim);
 }
 .diff .del {
   background: rgba(229, 83, 75, 0.09);
-  color: #a33d36;
+  color: var(--red-dim);
 }
 .diff .hdr {
-  color: var(--accent);
+  color: var(--accent-dim);
 }
 .diff .at {
-  color: var(--amber);
+  color: var(--amber-dim);
 }
 
 /* ─── Forms ──────────────────────────────────────────────────────────── */
@@ -2962,9 +2983,10 @@ pre.token {
   max-width: 1240px;
   min-height: 64px;
   padding: 0 40px;
-  /* Same correction as the base rule above — this override was re-introducing
-   * the non-shrinking middle track and would have undone the fix. */
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  /* Kept in step with the base rule and with kernel.css: the nav column is
+   * max-content, the actions column yields. A stale value here would win over
+   * globals' base rule and silently reinstate the clip. */
+  grid-template-columns: auto max-content minmax(0, 1fr);
 }
 .masthead-brand {
   gap: 10px;
@@ -4833,7 +4855,13 @@ html[data-theme="light"] .cap-row.blocked {
   background: var(--red-tint);
 }
 
-@media (max-width: 760px) {
+/* The masthead collapses to the vertical dropdown here. Raised from 760 to
+   900: .masthead-menu (the hamburger) is display:none at base and only becomes
+   visible inside this block, so 761-860px was a band with full desktop chrome
+   and NO dropdown fallback — and by the fit arithmetic in kernel.css the
+   desktop header cannot fit below ~1165px, let alone 800. A vertical stack
+   cannot clip horizontally, so 900 is where the guarantee has to start. */
+@media (max-width: 900px) {
   .topbar-inner {
     min-height: 60px;
     padding: 0 14px;
@@ -4853,7 +4881,9 @@ html[data-theme="light"] .cap-row.blocked {
   }
   .masthead-state,
   .topbar-action,
-  .masthead-actions [data-testid="session-shell"] {
+  .masthead-session {
+    /* !important because kernel.css loads after this file and sets
+       `.masthead-session { display: flex }` at the same specificity. */
     display: none !important;
   }
   .theme-toggle {
@@ -5621,28 +5651,53 @@ html[data-theme="light"] .docs-body .shiki,
 html[data-theme="light"] .docs-body .shiki span {
   color: var(--shiki-light) !important;
 }
+/* The copy affordance is ALWAYS visible.
+   It used to be opacity:0 until :hover or :focus-visible. Neither fires on a
+   touch tap (:focus-visible is keyboard-gated), so on a phone or tablet the
+   button was permanently invisible — and because opacity:0 does not disable
+   pointer events, it was also blind-tappable. That is precisely the device
+   someone follows a quickstart on. A hover-only reveal cannot be rescued with
+   `@media (hover: none)` either: a touchscreen laptop reports hover:hover.
+   So it sits quietly at reduced opacity and comes forward on interaction. */
 .docs-copy {
   position: absolute;
   top: 8px;
   right: 8px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  padding: 3px 8px;
+  min-height: 24px;
+  padding: 4px 9px;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius);
   background: var(--surface);
   color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 120ms ease;
+  opacity: 0.62;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
 }
 .docs-code:hover .docs-copy,
-.docs-copy:focus-visible {
+.docs-copy:focus-visible,
+.docs-copy:hover {
   opacity: 1;
 }
 .docs-copy:hover {
   color: var(--ink);
   border-color: var(--border-strong);
+}
+/* A failed copy is reported, not swallowed. */
+.docs-copy[data-state="failed"] {
+  opacity: 1;
+  border-color: var(--red);
+  color: var(--red);
+}
+/* Where the pointer is a finger, meet the 44px target. */
+@media (pointer: coarse) {
+  .docs-copy {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 12px;
+    opacity: 1;
+  }
 }
 
 .docs-mermaid {

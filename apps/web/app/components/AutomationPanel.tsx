@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { StateError } from "./state";
 import {
   Agent,
   apiGet,
@@ -259,6 +260,8 @@ export function AutomationActivity({ id }: { id: string }) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [deliveries, setDeliveries] = useState<ResultDelivery[]>([]);
   const [invocations, setInvocations] = useState<TriggerInvocation[]>([]);
+  const [hasSnapshot, setHasSnapshot] = useState(false);
+  const [pollError, setPollError] = useState<unknown>(null);
 
   const poll = useCallback(async () => {
     try {
@@ -270,11 +273,23 @@ export function AutomationActivity({ id }: { id: string }) {
       setSessions(response.sessions);
       setDeliveries(response.deliveries);
       setInvocations(response.invocations || []);
-    } catch {
-      /* Keep the last successful activity snapshot. */
+      setHasSnapshot(true);
+      setPollError(null);
+    } catch (error) {
+      // Keeping the last good snapshot is the right call for a POLL — a blip
+      // should not blank a panel someone is watching. What was wrong is that
+      // before the FIRST success there is no snapshot to keep, so the error
+      // was swallowed and the columns fell through to their empty copy:
+      // "No runs yet." reported an outage as an automation that had never run.
+      setPollError(error);
     }
   }, [id]);
   useSmartPolling(poll, 4000);
+
+  // A failed read is never rendered as empty.
+  if (!hasSnapshot && pollError) {
+    return <StateError error={pollError} onRetry={() => void poll()} />;
+  }
 
   return (
     <div className="automation-activity">

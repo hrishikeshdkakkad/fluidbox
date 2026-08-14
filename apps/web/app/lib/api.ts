@@ -4,6 +4,67 @@
 
 const BASE = "/api/fluidbox";
 
+export type ApiErrorKind = "notFound" | "denied" | "unreachable" | "error";
+
+function defaultDetail(status: number): string {
+  if (status === 0) return "the control plane could not be reached";
+  if (status === 404) return "not found";
+  if (status === 401 || status === 403) return "not permitted";
+  return "the request failed";
+}
+
+/**
+ * A control-plane failure that still knows its HTTP status.
+ *
+ * Every failure used to collapse into a bare `Error` carrying only a string,
+ * so no surface could tell a deleted run (404) from an outage (5xx) from a
+ * dead control plane (transport failure) — which is why a bad run id rendered
+ * an outage card with a Retry that could never succeed.
+ *
+ * `status` is 0 for a transport failure: fetch rejects rather than answering,
+ * and that is exactly the case a caller most needs to distinguish. `message`
+ * deliberately keeps the pre-existing `<status>: <detail>` shape so string
+ * consumers are unaffected; `detail` is the server's own words, which is what
+ * a human-facing surface should render.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly detail: string;
+
+  constructor(status: number, detail: string, options?: ErrorOptions) {
+    const text = detail.trim() || defaultDetail(status);
+    super(`${status}: ${text}`, options);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = text;
+  }
+
+  get kind(): ApiErrorKind {
+    if (this.status === 404) return "notFound";
+    if (this.status === 401 || this.status === 403) return "denied";
+    if (this.status === 0 || this.status >= 500) return "unreachable";
+    return "error";
+  }
+}
+
+/** The text to show a person: the server's own words rather than the
+ *  status-prefixed `message`, and never "[object Object]". */
+export function errorDetail(error: unknown): string {
+  if (error instanceof ApiError) return error.detail;
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+/** Wraps fetch so a transport failure becomes an ApiError with status 0
+ *  instead of a bare TypeError that no surface can classify. */
+async function send(path: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(`${BASE}${path}`, init);
+  } catch (cause) {
+    throw new ApiError(0, defaultDetail(0), { cause });
+  }
+}
+
 // The deployment mode is server-authoritative: the root layout stamps it onto
 // <html data-web-mode>. Only two things vary by mode client-side, and both are
 // presentation, not authorization: writes carry the CSRF header (required in
@@ -40,10 +101,10 @@ const inflightGets = new Map<string, Promise<unknown>>();
 let cacheGeneration = 0;
 
 async function fetchGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { cache: "no-store" });
+  const res = await send(path, { cache: "no-store" });
   if (!res.ok) {
     redirectOnUnauthorized(res);
-    throw new Error(`${res.status}: ${await res.text()}`);
+    throw new ApiError(res.status, await res.text());
   }
   return res.json();
 }
@@ -103,62 +164,45 @@ export async function apiGetCached<T = unknown>(
   return value;
 }
 
-export async function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...CSRF_HEADERS },
-    body: JSON.stringify(body),
+/**
+ * The one write path. POST/PUT/PATCH/DELETE were four byte-identical copies
+ * apart from the verb, which is how four of the five throw sites drifted into
+ * a different message shape from the GET helper. One implementation means one
+ * place where a failure becomes an ApiError.
+ */
+async function mutate<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> =
+    body === undefined ? { ...CSRF_HEADERS } : { "content-type": "application/json", ...CSRF_HEADERS };
+  const res = await send(path, {
+    method,
+    headers,
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const text = await res.text();
   if (!res.ok) {
     redirectOnUnauthorized(res);
-    throw new Error(text || `${res.status}`);
+    throw new ApiError(res.status, text);
   }
   invalidateApiCache();
-  return text ? JSON.parse(text) : ({} as T);
+  return text ? (JSON.parse(text) as T) : ({} as T);
 }
 
-export async function apiPut<T = unknown>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "PUT",
-    headers: { "content-type": "application/json", ...CSRF_HEADERS },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    redirectOnUnauthorized(res);
-    throw new Error(text || `${res.status}`);
-  }
-  invalidateApiCache();
-  return text ? JSON.parse(text) : ({} as T);
+export function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
+  return mutate<T>("POST", path, body);
+}
+
+export function apiPut<T = unknown>(path: string, body: unknown): Promise<T> {
+  return mutate<T>("PUT", path, body);
 }
 
 // No call sites yet — this exists so a future partial-update goes through the
 // sanctioned surface (CSRF header + 401→/login) instead of a raw fetch.
-export async function apiPatch<T = unknown>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: "PATCH",
-    headers: { "content-type": "application/json", ...CSRF_HEADERS },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    redirectOnUnauthorized(res);
-    throw new Error(text || `${res.status}`);
-  }
-  invalidateApiCache();
-  return text ? JSON.parse(text) : ({} as T);
+export function apiPatch<T = unknown>(path: string, body: unknown): Promise<T> {
+  return mutate<T>("PATCH", path, body);
 }
 
-export async function apiDelete<T = unknown>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method: "DELETE", headers: { ...CSRF_HEADERS } });
-  const text = await res.text();
-  if (!res.ok) {
-    redirectOnUnauthorized(res);
-    throw new Error(text || `${res.status}`);
-  }
-  invalidateApiCache();
-  return text ? JSON.parse(text) : ({} as T);
+export function apiDelete<T = unknown>(path: string): Promise<T> {
+  return mutate<T>("DELETE", path);
 }
 
 export function streamUrl(sessionId: string): string {
@@ -501,7 +545,7 @@ export async function fetchConnectionTools(id: string): Promise<ConnectionToolSn
     const r = await apiGet<{ snapshot: ConnectionToolSnapshot }>(`/connections/${id}/tools`);
     return r.snapshot;
   } catch (e) {
-    if (e instanceof Error && e.message.startsWith("404")) return null;
+    if (e instanceof ApiError && e.status === 404) return null;
     throw e;
   }
 }
