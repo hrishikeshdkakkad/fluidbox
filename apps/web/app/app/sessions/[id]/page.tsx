@@ -17,6 +17,7 @@ import {
 } from "../../../lib/api";
 import { ApprovalActions } from "../../../components/ApprovalActions";
 import { Pill, AutoPill, DiffView, LoadingRows, short } from "../../../components/bits";
+import { StateError } from "../../../components/state";
 import { useSmartPolling } from "../../../lib/useSmartPolling";
 
 export default function SessionDetail({ params }: { params: Promise<{ id: string }> }) {
@@ -30,6 +31,10 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
   const [loading, setLoading] = useState(true);
   const [hasSnapshot, setHasSnapshot] = useState(false);
   const [loadError, setLoadError] = useState("");
+  /** The rejection reason of the CORE /sessions/{id} read, kept as-is rather
+   *  than flattened to a string: it is what tells a deleted run (404) apart
+   *  from an outage, and offering "Retry now" for a 404 was the defect. */
+  const [coreError, setCoreError] = useState<unknown>(null);
   const [actionError, setActionError] = useState("");
   const [actingOn, setActingOn] = useState<string | null>(null);
   const [streamReconnecting, setStreamReconnecting] = useState(false);
@@ -48,8 +53,10 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
       setSession(core.value.session);
       setUsage(core.value.usage);
       setHasSnapshot(true);
+      setCoreError(null);
     } else {
       failed.push("run");
+      setCoreError(core.reason);
     }
     if (approvalResult.status === "fulfilled") {
       setApprovals(approvalResult.value.approvals);
@@ -199,30 +206,26 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
       {actionError && <div className="err" role="alert">{actionError}</div>}
 
       {!hasSnapshot ? (
-        <div className="panel">
+        <>
           {loading ? (
-            <LoadingRows />
-          ) : (
-            <div className="launch-empty">
-              <div>
-                <h3>Run detail is unavailable.</h3>
-                <p>No cost, usage, or activity assumptions were made from the failed response.</p>
-              </div>
-              <div className="empty-actions">
-                <button
-                  className="btn"
-                  type="button"
-                  onClick={() => {
-                    setLoading(true);
-                    void loadMeta();
-                  }}
-                >
-                  Retry now
-                </button>
-              </div>
+            <div className="panel">
+              <LoadingRows />
             </div>
+          ) : (
+            // Reads the status: a deleted or mistyped run id renders
+            // not-found (no Retry — retrying a 404 can never succeed), while a
+            // 5xx or a dead control plane renders the outage card that does
+            // offer one. This used to be a single hand-rolled outage card for
+            // every failure.
+            <StateError
+              error={coreError}
+              onRetry={() => {
+                setLoading(true);
+                void loadMeta();
+              }}
+            />
           )}
-        </div>
+        </>
       ) : (
       <>
       {/* Approval banners */}

@@ -74,12 +74,6 @@ export function Sidebar({
   }, []);
   useSmartPolling(poll, 8000, true);
 
-  const resourcesActive = ["/app/agents", "/app/capabilities", "/app/integrations"].some(
-    (route) => pathname.startsWith(route)
-  );
-  const activityActive = ["/app/sessions", "/app/automations"].some(
-    (route) => pathname.startsWith(route)
-  );
   const closeMobileNav = () => setMobileOpen(false);
 
   return (
@@ -102,18 +96,15 @@ export function Sidebar({
           >
             Overview
           </Link>
-          <Link
-            className={resourcesActive ? "active" : ""}
-            href="/app#configuration"
-            onNavigate={closeMobileNav}
-          >
+          {/* Resources and Activity are jump-links to sections of the Overview
+              page, not routes. They deliberately carry no `active` class: the
+              you-are-here highlight is reserved for a page you are actually on,
+              and lighting "Resources" while the URL reads /app/agents told the
+              user something untrue. */}
+          <Link href="/app#configuration" onNavigate={closeMobileNav}>
             Resources
           </Link>
-          <Link
-            className={activityActive ? "active" : ""}
-            href="/app#operations"
-            onNavigate={closeMobileNav}
-          >
+          <Link href="/app#operations" onNavigate={closeMobileNav}>
             Activity
             {pending > 0 && <span className="masthead-count">{pending}</span>}
           </Link>
@@ -169,26 +160,22 @@ export function Sidebar({
             <span className={`signal ${online ? "" : "down"}`} />
             <span>{online ? "Operational" : "Offline"}</span>
           </div>
-          <Link className="topbar-action" href="/app?action=new-run">
-            New Run
-          </Link>
+          {/* No desktop "New Run" here. Every page that can start a run renders
+              its own primary (e.g. app/app/page.tsx), so this was a second dark
+              primary competing with it — and its 76px (90px with the gap) is
+              exactly what the header needed to stop clipping the nav. The
+              mobile dropdown keeps its own .mobile-primary-action above, where
+              no page primary is in view. */}
           <ThemeToggle />
+          {/* Classes, not inline style. An inline `display` cannot be
+              overridden by a stylesheet, so the compact-desktop rule that hides
+              the identity text below 1280px was silently a no-op while these
+              were style={{…}} — the header kept overflowing by 20px. */}
           {workosSession && (
-            <div
-              style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}
-              data-testid="workos-session-shell"
-            >
+            <div className="masthead-session" data-testid="workos-session-shell">
               <span
+                className="masthead-session-email"
                 title={`${workosSession.label} · ${workosSession.email}`}
-                style={{
-                  fontSize: 11.5,
-                  color: "var(--ds-gray-800)",
-                  fontFamily: "var(--font-mono)",
-                  maxWidth: 150,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
               >
                 {workosSession.email}
               </span>
@@ -202,25 +189,11 @@ export function Sidebar({
             </div>
           )}
           {mode === "sso" && me?.user && (
-            <div
-              style={{ display: "flex", alignItems: "center", gap: 10 }}
-              data-testid="session-shell"
-            >
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  lineHeight: 1.15,
-                  textAlign: "right",
-                }}
-              >
-                <span style={{ fontSize: 12, color: "var(--ds-gray-1000)", fontWeight: 500 }}>
-                  {me.org?.display_name ?? me.org?.slug ?? ""}
-                </span>
-                <span style={{ fontSize: 11, color: "var(--ds-gray-800)" }}>
-                  {me.user.email}
-                </span>
-              </div>
+            <div className="masthead-session" data-testid="session-shell">
+              <span className="masthead-session-id">
+                <strong>{me.org?.display_name ?? me.org?.slug ?? ""}</strong>
+                <small>{me.user.email}</small>
+              </span>
               <button className="btn sm ghost" onClick={() => void logout()}>
                 Log out
               </button>
