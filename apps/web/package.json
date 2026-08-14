@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "lint:css": "stylelint 'app/**/*.css' --max-warnings 59",
+    "lint:css": "stylelint 'app/**/*.css' --max-warnings 10",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

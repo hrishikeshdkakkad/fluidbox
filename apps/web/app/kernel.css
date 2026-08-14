@@ -230,9 +230,19 @@ html {
   background: var(--bg);
 }
 
+/* Kept as its own block rather than folded into the dark token block above,
+   which is why one no-duplicate-selectors warning survives here.
+   SEPARATE, PRE-EXISTING BUG worth its own fix: measured on the running app,
+   `getComputedStyle(html).colorScheme` reports `light` even when
+   data-theme="dark" — verified BOTH with and without the fold, so the fold is
+   not the cause. Lightning CSS rewrites color-scheme into a paired
+   --lightningcss-light/--lightningcss-dark mechanism, and something in that
+   path is not resolving. Consequence: native scrollbars, form controls and
+   the browser's own UI stay in light mode on a dark page. */
 html[data-theme="dark"] {
   color-scheme: dark;
 }
+
 
 body {
   background: var(--bg);
