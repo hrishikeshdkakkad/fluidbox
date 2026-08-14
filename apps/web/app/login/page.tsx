@@ -49,15 +49,22 @@ async function sessionIsLive(cookieValue: string): Promise<boolean> {
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ next?: string }>;
+  searchParams: Promise<{ next?: string; error?: string }>;
 }) {
   if (webMode(process.env.FLUIDBOX_WEB_MODE) === "admin") {
     redirect("/app");
   }
-  const next = sanitizeNext((await searchParams).next);
+  const params = await searchParams;
+  const next = sanitizeNext(params.next);
   const session = (await cookies()).get(SESSION_COOKIE)?.value;
   if (session && (await sessionIsLive(session))) {
     redirect(next);
   }
-  return <LoginForm redirectTo={next} />;
+  // The control plane redirects its neutral refusal here (login.rs
+  // `neutral_unavailable`). The parameter is untrusted, so it is NARROWED to a
+  // known token rather than passed through — the form renders fixed copy for
+  // that token and nothing at all for anything else. Never render the raw
+  // value: it is attacker-controlled text on a pre-auth page.
+  const error = params.error === "unavailable" ? "unavailable" : null;
+  return <LoginForm redirectTo={next} error={error} />;
 }
