@@ -408,8 +408,15 @@ body {
 .masthead-session-id {
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
+  /* STRETCH, not flex-end. A flex-end child shrink-wraps its text and may
+     exceed this box, and text-overflow can only ellipsise a child that is
+     actually constrained — with flex-end the 137px email overflowed its 100px
+     column and ran 22px under the theme toggle. Stretch makes each line fill
+     the box so the ellipsis fires; text-align keeps the right edge flush,
+     which is what flex-end was really there for. */
+  align-items: stretch;
   min-width: 0;
+  overflow: hidden;
   line-height: 1.15;
   text-align: right;
 }
@@ -537,9 +544,13 @@ h1.title {
   line-height: 1.5;
 }
 
-.dashboard-header > .btn {
-  display: none;
-}
+/* The page's own primary is VISIBLE on desktop.
+   It used to be display:none here, because the masthead carried a duplicate
+   "New Run" and two dark primaries per view is one too many. The masthead copy
+   is gone (Sidebar.tsx), so hiding this one left the dashboard with NO way to
+   start a run at all on desktop — the audit reported that the page "already
+   renders its own primary" from the JSX without checking that CSS hid it.
+   The <=900 block below still re-states display for the mobile layout. */
 
 .crumbs {
   margin-bottom: 8px;
