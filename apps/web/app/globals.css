@@ -6245,6 +6245,24 @@ html[data-theme="light"] .docs-body .shiki span {
   text-decoration-thickness: 1px;
   text-underline-offset: 6px;
 }
+/* Session-aware chrome.
+   BOTH variants ship in the HTML — that is what lets the marketing pages stay
+   statically generated while still showing a signed-in reader the way home.
+   `data-session` is stamped on <html> before first paint (lib/session-hint),
+   so the right one is visible from the very first frame; there is no swap.
+   The default is signed-OUT, so a browser with JS disabled, or a stamp that
+   never ran, offers "Log In" rather than a dashboard link a stranger cannot
+   use. Failing toward the public state is the safe direction. */
+.site-when-in {
+  display: none;
+}
+html[data-session="in"] .site-when-in {
+  display: inline-flex;
+}
+html[data-session="in"] .site-when-out {
+  display: none;
+}
+
 .site-actions {
   display: flex;
   align-items: center;

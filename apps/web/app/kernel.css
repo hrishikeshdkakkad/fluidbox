@@ -232,13 +232,15 @@ html {
 
 /* Kept as its own block rather than folded into the dark token block above,
    which is why one no-duplicate-selectors warning survives here.
-   SEPARATE, PRE-EXISTING BUG worth its own fix: measured on the running app,
-   `getComputedStyle(html).colorScheme` reports `light` even when
-   data-theme="dark" — verified BOTH with and without the fold, so the fold is
-   not the cause. Lightning CSS rewrites color-scheme into a paired
-   --lightningcss-light/--lightningcss-dark mechanism, and something in that
-   path is not resolving. Consequence: native scrollbars, form controls and
-   the browser's own UI stay in light mode on a dark page. */
+
+   This rule is a FALLBACK, not the primary mechanism. The theme is applied by
+   ThemeToggle.tsx:23-24 and THEME_INIT_SCRIPT, which set BOTH `data-theme` and
+   an inline `style.colorScheme` on <html> — and an inline style beats any
+   stylesheet. This declaration only matters if that script has not run.
+   (An earlier comment here claimed color-scheme was broken in dark mode. It is
+   not: that measurement set data-theme by hand while the init script's inline
+   `color-scheme: light` was still on the element, so the inline style won.
+   Verified via the real toggle path — both mechanisms compute `dark`.) */
 html[data-theme="dark"] {
   color-scheme: dark;
 }
@@ -441,6 +443,34 @@ body {
   font-size: 11.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The public/private boundary in the chrome.
+   Both variants are rendered so the marketing pages stay STATICALLY generated;
+   `data-session` (stamped before first paint by lib/session-hint) decides which
+   one is shown, so there is no post-hydration swap.
+
+   !important because this is a visibility SWITCH, not a style preference: if
+   it loses, a signed-out visitor is shown a dashboard link they cannot use, or
+   a signed-in one is told to log in. Measured, `html .site-when-in` (0,1,1)
+   still lost to the header's own descendant button rules (0,2,0). Rather than
+   escalate specificity and lose again to the next rule someone adds, this
+   follows the precedent already set for the masthead's own chrome toggles
+   (globals.css: `.masthead-state, .topbar-action { display: none !important }`).
+
+   The default is SIGNED OUT: if the script has not run, cookies are off, or
+   the attribute is anything unexpected, a visitor is offered "Log In" rather
+   than a dashboard link they cannot use. Fail toward the public chrome. */
+html .site-when-in {
+  display: none !important;
+}
+
+html[data-session="in"] .site-when-in {
+  display: inline-flex !important;
+}
+
+html[data-session="in"] .site-when-out {
+  display: none !important;
 }
 
 /* Compact desktop, 901-1280.
