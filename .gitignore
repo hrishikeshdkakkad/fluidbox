@@ -41,3 +41,6 @@ deploy/cloud/terraform/**/terraform.tfstate
 deploy/cloud/terraform/**/terraform.tfstate.*
 deploy/cloud/terraform/**/*.tfvars
 !deploy/cloud/terraform/**/*.auto.tfvars.example
+
+# Playwright MCP page-snapshot dumps (browser tooling cache)
+.playwright-mcp/
