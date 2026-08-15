@@ -962,10 +962,11 @@ h1.title {
   flex-direction: column;
 }
 .run-row {
+  position: relative;
   min-height: 78px;
   padding: 14px 18px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 76px;
+  grid-template-columns: minmax(0, 1fr) auto 76px 14px;
   align-items: center;
   gap: 14px;
   border-bottom: 1px solid var(--border);
@@ -1657,6 +1658,8 @@ h1.title {
   display: grid;
   grid-template-columns: 66px minmax(0, 1fr) auto;
   align-items: center;
+  /* The whole row navigates (AutomationPanel guards inner buttons/links). */
+  cursor: pointer;
   gap: 14px;
 }
 .automation-glyph {
@@ -3924,7 +3927,8 @@ a.row:hover,
   .run-row {
     grid-template-columns: minmax(0, 1fr) auto;
   }
-  .run-time {
+  .run-time,
+  .run-row .run-arrow {
     display: none;
   }
   .launch-empty {
@@ -8091,4 +8095,526 @@ a.st-use:hover p {
   .recipe-detail-grid { grid-template-columns: 1fr; }
   .recipe-row { grid-template-columns: minmax(0, 1fr) 100px; }
   .recipe-row span:nth-child(2), .recipe-row span:nth-child(4), .recipe-row span:nth-child(5) { display: none; }
+}
+
+/* ── Activity workbench: the pulse + triage layer ─────────────────────────
+   The pulse is the page's signature: 24 hour-aligned bars, height = volume,
+   colour = the WORST outcome of that hour (failed > waiting > live > clean) —
+   the same fail-closed precedence the gate uses. Everything below derives
+   from the polled sessions list; colours come only from the token layer. */
+.activity-pulse {
+  margin: 0 0 44px;
+  padding: 16px 18px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-soft);
+  box-shadow: var(--panel-shadow);
+  animation: enter 0.5s 0.05s ease both;
+}
+.pulse-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 46px;
+}
+.pulse-bar {
+  flex: 1 1 0;
+  min-width: 0;
+  height: var(--pulse-h, 0%);
+  min-height: 2px;
+  background: var(--border-strong);
+  transform-origin: bottom;
+  animation: pulse-grow 0.45s ease both;
+}
+.pulse-bar.idle {
+  opacity: 0.5;
+}
+.pulse-bar.cancelled {
+  background: var(--border-strong);
+}
+.pulse-bar.completed {
+  background: var(--green);
+  opacity: 0.75;
+}
+.pulse-bar.live {
+  background: var(--accent);
+  animation:
+    pulse-grow 0.45s ease both,
+    pulse-breathe 1.8s ease-in-out 0.5s infinite;
+}
+.pulse-bar.attention {
+  background: var(--amber);
+}
+.pulse-bar.failed {
+  background: var(--red);
+}
+@keyframes pulse-grow {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+@keyframes pulse-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.pulse-readout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 10px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: lowercase;
+}
+.pulse-count b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.pulse-live {
+  color: var(--accent);
+}
+.pulse-attention {
+  color: var(--amber);
+}
+.pulse-failed {
+  color: var(--red);
+}
+.pulse-completed {
+  color: var(--green);
+}
+.pulse-quiet {
+  color: var(--ink-3);
+}
+
+/* Status filter chips: mono lowercase, square per the kernel language. */
+.run-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.run-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: none;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: lowercase;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    color 0.15s,
+    background 0.15s;
+}
+.run-filter:hover {
+  border-color: var(--border-strong);
+  color: var(--ink);
+}
+.run-filter b {
+  color: var(--ink-3);
+  font-weight: 500;
+}
+.run-filter.on {
+  border-color: var(--border-strong);
+  background: var(--interactive-subtle);
+  color: var(--ink);
+}
+.run-filter.on b {
+  color: inherit;
+}
+.run-filter.live.on {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  color: var(--accent-dim);
+}
+.run-filter.attention.on {
+  border-color: var(--amber);
+  background: var(--amber-tint);
+  color: var(--amber-dim);
+}
+.run-filter.failed.on {
+  border-color: var(--red);
+  background: var(--red-tint);
+  color: var(--red-dim);
+}
+.run-filter.completed.on {
+  border-color: var(--green);
+  background: var(--green-tint);
+  color: var(--green-dim);
+}
+
+/* Day dividers inside the shared run list (activity only, via `grouped`). */
+.run-day-label {
+  padding: 7px 18px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--interactive-subtle);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+.run-day + .run-day .run-day-label {
+  border-top: 1px solid var(--border);
+}
+
+/* The status rail: scanning the left edge reads the red/green pattern
+   without reading a single row. Live runs breathe. */
+.run-row::before,
+.run-tr::before {
+  content: "";
+  position: absolute;
+  top: 14px;
+  bottom: 14px;
+  left: 0;
+  width: 2px;
+  background: none;
+}
+.run-row.rail-live::before,
+.run-tr.rail-live::before {
+  background: var(--accent);
+  animation: pulse-breathe 1.8s ease-in-out infinite;
+}
+.run-row.rail-attention::before,
+.run-tr.rail-attention::before {
+  background: var(--amber);
+}
+.run-row.rail-failed::before,
+.run-tr.rail-failed::before {
+  background: var(--red);
+}
+.run-row.rail-completed::before,
+.run-tr.rail-completed::before {
+  background: var(--green);
+  opacity: 0.55;
+}
+.run-row.rail-cancelled::before,
+.run-tr.rail-cancelled::before {
+  background: var(--border-strong);
+}
+.run-agent {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.launch-empty.slim {
+  min-height: 150px;
+  padding: 30px 48px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse-bar,
+  .pulse-bar.live,
+  .run-row.rail-live::before,
+  .run-tr.rail-live::before {
+    animation: none;
+  }
+}
+@media (max-width: 640px) {
+  .pulse-bars {
+    gap: 3px;
+    height: 38px;
+  }
+  .run-filters {
+    gap: 5px;
+  }
+}
+
+/* ── Standalone resources page framing ────────────────────────────────
+   /app/resources renders PageHead("resources") ABOVE the shared
+   ResourceOverview section, whose own h2/p would read as a duplicate
+   heading. Hide the words, keep the readiness chip. */
+.resources-standalone .configuration-head > div:first-child {
+  display: none;
+}
+.resources-standalone .configuration-head {
+  justify-content: flex-end;
+  margin-bottom: 14px;
+}
+
+/* ── The run table (activity workbench) ───────────────────────────────
+   Real columns under a mono header: run · agent · trigger · status · age.
+   Shares the day-divider and rail language with the compact run rows. */
+.run-thead {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px 90px 170px 64px 14px;
+  gap: 14px;
+  padding: 9px 18px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--interactive-subtle);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+.run-th-age {
+  text-align: right;
+}
+.run-tr {
+  position: relative;
+  min-height: 64px;
+  padding: 11px 18px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px 90px 170px 64px 14px;
+  gap: 14px;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  color: inherit;
+  text-decoration: none;
+  transition: background 0.15s ease;
+}
+.run-tr:hover {
+  background: var(--surface-hover);
+}
+.run-table > div:last-child .run-tr:last-child {
+  border-bottom: 0;
+}
+.run-td-task {
+  min-width: 0;
+}
+.run-td-task strong {
+  display: block;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-td-task small {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-td-agent {
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-kind {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: lowercase;
+}
+.run-td-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.run-td-age {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: right;
+}
+.run-tr .run-arrow {
+  width: 14px;
+  height: 14px;
+  color: var(--ink-3);
+  transition: transform 0.15s, color 0.15s;
+}
+.run-tr:hover .run-arrow {
+  color: var(--ink);
+  transform: translateX(2px);
+}
+@media (max-width: 900px) {
+  .run-thead {
+    display: none;
+  }
+  .run-tr {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+  }
+  .run-td-agent,
+  .run-td-trigger,
+  .run-td-age,
+  .run-tr .run-arrow {
+    display: none;
+  }
+}
+
+/* ── The agents table ─────────────────────────────────────────────────
+   Same table language as run history: mono header, whole-row control
+   (the row button expands the revision history), chevron affordance. */
+.agent-thead {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) 140px 180px 130px 90px 14px;
+  gap: 14px;
+  padding: 9px 18px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--interactive-subtle);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+.agent-th-revs {
+  text-align: right;
+}
+.agent-tr {
+  width: 100%;
+  min-height: 64px;
+  padding: 11px 18px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) 140px 180px 130px 90px 14px;
+  gap: 14px;
+  align-items: center;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.agent-tr:hover {
+  background: var(--surface-hover);
+}
+.agent-table > div:last-child > .agent-tr[aria-expanded="false"]:last-child {
+  border-bottom: 0;
+}
+.agent-td-name {
+  min-width: 0;
+}
+.agent-td-name strong {
+  display: block;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13.5px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-td-name small {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-td-mono {
+  overflow: hidden;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-td-revs {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
+}
+.agent-chevron {
+  width: 14px;
+  height: 14px;
+  color: var(--ink-3);
+  transform: rotate(-90deg);
+  transition: transform 0.15s ease, color 0.15s ease;
+}
+.agent-chevron.open {
+  transform: rotate(0deg);
+}
+.agent-tr:hover .agent-chevron {
+  color: var(--ink);
+}
+
+/* The expanded revision history: a quiet inset sub-table. */
+.agent-revisions {
+  padding: 4px 18px 16px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  background: var(--interactive-subtle);
+}
+.rev-table {
+  min-width: 760px;
+}
+.rev-thead,
+.rev-tr {
+  display: grid;
+  grid-template-columns: 96px 130px 180px 120px minmax(0, 1fr) 130px;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.rev-thead {
+  padding: 10px 0 6px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+.rev-tr {
+  font-size: 12px;
+}
+.rev-tr:last-child {
+  border-bottom: 0;
+}
+.rev-tr .mono {
+  overflow: hidden;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rev-tr .badge {
+  margin-left: 8px;
+}
+.rev-details {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rev-image {
+  color: var(--ink-3);
+}
+
+@media (max-width: 900px) {
+  .agent-thead {
+    display: none;
+  }
+  .agent-tr {
+    grid-template-columns: minmax(0, 1fr) 14px;
+  }
+  .agent-td-mono,
+  .agent-td-revs,
+  .agent-tr > span:nth-child(4) {
+    display: none;
+  }
 }

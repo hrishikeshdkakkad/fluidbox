@@ -99,10 +99,15 @@
   --selection-bg: rgba(129, 179, 0, 0.25);
   --scrollbar: var(--ds-gray-300);
   --scrollbar-hover: var(--ds-gray-500);
-  --panel-shadow: none;
+  /* 2026-08-14 warmth pass (cerebras learnings): panels carry a soft real
+     shadow, the shell glows from one corner, and the flood accent gets a
+     bloom for filled controls. Literals stay in this token layer. */
+  --panel-shadow: 0 1px 2px rgba(28, 32, 36, 0.04), 0 10px 30px rgba(28, 32, 36, 0.06);
+  --canvas-glow: rgba(129, 179, 0, 0.09);
+  --flood-glow: 0 6px 22px rgba(129, 179, 0, 0.3);
   --modal-shadow: 0 24px 70px rgba(28, 32, 36, 0.18);
-  --radius: 4px;
-  --radius-lg: 8px;
+  --radius: 6px;
+  --radius-lg: 12px;
   --hairline: 0.5px;
 
   /* Third-party brand marks. These are other companies' identities, not our
@@ -156,10 +161,13 @@
    other rule in this file must reach a colour through a custom property;
    the gate enforces that, and this comment is the visible boundary. */
 html[data-theme="dark"] {
-  /* kernel.sh's dark sections: charcoal, never black. */
-  --ds-background-100: #191a1c;
-  --ds-background-200: #212225;
-  --ds-gray-100: #26282c;
+  /* kernel.sh's dark sections: deep charcoal, never black — deepened one
+     step (2026-08-14) so cards visibly sit ABOVE the canvas instead of
+     dissolving into it. Ink tokens are near-white, so deeper surfaces only
+     raise every contrast ratio the theme-contrast suite asserts. */
+  --ds-background-100: #131417;
+  --ds-background-200: #1c1d21;
+  --ds-gray-100: #232428;
   --ds-gray-200: #2c2e33;
   --ds-gray-300: #33363b;
   --ds-gray-400: #3d4046;
@@ -209,18 +217,20 @@ html[data-theme="dark"] {
   --green-tint: var(--ds-green-100);
   --red: var(--ds-red-700);
   --red-tint: var(--ds-red-100);
-  --chrome-bg: rgba(25, 26, 28, 0.92);
+  --chrome-bg: rgba(19, 20, 23, 0.9);
   --interactive-subtle: var(--ds-gray-alpha-100);
   --interactive-hover: var(--ds-gray-alpha-200);
-  --control-bg: #212225;
+  --control-bg: #1c1d21;
   --primary-bg: #edeef0;
   --primary-hover: #ffffff;
   --primary-ink: #1c2024;
-  --overlay-bg: rgba(10, 11, 12, 0.6);
+  --overlay-bg: rgba(8, 9, 10, 0.62);
   --selection-bg: rgba(129, 179, 0, 0.3);
   --scrollbar: var(--ds-gray-300);
   --scrollbar-hover: var(--ds-gray-500);
-  --panel-shadow: none;
+  --panel-shadow: 0 1px 0 rgba(237, 238, 240, 0.03) inset, 0 14px 40px rgba(0, 0, 0, 0.32);
+  --canvas-glow: rgba(129, 179, 0, 0.07);
+  --flood-glow: 0 6px 24px rgba(129, 179, 0, 0.22);
   --modal-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
 }
 /* stylelint-enable color-no-hex, scale-unlimited/declaration-strict-value */
@@ -379,8 +389,9 @@ body {
 }
 
 .masthead-nav a.active {
-  background: var(--ds-gray-alpha-200);
-  color: var(--ds-gray-1000);
+  background: var(--accent-tint);
+  color: var(--accent-dim);
+  font-weight: 500;
 }
 
 /* The out-of-app marker on the docs link: that click leaves the dashboard for
@@ -564,10 +575,10 @@ h1.title {
   margin: 0;
   color: var(--ds-gray-1000);
   font-family: var(--font-sans);
-  font-size: 33px;
-  font-weight: 300;
-  line-height: 1.2;
-  letter-spacing: 0.02em;
+  font-size: 40px;
+  font-weight: 350;
+  line-height: 1.12;
+  letter-spacing: -0.01em;
   text-transform: lowercase;
 }
 
@@ -635,18 +646,18 @@ h1.title {
   text-transform: lowercase;
 }
 
-/* Materials — hairline-bordered boxes, no shadows (kernel keeps panels
-   square; only small controls take the 4px radius). */
+/* Materials — cards now sit visibly above the canvas: soft border, real
+   radius, and the token shadow (2026-08-14 warmth pass). */
 
 .panel,
 .run-list,
 .configuration-loading,
 .feature-card,
 .overview-panel {
-  border: var(--hairline) solid var(--border-strong);
-  border-radius: 0;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
   background: var(--surface);
-  box-shadow: none;
+  box-shadow: var(--panel-shadow);
 }
 
 .panel.pad {
@@ -786,60 +797,62 @@ h1.title {
   background: var(--gold);
 }
 
+/* Resources — real tone-coloured cards (2026-08-14 warmth pass): the
+   3-up grid returns, each card keyed by its tone colour (glyph tile, count
+   chip, and the soft ::after bloom all ride currentColor from globals). */
+
 .resource-grid {
-  display: block;
-  overflow: hidden;
-  border: var(--hairline) solid var(--border-strong);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  overflow: visible;
+  border: 0;
   border-radius: 0;
-  background: var(--surface);
+  background: transparent;
   box-shadow: none;
 }
 
 .resource-card,
 .resource-card + .resource-card {
-  min-height: 96px;
-  padding: 16px;
-  display: grid;
-  grid-template-columns: 36px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 14px;
-  overflow: visible;
-  border: 0;
-  border-bottom: var(--hairline) solid var(--border);
-  border-radius: 0;
+  min-height: 250px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  overflow: hidden;
+  /* The whole card navigates (ResourceCard guards inner buttons/links). */
+  cursor: pointer;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
   background: var(--surface);
-  color: var(--ds-gray-1000);
-  transition: background 0.15s ease;
-}
-
-.resource-card:last-child {
-  border-bottom: 0;
+  box-shadow: var(--panel-shadow);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease;
 }
 
 .resource-card:hover {
-  border-color: var(--border);
-  background: var(--accent-tint);
-  transform: none;
-}
-
-.resource-card::after {
-  display: none;
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  transform: translateY(-2px);
 }
 
 .resource-glyph {
-  width: 36px;
-  height: 36px;
-  border: var(--hairline) solid var(--border-strong);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--ds-gray-1000);
+  width: 40px;
+  height: 40px;
+  margin-bottom: 14px;
+  border: var(--hairline) solid currentColor;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, currentColor 12%, transparent);
 }
 
 .resource-glyph svg {
-  width: 17px;
-  height: 17px;
+  width: 19px;
+  height: 19px;
   stroke: currentColor;
-  stroke-width: 1.2;
+  stroke-width: 1.4;
 }
 
 .resource-card-content {
@@ -856,7 +869,7 @@ h1.title {
   margin: 0;
   color: var(--ds-gray-1000);
   font-family: var(--font-sans);
-  font-size: 14.5px;
+  font-size: 17px;
   font-weight: 500;
   letter-spacing: 0;
   text-transform: lowercase;
@@ -864,6 +877,7 @@ h1.title {
 
 .resource-eyebrow {
   order: 3;
+  margin-left: auto;
   padding: 2px 8px;
   border: var(--hairline) solid var(--border-strong);
   border-radius: var(--radius);
@@ -889,15 +903,15 @@ h1.title {
 
 .resource-card > .resource-card-content > p {
   min-height: 0;
-  margin: 3px 0 0;
+  margin: 7px 0 0;
   color: var(--ds-gray-900);
   font-size: 13px;
-  line-height: 1.4;
+  line-height: 1.55;
 }
 
 .resource-items {
   min-height: 0;
-  margin-top: 7px;
+  margin-top: 12px;
   gap: 5px;
 }
 
@@ -912,13 +926,14 @@ h1.title {
 
 .resource-actions {
   min-height: 0;
-  margin: 0;
-  padding: 0;
+  margin: auto 0 0;
+  padding: 16px 0 0;
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 10px;
   border: 0;
+  border-top: var(--hairline) solid var(--border);
 }
 
 .text-action {
@@ -961,16 +976,18 @@ h1.title {
 }
 
 .btn.primary {
-  border-color: var(--ds-gray-1000);
-  background: var(--ds-gray-1000);
-  color: var(--ds-background-100);
-  box-shadow: none;
-}
-
-.btn.primary:hover {
   border-color: var(--flood);
   background: var(--flood);
   color: var(--flood-ink);
+  font-weight: 500;
+  box-shadow: var(--flood-glow);
+}
+
+.btn.primary:hover {
+  border-color: var(--accent-dim);
+  background: var(--accent-dim);
+  color: var(--flood-ink);
+  transform: translateY(-1px);
 }
 
 .btn.human {
@@ -1622,14 +1639,7 @@ pre.token,
   .resource-card,
   .resource-card + .resource-card {
     min-height: 0;
-    padding: 14px;
-    grid-template-columns: 36px minmax(0, 1fr);
-    align-items: start;
-  }
-
-  .resource-actions {
-    grid-column: 2;
-    justify-content: flex-start;
+    padding: 16px;
   }
 
   .connector-card {

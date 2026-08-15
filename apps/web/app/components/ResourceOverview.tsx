@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   Agent,
   apiGetCached,
@@ -155,6 +156,7 @@ export function ResourceOverview({
         <div className="resource-grid">
           <ResourceCard
             tone="agent"
+            href="/app/agents"
             eyebrow="Required"
             title="Agents"
             count={snapshot.agents.length}
@@ -170,6 +172,7 @@ export function ResourceOverview({
 
           <ResourceCard
             tone="integration"
+            href="/app/integrations"
             eyebrow="Optional"
             title="Integrations"
             count={activeConnections.length}
@@ -193,6 +196,7 @@ export function ResourceOverview({
 
           <ResourceCard
             tone="capability"
+            href="/app/capabilities"
             eyebrow="Optional"
             title="MCP"
             count={latestBundles.length}
@@ -213,6 +217,7 @@ export function ResourceOverview({
 
 function ResourceCard({
   tone,
+  href,
   eyebrow,
   title,
   count,
@@ -222,6 +227,8 @@ function ResourceCard({
   secondary,
 }: {
   tone: "integration" | "capability" | "agent";
+  /** The manage surface the WHOLE card opens; inner buttons/links win. */
+  href: string;
   eyebrow: string;
   title: string;
   count: number;
@@ -230,8 +237,15 @@ function ResourceCard({
   action: React.ReactNode;
   secondary?: React.ReactNode;
 }) {
+  const router = useRouter();
   return (
-    <article className={`resource-card resource-${tone}`}>
+    <article
+      className={`resource-card resource-${tone}`}
+      onClick={(event) => {
+        if ((event.target as HTMLElement).closest("button, a")) return;
+        router.push(href);
+      }}
+    >
       <ResourceGlyph tone={tone} />
       <div className="resource-card-content">
         <div className="resource-card-top">
