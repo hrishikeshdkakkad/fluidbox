@@ -94,10 +94,7 @@ export default function RecipeInstancePage({
   return (
     <>
       <PageHead
-        crumbs={[
-          { href: "/app/recipes", label: "Recipes" },
-          { href: "/app/recipes?tab=deployments", label: "Deployments" },
-        ]}
+        leaf={instance.name}
         title={instance.name}
         sub={`From ${instance.recipe_slug} · v${instance.recipe_version}`}
         right={<Pill status={instance.status} />}
