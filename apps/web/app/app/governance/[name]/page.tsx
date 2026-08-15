@@ -245,7 +245,7 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
   if (!detail || !draft) {
     return (
       <>
-        <PageHead title={name} crumbs={[{ href: "/governance", label: "Governance" }]} />
+        <PageHead title={name} leaf={name} />
         {err ? (
           <div className="err" role="alert">
             {err}
@@ -289,7 +289,7 @@ export default function PolicyDetailPage({ params }: { params: Promise<{ name: s
       <PageHead
         title={detail.policy.name}
         sub={`Version ${detail.policy.version}${dirty ? " · draft in progress" : ""}`}
-        crumbs={[{ href: "/governance", label: "Governance" }]}
+        leaf={name}
       />
 
       {/* Publishing applies to every FUTURE run of every agent on this policy. */}
