@@ -703,6 +703,22 @@ h1.title {
 .crumbs a:hover {
   color: var(--ink);
 }
+/* The route-derived trail (components/Breadcrumb) is an <ol> for AT ordering;
+   the list chrome comes off and the flex layout moves onto it. */
+.crumbs ol {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.crumbs li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
 
 /* ─── Cards & panels ─────────────────────────────────────────────────── */
 

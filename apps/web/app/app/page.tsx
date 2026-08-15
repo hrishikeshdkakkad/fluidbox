@@ -3,17 +3,11 @@
 import { Suspense, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import {
-  apiGet,
-  apiPost,
-  Approval,
-  isTerminal,
-  Session,
-  workspaceLabel,
-} from "../lib/api";
+import { apiGet, apiPost, Approval, isTerminal, Session } from "../lib/api";
 import { ApprovalActions } from "../components/ApprovalActions";
 import { AutomationPanel } from "../components/AutomationPanel";
 import { ResourceOverview } from "../components/ResourceOverview";
+import { RunHistory } from "../components/RunHistory";
 import { AddServerWizard } from "./capabilities/AddServerWizard";
 import {
   MintedAutomation,
@@ -21,7 +15,7 @@ import {
   RunMode,
   ShowAutomationSecrets,
 } from "../components/RunComposer";
-import { AutoPill, LoadingRows, Pill, short, timeAgo } from "../components/bits";
+import { LoadingRows, short } from "../components/bits";
 import { useSmartPolling } from "../lib/useSmartPolling";
 
 type OperateView = "history" | "automations";
@@ -173,7 +167,7 @@ export default function Runs() {
                   <div className="d">
                     <b className="mono">{approval.tool}</b>{" "}
                     <span className="mono mut">{approval.summary}</span>{" "}
-                    <Link href={`/sessions/${approval.session_id}`} className="link mono approval-session-link">
+                    <Link href={`/app/sessions/${approval.session_id}`} className="link mono approval-session-link">
                       {short(approval.session_id)}
                     </Link>
                   </div>
@@ -250,28 +244,7 @@ export default function Runs() {
                 </div>
               </div>
             ) : (
-              <div className="run-rows">
-                {sessions.map((session) => (
-                  <Link key={session.id} href={`/sessions/${session.id}`} className="run-row">
-                    <span className="run-copy">
-                      <strong>{session.task}</strong>
-                      <small>
-                        <span className="mono">{short(session.id)}</span>
-                        <span>·</span>
-                        <span>{session.trigger?.kind || "manual"}</span>
-                        {session.repo_source && (
-                          <><span>·</span><span>{workspaceLabel(session.repo_source)}</span></>
-                        )}
-                      </small>
-                    </span>
-                    <span className="run-status">
-                      <Pill status={session.status} />
-                      {session.autonomy === "autonomous" && <AutoPill autonomy={session.autonomy} />}
-                    </span>
-                    <span className="run-time">{timeAgo(session.created_at)}</span>
-                  </Link>
-                ))}
-              </div>
+              <RunHistory sessions={sessions} />
             )}
           </div>
         </section>

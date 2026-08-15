@@ -1,8 +1,8 @@
 "use client";
 
 import React, { useEffect, useId, useRef } from "react";
-import Link from "next/link";
 import { Connection, ownerBadge } from "../lib/api";
+import { Breadcrumb } from "./Breadcrumb";
 
 export function Pill({ status }: { status: string }) {
   const label = status.replace(/_/g, " ");
@@ -50,26 +50,19 @@ export function PageHead({
   title,
   sub,
   right,
-  crumbs,
+  leaf,
 }: {
   title: string;
   sub?: string;
   right?: React.ReactNode;
-  crumbs?: { href: string; label: string }[];
+  /** Human label for a dynamic trailing segment — see Breadcrumb. The trail
+   *  itself derives from the route (lib/nav.ts); pages no longer hand it in. */
+  leaf?: string;
 }) {
   return (
     <div className="pagehead">
       <div style={{ minWidth: 0 }}>
-        {crumbs && crumbs.length > 0 && (
-          <div className="crumbs">
-            {crumbs.map((c) => (
-              <React.Fragment key={c.href}>
-                <Link href={c.href}>{c.label}</Link>
-                <span aria-hidden>/</span>
-              </React.Fragment>
-            ))}
-          </div>
-        )}
+        <Breadcrumb leaf={leaf} />
         <h1 className="title">{title}</h1>
         {sub && <div className="sub">{sub}</div>}
       </div>

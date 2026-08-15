@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { apiGet, apiGetCached, AuthMe, logout } from "../lib/api";
+import { NAV, sectionFor } from "../lib/nav";
 import { useSmartPolling } from "../lib/useSmartPolling";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -75,6 +76,7 @@ export function Sidebar({
   useSmartPolling(poll, 8000, true);
 
   const closeMobileNav = () => setMobileOpen(false);
+  const activeSection = sectionFor(pathname);
 
   return (
     <header className="topbar">
@@ -89,48 +91,32 @@ export function Sidebar({
           id="primary-navigation"
           aria-label="Primary navigation"
         >
-          <Link
-            className={pathname === "/app" ? "active" : ""}
-            href="/app"
-            onNavigate={closeMobileNav}
-          >
-            Overview
-          </Link>
-          {/* Resources and Activity are jump-links to sections of the Overview
-              page, not routes. They deliberately carry no `active` class: the
-              you-are-here highlight is reserved for a page you are actually on,
-              and lighting "Resources" while the URL reads /app/agents told the
-              user something untrue. */}
-          <Link href="/app#configuration" onNavigate={closeMobileNav}>
-            Resources
-          </Link>
-          <Link href="/app#operations" onNavigate={closeMobileNav}>
-            Activity
-            {pending > 0 && <span className="masthead-count">{pending}</span>}
-          </Link>
-          <Link
-            className={pathname.startsWith("/app/recipes") ? "active" : ""}
-            href="/app/recipes"
-            onNavigate={closeMobileNav}
-          >
-            Recipes
-          </Link>
-          <Link
-            className={pathname.startsWith("/app/governance") ? "active" : ""}
-            href="/app/governance"
-            onNavigate={closeMobileNav}
-          >
-            Governance
-          </Link>
+          {/* The six sections come from lib/nav's NAV table — the same table
+              the breadcrumb walks — and you-are-here is sectionFor(pathname),
+              so a route can never light two items, or none while the trail
+              claims an ancestor. Resources and Activity are REAL routes since
+              the 2026-08-14 navigation pass, not #hash jumps onto Overview
+              (which lit nothing and left deep pages with no parent). */}
+          {NAV.map((item) => (
+            <Link
+              key={item.id}
+              className={activeSection === item.id ? "active" : ""}
+              href={item.href}
+              onNavigate={closeMobileNav}
+            >
+              {item.label}
+              {item.id === "activity" && pending > 0 && (
+                <span className="masthead-count">{pending}</span>
+              )}
+            </Link>
+          ))}
+          {/* Docs deliberately sits outside NAV: it LEAVES the dashboard for
+              the public surface, and the marker says so before the click. */}
           <Link href="/docs" onNavigate={closeMobileNav}>
             Docs
-          </Link>
-          <Link
-            className={pathname === "/app/settings" ? "active" : ""}
-            href="/app/settings"
-            onNavigate={closeMobileNav}
-          >
-            Settings
+            <span className="masthead-ext" aria-hidden="true">
+              ↗
+            </span>
           </Link>
           <Link
             className="mobile-primary-action"

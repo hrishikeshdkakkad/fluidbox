@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { AuthKitProvider } from "@workos-inc/authkit-nextjs/components";
+import { RouteFocus } from "../components/RouteFocus";
 import { Sidebar, type WorkosSessionBadge } from "../components/Sidebar";
 import { webMode } from "../lib/proxy-auth";
 import { webAuthMode } from "../lib/web-auth";
@@ -50,8 +51,17 @@ export default async function AppLayout({ children }: LayoutProps<"/app">) {
 
   const shell = (
     <div className="shell">
+      {/* First focusable element on the page; tabIndex on main makes the
+          fragment target reliably take focus in every browser. RouteFocus
+          handles the CLIENT-navigation half of the same contract. */}
+      <a className="skip-link" href="#content">
+        Skip to content
+      </a>
       <Sidebar mode={WEB_MODE} workosSession={workosSession} signOut={signOutAction} />
-      <main className="main">{children}</main>
+      <main className="main" id="content" tabIndex={-1}>
+        <RouteFocus />
+        {children}
+      </main>
     </div>
   );
 

@@ -1,7 +1,6 @@
 "use client";
 
 import { use, useEffect, useRef, useState, useCallback } from "react";
-import Link from "next/link";
 import {
   apiGet,
   apiPost,
@@ -16,6 +15,7 @@ import {
   workspaceLabel,
 } from "../../../lib/api";
 import { ApprovalActions } from "../../../components/ApprovalActions";
+import { Breadcrumb } from "../../../components/Breadcrumb";
 import { Pill, AutoPill, DiffView, LoadingRows, short } from "../../../components/bits";
 import { StateError } from "../../../components/state";
 import { useSmartPolling } from "../../../lib/useSmartPolling";
@@ -148,11 +148,7 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
     <>
       <div className="pagehead">
         <div style={{ minWidth: 0 }}>
-          <div className="crumbs">
-            <Link href="/app">Runs</Link>
-            <span>/</span>
-            <span className="mono">{short(id)}</span>
-          </div>
+          <Breadcrumb leaf={short(id)} />
           <h1
             className="title"
             title={session?.task || undefined}
