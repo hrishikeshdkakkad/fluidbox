@@ -19,7 +19,14 @@ import { useState } from "react";
  * round-trip (page.tsx clamps it; the control plane re-validates). It rides the
  * login flow as `redirect_to`, so a deep link survives the whole dance.
  */
-export default function LoginForm({ redirectTo = "/app" }: { redirectTo?: string }) {
+export default function LoginForm({
+  redirectTo = "/app",
+  error = null,
+}: {
+  redirectTo?: string;
+  /** Narrowed by page.tsx to a known token — never raw query text. */
+  error?: "unavailable" | null;
+}) {
   const [org, setOrg] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -50,6 +57,17 @@ export default function LoginForm({ redirectTo = "/app" }: { redirectTo?: string
         <div className="sub" style={{ marginTop: 4, marginBottom: 20 }}>
           Enter your organization to continue to your identity provider.
         </div>
+
+        {/* One message for every cause — an unknown slug, an organization with
+            no identity provider, a suspended one, and a discovery failure all
+            land here identically. That is deliberate: the control plane never
+            reveals whether an organization exists. */}
+        {error === "unavailable" && (
+          <div className="err" role="alert" style={{ marginBottom: 14 }}>
+            Sign-in is not available for that organization. Check the name, or ask whoever
+            administers your fluidbox.
+          </div>
+        )}
 
         <label className="field" style={{ display: "block" }}>
           <span className="lab">Organization</span>

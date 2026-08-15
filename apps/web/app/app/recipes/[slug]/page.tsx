@@ -85,7 +85,7 @@ export default function RecipeDetailPage({
   return (
     <>
       <PageHead
-        crumbs={[{ href: "/app/recipes", label: "Recipes" }]}
+        leaf={r.name}
         title={r.name}
         sub={r.tagline}
         right={

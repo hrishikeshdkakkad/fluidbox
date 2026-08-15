@@ -367,6 +367,18 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      # The CSS gate (stylelint.config.mjs). Its own step, deliberately NOT
+      # `pnpm lint`: eslint has a pre-existing red baseline (15 errors, 11 of
+      # them react-hooks/set-state-in-effect in the run composer and policy
+      # editor) that is a runtime-behaviour problem, and enforcing the design
+      # scales must not wait on greening it.
+      #
+      # Every stylelint rule reports at `warning` and the script carries a
+      # --max-warnings ceiling equal to today's count. Existing violations
+      # block nobody; ONE new raw hex, off-scale radius, fourth breakpoint or
+      # duplicate selector pushes the count over the ceiling and fails here.
+      # Lower the ceiling in package.json as each migration lands.
+      - run: pnpm lint:css
       - run: pnpm build
       # Proxy-auth + sso-route unit tests (vitest) — the credential-boundary logic
       # (webMode strictness, cookie allowlist, no-bearer forward, Set-Cookie
