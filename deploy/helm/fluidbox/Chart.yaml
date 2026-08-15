@@ -4,8 +4,8 @@ description: >-
   A control plane that runs AI coding agents in governed, disposable Kubernetes
   sandboxes
 type: application
-version: 0.7.0
-appVersion: 0.7.0
+version: 0.8.0
+appVersion: 0.8.0
 home: https://github.com/hrishikeshdkakkad/fluidbox
 sources:
   - https://github.com/hrishikeshdkakkad/fluidbox

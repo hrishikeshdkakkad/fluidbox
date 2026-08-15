@@ -4,6 +4,30 @@ All notable, user-visible changes to fluidbox are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
+## [0.8.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.7.0...v0.8.0) (2026-08-15)
+
+
+### Added
+
+* **web:** six-section IA — real activity/resources routes, derived breadcrumbs, focus ([0e940cd](https://github.com/hrishikeshdkakkad/fluidbox/commit/0e940cd6f47657a94be85e67b61cf1277635fc3a))
+* **web:** the delight pass — activity workbench, warm kernel, real tables ([4b1a452](https://github.com/hrishikeshdkakkad/fluidbox/commit/4b1a452cad8f4ce79cdc0e08e55e5ec054a9d1ea))
+* **web:** the delight pass — activity workbench, warm kernel, real tables ([f5f5060](https://github.com/hrishikeshdkakkad/fluidbox/commit/f5f506012ab668568d8d217dca4d888ab619eea1))
+* **web:** the public/private boundary — one product, chrome that knows you ([8fb8329](https://github.com/hrishikeshdkakkad/fluidbox/commit/8fb832946748d30f12f90dc5429ab19aabf045bd))
+
+
+### Fixed
+
+* **web,login:** confirm destructive revokes, give the sign-in refusal a way back ([e37bbf2](https://github.com/hrishikeshdkakkad/fluidbox/commit/e37bbf28f89d51882415aaf0d3bd713c69e97f4a))
+* **web:** gate the design scales and fix four user-visible defects ([f4dfd1d](https://github.com/hrishikeshdkakkad/fluidbox/commit/f4dfd1dbe5ef779d058a28e1c57c05571f2bb213))
+* **web:** gate the design scales, fix four user-visible defects, and close three high-severity findings ([bbf27d2](https://github.com/hrishikeshdkakkad/fluidbox/commit/bbf27d2636f7c00a384e895622e3e21ed17ce367))
+* **web:** restore the run primary and stop the email overlapping the toggle ([3206890](https://github.com/hrishikeshdkakkad/fluidbox/commit/3206890d9239646bfa9f3a60d5916e07054d910a))
+
+
+### Changed
+
+* **web:** fold the 47 duplicate selectors, ratchet the CSS gate 59 -&gt; 10 ([ffec520](https://github.com/hrishikeshdkakkad/fluidbox/commit/ffec520e4f4103afe5e3cbbb072296621d52f6a0))
+* **web:** retire 239 of the 298 gated CSS warnings, ratchet 298 -&gt; 59 ([54452bd](https://github.com/hrishikeshdkakkad/fluidbox/commit/54452bd27caddeb51df9e4a6b88d6ee308c30ece))
+
 ## [0.7.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.6.0...v0.7.0) (2026-08-13)
 
 
