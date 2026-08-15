@@ -9,7 +9,9 @@ const COLUMNS: { title: string; links: { href: string; label: string; external?:
       { href: "/product", label: "Overview" },
       { href: "/pricing", label: "Pricing" },
       { href: "/changelog", label: "Changelog" },
-      { href: "/app", label: "Dashboard" },
+      // No Dashboard entry here: the boundary invariant is ONE visible route
+      // back to /app when signed in (the header CTA) and ZERO signed out —
+      // this unconditional link was both violations at once.
     ],
   },
   {

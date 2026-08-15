@@ -1384,7 +1384,7 @@ export function RunComposer({
         {!agentOnly && (
           <ComposerSection
             index={4}
-            title="Guardrails"
+            title="Policy"
             hint="How much freedom this run gets. Every action is logged either way."
           >
             <>
@@ -1742,7 +1742,7 @@ export function RunComposer({
 
             {!agentOnly && (
               <SpecRow
-                label="Guardrails"
+                label="Policy"
                 value={
                   activePreset === "free"
                     ? "Free rein"

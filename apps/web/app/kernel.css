@@ -11,6 +11,10 @@
   the chrome voice does.
 */
 
+/* stylelint-disable color-no-hex, scale-unlimited/declaration-strict-value --
+   The token layer is the ONE place a raw colour literal may appear. Every
+   other rule in this file must reach a colour through a custom property;
+   the gate enforces that, and this comment is the visible boundary. */
 :root {
   /* Warm paper scale (kernel.sh beige family). */
   --ds-background-100: #f2f0e7;
@@ -34,10 +38,21 @@
   /* The accent family IS kernel-green: raw chartreuse for fills, the
      darkened pair for text on beige. */
   --ds-green-100: rgba(129, 179, 0, 0.14);
-  --ds-green-700: #567a00;
+  /* -700 is the text step, so it carries a WCAG floor, not just a hue — and
+     the floor is set by the DARKEST surface it can land on, which is --raised
+     (#eae7db), not the canvas. Tuning it for --bg alone is how #567a00 (4.40
+     on --bg) became #557800 (4.52 on --bg) and still failed at 4.16 on every
+     card. #517200 clears all three: raised 4.51, surface 5.30, bg 4.90 — at
+     H 77.37deg / S 100%, i.e. the same colour two value-steps down.
+     lib/theme-contrast.test.ts asserts all three surfaces. */
+  --ds-green-700: #517200;
   --ds-green-900: #486700;
   --ds-gold-100: rgba(202, 177, 104, 0.2);
-  --ds-gold-700: #8a6d1c;
+  /* Same story as green. Was #8a6d1c (4.29 on --bg); note #866a1b computes
+     4.4959 — it rounds to 4.50 but does NOT clear the floor. #85691b cleared
+     --bg but still failed at 4.20 on --raised. #7f641a clears all three:
+     raised 4.53, surface 5.32, bg 4.92 — H 43.96deg / S 79.5%. */
+  --ds-gold-700: #7f641a;
   --ds-gold-900: #74590f;
   --ds-red-100: rgba(179, 64, 46, 0.1);
   --ds-red-700: #b3402e;
@@ -65,6 +80,14 @@
   --green-tint: var(--ds-green-100);
   --red: var(--ds-red-700);
   --red-tint: var(--ds-red-100);
+  /* The -dim step of each family, completing the pattern --accent-dim already
+     set: the -900 primitive, which darkens in light and lightens in dark.
+     Reserved for ink that sits on a TINTED surface, where the base
+     --accent/--amber/--green/--red do not clear AA. Declared once — they
+     resolve lazily, so the dark block's -900 values flip them for free. */
+  --amber-dim: var(--ds-gold-900);
+  --green-dim: var(--ds-green-900);
+  --red-dim: var(--ds-red-900);
   --chrome-bg: rgba(242, 240, 231, 0.92);
   --interactive-subtle: var(--ds-gray-alpha-100);
   --interactive-hover: var(--ds-gray-alpha-200);
@@ -81,8 +104,57 @@
   --radius: 4px;
   --radius-lg: 8px;
   --hairline: 0.5px;
-}
 
+  /* Third-party brand marks. These are other companies' identities, not our
+     scale — they must NOT be tokenised into the palette or flipped by theme,
+     and they are the one legitimate literal ghetto besides the tokens
+     themselves. Named here so a component rule never carries a raw hex. */
+  --brand-mark-ink: #ffffff;
+  --brand-github: #20242b;
+  --brand-github-light: #292b2f;
+  --brand-notion: #f3f3f2;
+  --brand-notion-ink: #111214;
+  --brand-atlassian-from: #2684ff;
+  --brand-atlassian-to: #0754bb;
+  --brand-linear-from: #8a7cff;
+  --brand-linear-to: #4c3bcf;
+  --brand-sentry-from: #8a68d5;
+  --brand-sentry-to: #4f2d91;
+  --brand-stripe-from: #7767ff;
+  --brand-stripe-to: #5142d8;
+  --brand-workspace-from: #36cba8;
+  --brand-workspace-to: #187e96;
+  --brand-custom-from: #ef7c63;
+  --brand-custom-to: #a74169;
+
+  /* Simulated-terminal / ledger swatches for the marketing mockups. A fake
+     terminal has ONE look — these are picture, not interface, so they are
+     theme-exempt by design and never flip. The other sanctioned literal
+     ghetto (foundation-spec 2.1). */
+  --term-bg: #26282c;
+  --term-film-body: #191a1c;
+  --term-film-cover: #212225;
+  --term-red: #ff5f57;
+  --term-amber: #febc2e;
+  --term-green: #2ac840;
+  --term-teal: #6ef0c0;
+  --term-gold: #ffce6a;
+  --term-salmon: #ff8d84;
+  --term-accent: #9ccf1f;
+  --term-ink: #ecedf3;
+  --term-ink-strong: #edeef0;
+  --term-muted: #b0b1c0;
+  --term-detail: #9d9eae;
+  --term-meta: #85869a;
+  --term-kicker: #83888f;
+  --term-faint: #5c5d6e;
+}
+/* stylelint-enable color-no-hex, scale-unlimited/declaration-strict-value */
+
+/* stylelint-disable color-no-hex, scale-unlimited/declaration-strict-value --
+   The token layer is the ONE place a raw colour literal may appear. Every
+   other rule in this file must reach a colour through a custom property;
+   the gate enforces that, and this comment is the visible boundary. */
 html[data-theme="dark"] {
   /* kernel.sh's dark sections: charcoal, never black. */
   --ds-background-100: #191a1c;
@@ -93,7 +165,9 @@ html[data-theme="dark"] {
   --ds-gray-400: #3d4046;
   --ds-gray-500: #4c5157;
   --ds-gray-600: #696e77;
-  --ds-gray-700: #83888f;
+  /* --ink-3 in dark. #83888f measured 4.46:1 on --surface and 4.14:1 on
+     --raised — muted text on a card was below AA. */
+  --ds-gray-700: #8d9298;
   --ds-gray-800: #9ba0a6;
   --ds-gray-900: #b3b7bc;
   --ds-gray-1000: #edeef0;
@@ -149,15 +223,28 @@ html[data-theme="dark"] {
   --panel-shadow: none;
   --modal-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
 }
+/* stylelint-enable color-no-hex, scale-unlimited/declaration-strict-value */
 
 html {
   color-scheme: light;
   background: var(--bg);
 }
 
+/* Kept as its own block rather than folded into the dark token block above,
+   which is why one no-duplicate-selectors warning survives here.
+
+   This rule is a FALLBACK, not the primary mechanism. The theme is applied by
+   ThemeToggle.tsx:23-24 and THEME_INIT_SCRIPT, which set BOTH `data-theme` and
+   an inline `style.colorScheme` on <html> — and an inline style beats any
+   stylesheet. This declaration only matters if that script has not run.
+   (An earlier comment here claimed color-scheme was broken in dark mode. It is
+   not: that measurement set data-theme by hand while the init script's inline
+   `color-scheme: light` was still on the element, so the inline style won.
+   Verified via the real toggle path — both mechanisms compute `dark`.) */
 html[data-theme="dark"] {
   color-scheme: dark;
 }
+
 
 body {
   background: var(--bg);
@@ -214,10 +301,23 @@ body {
   margin: 0 auto;
   padding: 0 24px;
   display: grid;
-  /* The NAV is the column that flexes; brand and actions size to their
-   * content — `auto minmax(0, 1fr) auto` keeps the actions cluster from
-   * bleeding over the nav (see the globals.css comment for the history). */
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  /* The ACTIONS cluster is the column that yields; the nav takes its intrinsic
+   * width and therefore CANNOT clip.
+   *
+   * History: `auto minmax(0, 1fr) auto` made the nav the flexing track. Under
+   * width pressure it shrank below its content, and because .masthead-nav was
+   * centre-justified with a hidden scrollbar the overflow was hidden at BOTH
+   * ends — measured on this build at 1280/1440/1790 the nav overflowed by a
+   * constant 13px and "Overview"/"Settings" each lost 13px ("erview",
+   * "settin"). Widening the viewport never helped because .topbar-inner is
+   * capped at max-width above.
+   *
+   * Fit arithmetic at the 1200px cap (measured, not estimated): brand 171 +
+   * nav max-content 538 + gaps 48 + padding 48 = 805, leaving 347 for actions.
+   * The actions cluster intrinsically wants 450 WITH the duplicate desktop
+   * "New Run" and 360 without it — so deleting that duplicate (Sidebar.tsx) is
+   * what makes the header fit, with ~35px of slack. */
+  grid-template-columns: auto max-content minmax(0, 1fr);
   align-items: center;
   gap: 24px;
 }
@@ -253,9 +353,17 @@ body {
   border: 0;
   border-radius: 0;
   background: transparent;
+  /* Stated positively here because this file is the last word: no duplicate
+     .masthead-nav block in either sheet can reinstate the clip. */
+  flex-wrap: nowrap;
+  justify-content: flex-start;
+  overflow: visible;
 }
 
 .masthead-nav a {
+  /* Links must never absorb width pressure — a shrunk link wraps or truncates
+     its own label, which is the same defect one level down. */
+  flex: 0 0 auto;
   min-height: 32px;
   padding: 0 10px;
   border-radius: var(--radius);
@@ -275,6 +383,13 @@ body {
   color: var(--ds-gray-1000);
 }
 
+/* The out-of-app marker on the docs link: that click leaves the dashboard for
+   the public surface, and the arrow says so before the click (Sidebar.tsx). */
+.masthead-nav a .masthead-ext {
+  color: var(--ds-gray-700);
+  font-size: 11px;
+}
+
 .masthead-nav .mobile-primary-action {
   display: none;
 }
@@ -284,6 +399,117 @@ body {
   display: flex;
   align-items: center;
   gap: 14px;
+  /* The yielding column: without min-width:0 a grid item's automatic minimum
+     is its content, so the track would refuse to shrink and push the nav. */
+  min-width: 0;
+}
+
+/* Signed-in identity in the actions cluster. Was inline style in Sidebar.tsx;
+   moved to classes so a media query can actually hide it (an inline `display`
+   wins over any stylesheet rule short of !important). */
+.masthead-session {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.masthead-session-id {
+  display: flex;
+  flex-direction: column;
+  /* STRETCH, not flex-end. A flex-end child shrink-wraps its text and may
+     exceed this box, and text-overflow can only ellipsise a child that is
+     actually constrained — with flex-end the 137px email overflowed its 100px
+     column and ran 22px under the theme toggle. Stretch makes each line fill
+     the box so the ellipsis fires; text-align keeps the right edge flush,
+     which is what flex-end was really there for. */
+  align-items: stretch;
+  min-width: 0;
+  overflow: hidden;
+  line-height: 1.15;
+  text-align: right;
+}
+
+.masthead-session-id strong {
+  color: var(--ds-gray-1000);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.masthead-session-id small {
+  color: var(--ds-gray-800);
+  font-size: 11px;
+}
+
+.masthead-session-email {
+  display: block;
+  max-width: 150px;
+  overflow: hidden;
+  color: var(--ds-gray-800);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The public/private boundary in the chrome.
+   Both variants are rendered so the marketing pages stay STATICALLY generated;
+   `data-session` (stamped before first paint by lib/session-hint) decides which
+   one is shown, so there is no post-hydration swap.
+
+   !important because this is a visibility SWITCH, not a style preference: if
+   it loses, a signed-out visitor is shown a dashboard link they cannot use, or
+   a signed-in one is told to log in. Measured, `html .site-when-in` (0,1,1)
+   still lost to the header's own descendant button rules (0,2,0). Rather than
+   escalate specificity and lose again to the next rule someone adds, this
+   follows the precedent already set for the masthead's own chrome toggles
+   (globals.css: `.masthead-state, .topbar-action { display: none !important }`).
+
+   The default is SIGNED OUT: if the script has not run, cookies are off, or
+   the attribute is anything unexpected, a visitor is offered "Log In" rather
+   than a dashboard link they cannot use. Fail toward the public chrome. */
+html .site-when-in {
+  display: none !important;
+}
+
+html[data-session="in"] .site-when-in {
+  display: inline-flex !important;
+}
+
+html[data-session="in"] .site-when-out {
+  display: none !important;
+}
+
+/* Compact desktop, 901-1280.
+   min-width:0 frees the TRACK, but a justify-self:end grid item still sizes to
+   its own content, so the cluster does not actually shrink — measured, it wants
+   396px while the track offers 209px at 1024, and the overflow lands on the
+   "Log out" button (12px of horizontal page scroll). A cluster that must yield
+   has to shed content, not be squeezed.
+   So below 1280 the two things that are labels rather than controls go: the
+   status word (the chartreuse dot still carries live state and the title
+   attribute still carries the words) and the org/email (one tap away in
+   Settings). That takes the cluster to ~148px, which is what keeps the
+   seven-item nav INLINE down to 901px instead of hiding primary navigation
+   behind a hamburger on an ordinary laptop. */
+@media (max-width: 1280px) {
+  .topbar-inner {
+    padding: 0 16px;
+    gap: 16px;
+  }
+
+  .masthead-nav a {
+    padding: 0 7px;
+  }
+
+  .masthead-state span:not(.signal) {
+    display: none;
+  }
+
+  .masthead-session-id,
+  .masthead-session-email {
+    display: none;
+  }
 }
 
 .masthead-state,
@@ -355,9 +581,13 @@ h1.title {
   line-height: 1.5;
 }
 
-.dashboard-header > .btn {
-  display: none;
-}
+/* The page's own primary is VISIBLE on desktop.
+   It used to be display:none here, because the masthead carried a duplicate
+   "New Run" and two dark primaries per view is one too many. The masthead copy
+   is gone (Sidebar.tsx), so hiding this one left the dashboard with NO way to
+   start a run at all on desktop — the audit reported that the page "already
+   renders its own primary" from the JSX without checking that CSS hid it.
+   The <=900 block below still re-states display for the mobile layout. */
 
 .crumbs {
   margin-bottom: 8px;
@@ -746,7 +976,7 @@ h1.title {
 .btn.human {
   border-color: var(--gold);
   background: var(--gold);
-  color: #1c2024;
+  color: var(--flood-ink);
 }
 
 .btn.human:hover {
@@ -1287,7 +1517,7 @@ pre.token,
   color: var(--ds-gray-800);
 }
 
-@media (max-width: 860px) {
+@media (max-width: 900px) {
   .main {
     padding: 32px 18px 72px;
   }
@@ -1654,7 +1884,7 @@ pre.token,
 /* The compact defaults are excellent on a pointer-precise desktop, but the
    responsive shell needs an explicit touch contract. This final block is
    intentionally last so older mobile rules cannot shrink the menu again. */
-@media (max-width: 760px) {
+@media (max-width: 900px) {
   .masthead-brand {
     min-height: 44px;
     display: inline-flex;
