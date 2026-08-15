@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 import { ThemeToggle } from "../../components/ThemeToggle";
+import { APP_HOME } from "../../lib/auth-gate";
 
 const REPO = "https://github.com/hrishikeshdkakkad/fluidbox";
 
@@ -87,10 +88,20 @@ export function SiteHeader() {
               </Link>
             ))}
             <div className="site-nav-mobile-actions">
-              <Link href="/sign-in" className="btn sm" onNavigate={close}>
+              {/* Both variants render; CSS shows the one matching data-session
+                  (stamped before paint by lib/session-hint). Rendering both is
+                  what keeps these pages statically generated. */}
+              <Link href={APP_HOME} className="btn sm primary site-when-in" onNavigate={close}>
+                Dashboard
+              </Link>
+              <Link href="/sign-in" className="btn sm site-when-out" onNavigate={close}>
                 Log In
               </Link>
-              <Link href="/docs/getting-started" className="btn sm primary" onNavigate={close}>
+              <Link
+                href="/docs/getting-started"
+                className="btn sm primary site-when-out"
+                onNavigate={close}
+              >
                 Get Started
               </Link>
             </div>
@@ -107,11 +118,20 @@ export function SiteHeader() {
             >
               <GitHubMark />
             </a>
-            <Link href="/docs/getting-started" className="btn sm primary site-getstarted">
+            <Link
+              href="/docs/getting-started"
+              className="btn sm primary site-getstarted site-when-out"
+            >
               Get Started
             </Link>
-            <Link href="/sign-in" className="btn sm site-signin">
+            <Link href="/sign-in" className="btn sm site-signin site-when-out">
               Log In
+            </Link>
+            {/* The door home. A signed-in reader who lands here from search or
+                a shared link must never be offered "Log In", and must never
+                have to hunt the footer to get back to their workspace. */}
+            <Link href={APP_HOME} className="btn sm primary site-dashboard site-when-in">
+              Dashboard <span aria-hidden="true">→</span>
             </Link>
             <button
               className="site-menu-btn"

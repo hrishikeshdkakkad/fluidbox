@@ -12,6 +12,7 @@ import {
   TriggerSubscription,
 } from "../../../lib/api";
 import { AutomationContract, CopyBlock, TemplateChips } from "../../../components/AutomationContract";
+import { Breadcrumb } from "../../../components/Breadcrumb";
 import { AutomationActivity } from "../../../components/AutomationPanel";
 import { MintedAutomation, ShowAutomationSecrets } from "../../../components/RunComposer";
 import { ScheduleBuilder } from "../../../components/ScheduleBuilder";
@@ -96,6 +97,7 @@ export default function AutomationDetail({ params }: { params: Promise<{ id: str
     <div className="automation-detail">
       <header className="automation-detail-head">
         <div>
+          <Breadcrumb leaf={sub.name} />
           <div className="automation-title-line">
             <span className="automation-kind">
               {sub.trigger_kind === "schedule" ? "Schedule" : sub.trigger_kind === "event" ? "Event" : "API"}

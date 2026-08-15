@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { apiGet, apiGetCached, AuthMe, logout } from "../lib/api";
+import { NAV, sectionFor } from "../lib/nav";
 import { useSmartPolling } from "../lib/useSmartPolling";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -74,13 +75,8 @@ export function Sidebar({
   }, []);
   useSmartPolling(poll, 8000, true);
 
-  const resourcesActive = ["/app/agents", "/app/capabilities", "/app/integrations"].some(
-    (route) => pathname.startsWith(route)
-  );
-  const activityActive = ["/app/sessions", "/app/automations"].some(
-    (route) => pathname.startsWith(route)
-  );
   const closeMobileNav = () => setMobileOpen(false);
+  const activeSection = sectionFor(pathname);
 
   return (
     <header className="topbar">
@@ -95,51 +91,32 @@ export function Sidebar({
           id="primary-navigation"
           aria-label="Primary navigation"
         >
-          <Link
-            className={pathname === "/app" ? "active" : ""}
-            href="/app"
-            onNavigate={closeMobileNav}
-          >
-            Overview
-          </Link>
-          <Link
-            className={resourcesActive ? "active" : ""}
-            href="/app#configuration"
-            onNavigate={closeMobileNav}
-          >
-            Resources
-          </Link>
-          <Link
-            className={activityActive ? "active" : ""}
-            href="/app#operations"
-            onNavigate={closeMobileNav}
-          >
-            Activity
-            {pending > 0 && <span className="masthead-count">{pending}</span>}
-          </Link>
-          <Link
-            className={pathname.startsWith("/app/recipes") ? "active" : ""}
-            href="/app/recipes"
-            onNavigate={closeMobileNav}
-          >
-            Recipes
-          </Link>
-          <Link
-            className={pathname.startsWith("/app/governance") ? "active" : ""}
-            href="/app/governance"
-            onNavigate={closeMobileNav}
-          >
-            Governance
-          </Link>
+          {/* The six sections come from lib/nav's NAV table — the same table
+              the breadcrumb walks — and you-are-here is sectionFor(pathname),
+              so a route can never light two items, or none while the trail
+              claims an ancestor. Resources and Activity are REAL routes since
+              the 2026-08-14 navigation pass, not #hash jumps onto Overview
+              (which lit nothing and left deep pages with no parent). */}
+          {NAV.map((item) => (
+            <Link
+              key={item.id}
+              className={activeSection === item.id ? "active" : ""}
+              href={item.href}
+              onNavigate={closeMobileNav}
+            >
+              {item.label}
+              {item.id === "activity" && pending > 0 && (
+                <span className="masthead-count">{pending}</span>
+              )}
+            </Link>
+          ))}
+          {/* Docs deliberately sits outside NAV: it LEAVES the dashboard for
+              the public surface, and the marker says so before the click. */}
           <Link href="/docs" onNavigate={closeMobileNav}>
             Docs
-          </Link>
-          <Link
-            className={pathname === "/app/settings" ? "active" : ""}
-            href="/app/settings"
-            onNavigate={closeMobileNav}
-          >
-            Settings
+            <span className="masthead-ext" aria-hidden="true">
+              ↗
+            </span>
           </Link>
           <Link
             className="mobile-primary-action"
@@ -169,26 +146,22 @@ export function Sidebar({
             <span className={`signal ${online ? "" : "down"}`} />
             <span>{online ? "Operational" : "Offline"}</span>
           </div>
-          <Link className="topbar-action" href="/app?action=new-run">
-            New Run
-          </Link>
+          {/* No desktop "New Run" here. Every page that can start a run renders
+              its own primary (e.g. app/app/page.tsx), so this was a second dark
+              primary competing with it — and its 76px (90px with the gap) is
+              exactly what the header needed to stop clipping the nav. The
+              mobile dropdown keeps its own .mobile-primary-action above, where
+              no page primary is in view. */}
           <ThemeToggle />
+          {/* Classes, not inline style. An inline `display` cannot be
+              overridden by a stylesheet, so the compact-desktop rule that hides
+              the identity text below 1280px was silently a no-op while these
+              were style={{…}} — the header kept overflowing by 20px. */}
           {workosSession && (
-            <div
-              style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}
-              data-testid="workos-session-shell"
-            >
+            <div className="masthead-session" data-testid="workos-session-shell">
               <span
+                className="masthead-session-email"
                 title={`${workosSession.label} · ${workosSession.email}`}
-                style={{
-                  fontSize: 11.5,
-                  color: "var(--ds-gray-800)",
-                  fontFamily: "var(--font-mono)",
-                  maxWidth: 150,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
               >
                 {workosSession.email}
               </span>
@@ -202,25 +175,11 @@ export function Sidebar({
             </div>
           )}
           {mode === "sso" && me?.user && (
-            <div
-              style={{ display: "flex", alignItems: "center", gap: 10 }}
-              data-testid="session-shell"
-            >
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  lineHeight: 1.15,
-                  textAlign: "right",
-                }}
-              >
-                <span style={{ fontSize: 12, color: "var(--ds-gray-1000)", fontWeight: 500 }}>
-                  {me.org?.display_name ?? me.org?.slug ?? ""}
-                </span>
-                <span style={{ fontSize: 11, color: "var(--ds-gray-800)" }}>
-                  {me.user.email}
-                </span>
-              </div>
+            <div className="masthead-session" data-testid="session-shell">
+              <span className="masthead-session-id">
+                <strong>{me.org?.display_name ?? me.org?.slug ?? ""}</strong>
+                <small>{me.user.email}</small>
+              </span>
               <button className="btn sm ghost" onClick={() => void logout()}>
                 Log out
               </button>
