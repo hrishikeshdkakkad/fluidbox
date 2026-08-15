@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { ChevronDown, ChevronRight, Search as SearchIcon } from "lucide-react";
+import { ChevronDown, Search as SearchIcon } from "lucide-react";
 import {
   apiGetCached,
   apiPost,
@@ -204,93 +204,110 @@ function Agents() {
           ) : shown.length === 0 ? (
             <div className="empty">No agents match “{q}”.</div>
           ) : (
-            <div className="rows">
-              {shown.map((a) => (
-                <div key={a.id}>
-                  <button
-                    type="button"
-                    className="row click"
-                    style={{ gridTemplateColumns: "16px 180px 1fr", cursor: "pointer" }}
-                    onClick={() => toggle(a.id)}
-                    aria-expanded={open === a.id}
-                    aria-controls={`agent-revisions-${a.id}`}
-                  >
-                    <span className="faint" style={{ display: "grid" }}>
-                      {open === a.id ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                    </span>
-                    <span className="mono" style={{ fontSize: 12.5, color: "var(--accent)" }}>
-                      {a.name}
-                    </span>
-                    <span className="task mut">
-                      {a.description || "—"}
-                      {/* The current revision's declaration, stated where an
-                          operator actually looks. Rendered only once the
-                          revisions are known — an unknown declaration shows
-                          nothing rather than claiming "Offline". */}
-                      {revs[a.id]?.[0] && (
-                        <span className="chip" style={{ marginLeft: 8 }}>
-                          network <b>{summarizeRequest(requestOf(revs[a.id][0].network))}</b>
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                  {open === a.id && (
-                    <div
-                      id={`agent-revisions-${a.id}`}
-                      style={{
-                        padding: "4px 16px 14px 42px",
-                        borderBottom: "1px solid var(--border)",
-                      }}
+            <div className="agent-table" role="table" aria-label="Agents">
+              <div className="agent-thead" role="row">
+                <span role="columnheader">agent</span>
+                <span role="columnheader">harness</span>
+                <span role="columnheader">model</span>
+                <span role="columnheader">network</span>
+                <span role="columnheader" className="agent-th-revs">
+                  revisions
+                </span>
+                <span aria-hidden />
+              </div>
+              {shown.map((a) => {
+                const current = revs[a.id]?.[0];
+                const count = revs[a.id]?.length ?? 0;
+                const isOpen = open === a.id;
+                return (
+                  <div key={a.id} role="rowgroup">
+                    {/* The WHOLE row is the expand control; the revision
+                        declaration renders only once revisions are known —
+                        an unknown declaration shows nothing, never a guess. */}
+                    <button
+                      type="button"
+                      className="agent-tr"
+                      role="row"
+                      onClick={() => toggle(a.id)}
+                      aria-expanded={isOpen}
+                      aria-controls={`agent-revisions-${a.id}`}
                     >
-                      {(revs[a.id] || []).map((r, i) => (
-                        <div
-                          key={r.id}
-                          className="chips"
-                          style={{
-                            padding: "8px 0",
-                            borderBottom: "1px solid var(--border)",
-                            alignItems: "center",
-                          }}
-                        >
-                          <span className="chip">
-                            rev <b>{r.rev}</b>
+                      <span className="agent-td-name" role="cell">
+                        <strong>{a.name}</strong>
+                        <small>{a.description || "—"}</small>
+                      </span>
+                      <span className="agent-td-mono" role="cell">
+                        {current?.harness ?? ""}
+                      </span>
+                      <span className="agent-td-mono" role="cell">
+                        {current?.model ?? ""}
+                      </span>
+                      <span role="cell">
+                        {current && (
+                          <span className="run-kind">
+                            {summarizeRequest(requestOf(current.network))}
                           </span>
-                          {i === 0 && <span className="badge ok">current</span>}
-                          <span className="chip">
-                            harness <b>{r.harness}</b>
-                          </span>
-                          <span className="chip">
-                            model <b>{r.model}</b>
-                          </span>
-                          {r.system_prompt && <span className="chip">prompt set</span>}
-                          {r.default_workspace && (
-                            <span className="chip">
-                              workspace <b>{workspaceLabel(r.default_workspace)}</b>
-                            </span>
-                          )}
-                          {r.capability_bundles?.length > 0 && (
-                            <span className="chip">
-                              bundles <b>{bundleRefsLabel(r.capability_bundles)}</b>
-                            </span>
-                          )}
-                          <span className="chip">
-                            network <b>{summarizeRequest(requestOf(r.network))}</b>
-                          </span>
-                          <span className="chip">image {short(r.runner_image, 24)}</span>
+                        )}
+                      </span>
+                      <span className="agent-td-revs" role="cell">
+                        {count > 0 ? `v${current!.rev} · ${count}` : ""}
+                      </span>
+                      <ChevronDown className={`agent-chevron${isOpen ? " open" : ""}`} aria-hidden />
+                    </button>
+                    {isOpen && (
+                      <div id={`agent-revisions-${a.id}`} className="agent-revisions">
+                        <div className="rev-table">
+                          <div className="rev-thead" aria-hidden>
+                            <span>rev</span>
+                            <span>harness</span>
+                            <span>model</span>
+                            <span>network</span>
+                            <span>details</span>
+                            <span>image</span>
+                          </div>
+                          {(revs[a.id] || []).map((r, i) => (
+                            <div key={r.id} className="rev-tr">
+                              <span className="mono">
+                                v{r.rev}
+                                {i === 0 && <span className="badge ok">current</span>}
+                              </span>
+                              <span className="mono">{r.harness}</span>
+                              <span className="mono">{r.model}</span>
+                              <span>
+                                <span className="run-kind">
+                                  {summarizeRequest(requestOf(r.network))}
+                                </span>
+                              </span>
+                              <span className="rev-details">
+                                {[
+                                  r.default_workspace
+                                    ? workspaceLabel(r.default_workspace)
+                                    : "scratch workspace",
+                                  r.capability_bundles?.length
+                                    ? bundleRefsLabel(r.capability_bundles)
+                                    : null,
+                                  r.system_prompt ? "prompt set" : null,
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")}
+                              </span>
+                              <span className="mono rev-image">{short(r.runner_image, 24)}</span>
+                            </div>
+                          ))}
                         </div>
-                      ))}
-                      <button
-                        className="btn sm"
-                        style={{ marginTop: 12 }}
-                        disabled={!revs[a.id]}
-                        onClick={() => setAddRev(a.id)}
-                      >
-                        Add revision
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))}
+                        <button
+                          className="btn sm"
+                          style={{ marginTop: 12 }}
+                          disabled={!revs[a.id]}
+                          onClick={() => setAddRev(a.id)}
+                        >
+                          Add revision
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
