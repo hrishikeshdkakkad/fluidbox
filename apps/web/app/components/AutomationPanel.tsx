@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { StateError } from "./state";
 import {
   Agent,
@@ -197,6 +198,7 @@ function AutomationRow({
   onToggle: (subscription: TriggerSubscription, enabled: boolean) => void;
   onRotate: (subscription: TriggerSubscription) => void;
 }) {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const details = [
     subscription.pinned_revision_id ? "pinned revision" : null,
@@ -209,7 +211,15 @@ function AutomationRow({
 
   return (
     <article className="automation-row">
-      <div className="automation-row-main">
+      {/* The WHOLE row opens the automation; inner buttons/links keep their
+          own jobs (the guard lets any nested interactive element win). */}
+      <div
+        className="automation-row-main"
+        onClick={(event) => {
+          if ((event.target as HTMLElement).closest("button, a")) return;
+          router.push(`/automations/${subscription.id}`);
+        }}
+      >
         <KindIcon kind={subscription.trigger_kind} />
         <div className="automation-copy">
           <div className="automation-title-line">

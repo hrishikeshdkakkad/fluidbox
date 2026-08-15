@@ -22,11 +22,16 @@ export default function ResourcesPage() {
         title="Resources"
         sub="The agents, MCP servers, and integrations every run draws from."
       />
-      <ResourceOverview
-        refreshKey={resourceRefresh}
-        onCreateAgent={() => setAgentComposer(true)}
-        onAddCapability={() => setShowCapabilityWizard(true)}
-      />
+      {/* Standalone framing: the page header above already says "resources",
+          so the shared section's own h2/p are hidden here (globals.css
+          .resources-standalone) and only the readiness chip survives. */}
+      <div className="resources-standalone">
+        <ResourceOverview
+          refreshKey={resourceRefresh}
+          onCreateAgent={() => setAgentComposer(true)}
+          onAddCapability={() => setShowCapabilityWizard(true)}
+        />
+      </div>
       {agentComposer && (
         <RunComposer
           agentOnly
