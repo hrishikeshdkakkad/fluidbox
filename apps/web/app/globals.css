@@ -8463,8 +8463,14 @@ a.st-use:hover p {
 }
 /* The responsive ladder sheds columns in triage order: trigger first (its
    kind is repeated in the meta line's voice anyway), then agent/age, and
-   the re-run affordance last — status never leaves. */
-@media (max-width: 1180px) {
+   the re-run affordance last — status never leaves.
+
+   Keyed on the BOARD's own width, not the viewport's: once the automations
+   rail sits beside it, the table has ~600px inside a 1700px window, and a
+   viewport query would call that wide. `.activity-board` declares the
+   container below. This is also why the ladder needs no fourth breakpoint —
+   the numbers are the board's width, on the same 640/900 scale. */
+@container run-board (max-width: 900px) {
   .run-thead,
   .run-tr {
     grid-template-columns: minmax(0, 1fr) 132px 156px 60px 76px 14px;
@@ -8474,7 +8480,7 @@ a.st-use:hover p {
     display: none;
   }
 }
-@media (max-width: 900px) {
+@container run-board (max-width: 640px) {
   .run-thead {
     display: none;
   }
@@ -8488,14 +8494,6 @@ a.st-use:hover p {
     display: none;
   }
 }
-@media (max-width: 560px) {
-  .run-tr {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-  .run-td-rerun {
-    display: none;
-  }
-}
 
 /* ── The activity board ───────────────────────────────────────────────
    One instrument card: heading + triage chips, the 24h pulse band, the
@@ -8503,6 +8501,10 @@ a.st-use:hover p {
    a seismograph strip directly above the log it summarizes. Children keep
    their own classes; the board only re-frames them. */
 .activity-board {
+  /* Named container: the run table sheds columns by the BOARD's width, so it
+     stays correct whether the board is full-bleed or sitting beside the rail. */
+  container: run-board / inline-size;
+
   /* Measured height of the sticky header (33.75px rendered); the day label
      tucks a fraction under it so no seam opens while scrolling. */
   --run-thead-h: 33px;
@@ -8537,21 +8539,23 @@ a.st-use:hover p {
   box-shadow: none;
   animation: none;
 }
+/* Sticky rows must be OPAQUE or the list scrolls through them, and the
+   header tint is an alpha token. Painting the tint as an image over an
+   opaque background-color composites the two without inventing a colour —
+   and keeps every colour coming from a custom property. */
 .activity-board .run-thead {
   position: sticky;
   top: 0;
   z-index: 3;
-  background:
-    linear-gradient(var(--interactive-subtle), var(--interactive-subtle)),
-    var(--surface);
+  background-color: var(--surface);
+  background-image: linear-gradient(var(--interactive-subtle), var(--interactive-subtle));
 }
 .activity-board .run-day-label {
   position: sticky;
   top: var(--run-thead-h);
   z-index: 2;
-  background:
-    linear-gradient(var(--interactive-subtle), var(--interactive-subtle)),
-    var(--surface);
+  background-color: var(--surface);
+  background-image: linear-gradient(var(--interactive-subtle), var(--interactive-subtle));
 }
 @media (max-width: 900px) {
   .activity-board .run-day-label {
@@ -8759,7 +8763,7 @@ a.last-run:hover {
   font-size: 12px;
   line-height: 1.45;
 }
-@media (max-width: 760px) {
+@media (max-width: 640px) {
   .home-handoff {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -8768,21 +8772,26 @@ a.last-run:hover {
 /* ── The workbench split ──────────────────────────────────────────────
    Wide viewports place the automations rail BESIDE the run board so both
    halves of the workbench are on screen at once; below the split they
-   stack, and the pagehead's jump link announces the buried half. The
-   split threshold accounts for the 264px nav rail: 1560px viewport ⇒
-   ~1250px of main column, enough for board + 420px rail. */
+   stack, and the pagehead's jump link announces the buried half.
+
+   Split at the system's top tier (1281px = above the 1280 breakpoint)
+   rather than a bespoke width. The rail is a RANGE, not a fixed 420px, so
+   the board keeps a usable measure at the threshold and the rail grows on
+   a large monitor; the table itself responds to the board's own width
+   (see the `run-board` container queries above), which is what makes one
+   threshold sufficient. */
 .activity-workbench {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
 }
-@media (min-width: 1560px) {
+@media (min-width: 1281px) {
   /* Only this page earns the wider column — every other page keeps the
      1200px reading measure. */
   .main:has(.activity-workbench) {
     max-width: 1760px;
   }
   .activity-workbench {
-    grid-template-columns: minmax(0, 1fr) 420px;
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 420px);
     gap: 28px;
     align-items: start;
   }
@@ -8823,19 +8832,6 @@ a.last-run:hover {
     padding-left: 18px;
   }
 }
-/* Split-but-narrow: the board column lands under ~1000px, the same squeeze
-   the stacked 1180 step handles — shed the trigger column here too. */
-@media (min-width: 1560px) and (max-width: 2140px) {
-  .activity-workbench .run-thead,
-  .activity-workbench .run-tr {
-    grid-template-columns: minmax(0, 1fr) 132px 156px 60px 76px 14px;
-  }
-  .activity-workbench .run-th-trigger,
-  .activity-workbench .run-td-trigger {
-    display: none;
-  }
-}
-
 /* ── The agents table ─────────────────────────────────────────────────
    Same table language as run history: mono header, whole-row control
    (the row button expands the revision history), chevron affordance. */
