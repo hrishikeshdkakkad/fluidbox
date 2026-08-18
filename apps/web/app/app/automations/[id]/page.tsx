@@ -15,8 +15,10 @@ import { AutomationContract, CopyBlock, TemplateChips } from "../../../component
 import { Breadcrumb } from "../../../components/Breadcrumb";
 import { AutomationActivity } from "../../../components/AutomationPanel";
 import { MintedAutomation, ShowAutomationSecrets } from "../../../components/RunComposer";
+import { ConfirmAction } from "../../../components/ConfirmAction";
 import { ScheduleBuilder } from "../../../components/ScheduleBuilder";
-import { LoadingRows } from "../../../components/bits";
+import { StateError } from "../../../components/state";
+import { LoadingRows, short } from "../../../components/bits";
 
 /** Verbatim message from an apiPatch rejection (server body for 4xx/409). */
 function errText(error: unknown): string {
@@ -28,6 +30,9 @@ export default function AutomationDetail({ params }: { params: Promise<{ id: str
   const [detail, setDetail] = useState<TriggerDetail | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loadErr, setLoadErr] = useState("");
+  // The raw rejection, kept unflattened so StateError can read ApiError.kind
+  // and tell a deleted automation apart from an outage.
+  const [coreError, setCoreError] = useState<unknown>(null);
   const [actionErr, setActionErr] = useState("");
   const [minted, setMinted] = useState<MintedAutomation | null>(null);
 
@@ -40,9 +45,11 @@ export default function AutomationDetail({ params }: { params: Promise<{ id: str
       setDetail(detailResponse);
       setAgents(agentResponse.agents);
       setLoadErr("");
+      setCoreError(null);
     } catch (error) {
       // Keep the last good snapshot; surface the failure without blanking.
       setLoadErr(String(error));
+      setCoreError(error);
     }
   }, [id]);
   useEffect(() => {
@@ -84,15 +91,55 @@ export default function AutomationDetail({ params }: { params: Promise<{ id: str
     }
   };
 
+  // Page identity comes from the ROUTE, so it renders whether or not the data
+  // arrived. This branch used to replace the whole page with a bare error
+  // string: no <h1> for RouteFocus to land on and no crumb, so a stale deep
+  // link left <main> with nothing to click — exactly the stranding the
+  // 2026-08-14 navigation design set out to remove. Same shape sessions/[id]
+  // already uses; the heading fills in once the load succeeds.
   if (!detail) {
     return (
       <div className="automation-detail">
-        {loadErr ? <div className="err">{loadErr}</div> : <LoadingRows />}
+        <header className="automation-detail-head">
+          <div>
+            <Breadcrumb leaf={short(id)} />
+            <div className="automation-title-line">
+              <h1>Automation</h1>
+            </div>
+          </div>
+        </header>
+        {coreError ? (
+          // Was a bare error string with no way forward — the one hard dead
+          // end in the app. StateError separates a deleted/mistyped id (404,
+          // where retrying can never work) from an outage (retry offered),
+          // and never shows String(error) to a person.
+          <StateError
+            error={coreError}
+            onRetry={() => void load()}
+            notFoundHref="/app/activity#automations-heading"
+            notFoundLabel="All automations"
+          />
+        ) : (
+          <LoadingRows />
+        )}
       </div>
     );
   }
   const sub = detail.subscription;
   const agentName = agents.find((agent) => agent.id === sub.agent_id)?.name ?? null;
+  // Only an API automation is actually invoked by a caller; schedules run on
+  // the clock and event automations run from a webhook.
+  const hasApiCaller = sub.trigger_kind === "api";
+  const contract = (
+    <AutomationContract
+      subscription={sub}
+      invokeUrl={detail.invoke_url}
+      pollUrl={detail.poll_url_template}
+      ingressUrl={detail.ingress_url}
+      token={null}
+      updatedAt={sub.updated_at}
+    />
+  );
   return (
     <div className="automation-detail">
       <header className="automation-detail-head">
@@ -120,15 +167,21 @@ export default function AutomationDetail({ params }: { params: Promise<{ id: str
               <> · next run {new Date(detail.schedule.next_fire_at).toLocaleString()}</>
             )}
             {" · "}
-            <Link className="link" href="/app?view=automations">
+            <Link className="link" href="/app/activity#automations-heading">
               All automations
             </Link>
           </p>
         </div>
         <div className="automation-actions">
-          <button className="btn ghost sm" type="button" onClick={() => void rotate(sub)}>
-            Rotate token
-          </button>
+          {/* Rotation kills the current token the moment the new one is
+              minted, and this is now the only place it can be triggered. */}
+          <ConfirmAction
+            label="Rotate token"
+            title="Rotate this automation's token?"
+            body="The current token stops working immediately. Anything using it must be updated with the new one, which is shown only once."
+            confirmLabel="Rotate token"
+            onConfirm={() => void rotate(sub)}
+          />
           <button className="btn sm" type="button" onClick={() => void toggle(sub)}>
             {sub.enabled ? "Disable" : "Enable"}
           </button>
@@ -137,17 +190,16 @@ export default function AutomationDetail({ params }: { params: Promise<{ id: str
       {loadErr && <div className="note">Refresh failed — showing the last loaded state. {loadErr}</div>}
       {actionErr && <div className="err">{actionErr}</div>}
 
-      <section className="automation-detail-section">
-        <h2>API</h2>
-        <AutomationContract
-          subscription={sub}
-          invokeUrl={detail.invoke_url}
-          pollUrl={detail.poll_url_template}
-          ingressUrl={detail.ingress_url}
-          token={null}
-          updatedAt={sub.updated_at}
-        />
-      </section>
+      {/* A schedule or repository-event automation has no caller, so leading
+          with an endpoint and its 400/401/409/422 table put the least relevant
+          thing first — the contract itself says "there is no API caller".
+          It stays available, one click away, below what you came for. */}
+      {hasApiCaller && (
+        <section className="automation-detail-section">
+          <h2>API</h2>
+          {contract}
+        </section>
+      )}
 
       <section className="automation-detail-section">
         <h2>Configuration</h2>
@@ -163,6 +215,15 @@ export default function AutomationDetail({ params }: { params: Promise<{ id: str
         <h2>Activity</h2>
         <AutomationActivity id={sub.id} />
       </section>
+
+      {!hasApiCaller && (
+        <section className="automation-detail-section">
+          <details className="advanced-config">
+            <summary>API</summary>
+            {contract}
+          </details>
+        </section>
+      )}
       {minted && (
         <ShowAutomationSecrets
           minted={minted}

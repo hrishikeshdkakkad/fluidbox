@@ -1,7 +1,9 @@
 "use client";
 
 import React, { useEffect, useId, useRef } from "react";
+import { createPortal } from "react-dom";
 import { Connection, ownerBadge } from "../lib/api";
+import { parseInline } from "../lib/markdown";
 import { Breadcrumb } from "./Breadcrumb";
 
 export function Pill({ status }: { status: string }) {
@@ -44,6 +46,47 @@ export function OwnerTag({
 
 export function short(id: string, n = 8): string {
   return id.slice(0, n);
+}
+
+/**
+ * Renders agent-authored prose that contains inline markdown — run results are
+ * the main source, and they arrive as `[label](/workspace/…)`, which printed
+ * as raw source everywhere it appeared.
+ *
+ * Uses the tested pure parser the docs already use (`lib/markdown.ts`), so
+ * there is no new dependency and no `dangerouslySetInnerHTML`: `parseInline`
+ * returns nodes, which makes this XSS-safe by construction on text a model
+ * wrote. A link is only an anchor when its target is actually navigable —
+ * run results reference sandbox workspace paths, not URLs, so those render as
+ * the label with the path beside it rather than a link that goes nowhere.
+ */
+export function InlineMarkdown({ text }: { text: string }) {
+  return (
+    <>
+      {parseInline(text).map((node, index) => {
+        switch (node.kind) {
+          case "strong":
+            return <strong key={index}>{node.text}</strong>;
+          case "em":
+            return <em key={index}>{node.text}</em>;
+          case "code":
+            return <code key={index}>{node.text}</code>;
+          case "link":
+            return /^(https?:|mailto:)/i.test(node.href) ? (
+              <a key={index} href={node.href} target="_blank" rel="noreferrer">
+                {node.text}
+              </a>
+            ) : (
+              <span key={index}>
+                {node.text} <span className="mono mut">{node.href}</span>
+              </span>
+            );
+          case "text":
+            return <span key={index}>{node.text}</span>;
+        }
+      })}
+    </>
+  );
 }
 
 export function PageHead({
@@ -167,7 +210,26 @@ export function ModalShell({
     };
   }, []);
 
-  return (
+  // Portaled OUT of the caller, but only as far as `.shell`.
+  //
+  // Two constraints pull in opposite directions. position:fixed resolves
+  // against any ancestor carrying a transform, and several sections keep one
+  // (the `enter` animation retains an identity transform under fill-mode
+  // both) — that is what confined Rotate Token's overlay to the sticky
+  // automations rail. But the app's skin (app/material.css) is scoped to
+  // `.shell`, so portaling all the way to <body> dropped every modal out of
+  // the design system and back to the base kernel look.
+  //
+  // `.shell` satisfies both: it is above every animated section and carries
+  // no transform of its own, so fixed positioning still resolves against the
+  // viewport. Falling back to <body> keeps this usable outside the app shell.
+  const portalTarget =
+    typeof document === "undefined"
+      ? null
+      : (document.querySelector(".shell") ?? document.body);
+  if (!portalTarget) return null;
+
+  return createPortal(
     <div
       className="overlay"
       onMouseDown={(event) => {
@@ -211,7 +273,8 @@ export function ModalShell({
         )}
         <div className="mb">{children}</div>
       </div>
-    </div>
+    </div>,
+    portalTarget
   );
 }
 

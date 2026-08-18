@@ -88,6 +88,7 @@ export function StateError({
   onRetry,
   body,
   notFoundHref = "/app",
+  notFoundLabel,
 }: {
   error: unknown;
   onRetry?: () => void;
@@ -96,11 +97,16 @@ export function StateError({
    *  framework string in production. */
   body?: string;
   notFoundHref?: string;
+  /** Names the destination. A caller that overrides `notFoundHref` must say
+   *  where it goes, or the button promises "overview" and lands elsewhere. */
+  notFoundLabel?: string;
 }) {
   const kind = error instanceof ApiError ? error.kind : "error";
 
   if (kind === "notFound") {
-    return <StateNotFound href={notFoundHref} />;
+    return (
+      <StateNotFound href={notFoundHref} {...(notFoundLabel ? { label: notFoundLabel } : {})} />
+    );
   }
 
   if (kind === "denied") {

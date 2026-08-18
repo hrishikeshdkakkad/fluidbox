@@ -79,24 +79,48 @@ export function Sidebar({
   const activeSection = sectionFor(pathname);
 
   return (
-    <header className="topbar">
-      <div className="topbar-inner">
+    <>
+      {/* Mobile only: a slim bar carrying the brand and the drawer toggle.
+          Desktop hides it entirely — the rail below is the whole chrome. */}
+      <header className="sidenav-mobilebar">
         <Link href="/app" className="brand masthead-brand" onNavigate={closeMobileNav}>
           <span className="wordmark">fluidbox</span>
           <span className="product-label">control plane</span>
         </Link>
-
-        <nav
-          className={`masthead-nav ${mobileOpen ? "open" : ""}`}
-          id="primary-navigation"
-          aria-label="Primary navigation"
+        <button
+          className="masthead-menu"
+          type="button"
+          aria-label={mobileOpen ? "Close navigation" : "Open navigation"}
+          aria-expanded={mobileOpen}
+          aria-controls="primary-navigation"
+          onClick={() => setMobileOpen((open) => !open)}
         >
+          {mobileOpen ? <CloseIcon /> : <MenuIcon />}
+        </button>
+      </header>
+
+      {/* The navigation rail (Gemini drawer pattern): brand, a global New Run
+          primary, the six sections as pill rows, and the ambient context —
+          status, theme, account — at the foot where Google apps keep it. */}
+      <aside className={`sidenav ${mobileOpen ? "open" : ""}`} aria-label="Primary">
+        <Link href="/app" className="brand sidenav-brand" onNavigate={closeMobileNav}>
+          <span className="wordmark">fluidbox</span>
+          <span className="product-label">control plane</span>
+        </Link>
+
+        <Link
+          className="btn primary sidenav-new"
+          href="/app?action=new-run"
+          onNavigate={closeMobileNav}
+        >
+          New Run
+        </Link>
+
+        <nav className="sidenav-nav" id="primary-navigation" aria-label="Primary navigation">
           {/* The six sections come from lib/nav's NAV table — the same table
               the breadcrumb walks — and you-are-here is sectionFor(pathname),
               so a route can never light two items, or none while the trail
-              claims an ancestor. Resources and Activity are REAL routes since
-              the 2026-08-14 navigation pass, not #hash jumps onto Overview
-              (which lit nothing and left deep pages with no parent). */}
+              claims an ancestor. */}
           {NAV.map((item) => (
             <Link
               key={item.id}
@@ -118,56 +142,33 @@ export function Sidebar({
               ↗
             </span>
           </Link>
-          <Link
-            className="mobile-primary-action"
-            href="/app?action=new-run"
-            onNavigate={closeMobileNav}
-          >
-            New Run
-          </Link>
-          {mode === "sso" && me?.user && (
-            <div className="mobile-session">
-              <span>
-                <strong>{me.org?.display_name ?? me.org?.slug ?? "Signed in"}</strong>
-                <small>{me.user.email}</small>
-              </span>
-              <button className="btn sm ghost" type="button" onClick={() => void logout()}>
-                Log out
-              </button>
-            </div>
-          )}
         </nav>
 
-        <div className="masthead-actions">
-          <div
-            className="masthead-state"
-            title={online ? "Control plane online" : "Control plane offline"}
-          >
-            <span className={`signal ${online ? "" : "down"}`} />
-            <span>{online ? "Operational" : "Offline"}</span>
+        <div className="sidenav-foot">
+          <div className="sidenav-foot-row">
+            <div
+              className="masthead-state"
+              title={online ? "Control plane online" : "Control plane offline"}
+            >
+              <span className={`signal ${online ? "" : "down"}`} />
+              <span>{online ? "Operational" : "Offline"}</span>
+            </div>
+            <ThemeToggle />
           </div>
-          {/* No desktop "New Run" here. Every page that can start a run renders
-              its own primary (e.g. app/app/page.tsx), so this was a second dark
-              primary competing with it — and its 76px (90px with the gap) is
-              exactly what the header needed to stop clipping the nav. The
-              mobile dropdown keeps its own .mobile-primary-action above, where
-              no page primary is in view. */}
-          <ThemeToggle />
-          {/* Classes, not inline style. An inline `display` cannot be
-              overridden by a stylesheet, so the compact-desktop rule that hides
-              the identity text below 1280px was silently a no-op while these
-              were style={{…}} — the header kept overflowing by 20px. */}
           {workosSession && (
-            <div className="masthead-session" data-testid="workos-session-shell">
-              <span
-                className="masthead-session-email"
-                title={`${workosSession.label} · ${workosSession.email}`}
-              >
-                {workosSession.email}
-              </span>
+            <div className="sidenav-session" data-testid="workos-session-shell">
+              <div className="sidenav-account" title={`${workosSession.label} · ${workosSession.email}`}>
+                <span className="sidenav-avatar" aria-hidden="true">
+                  {initials(workosSession.label || workosSession.email)}
+                </span>
+                <span className="sidenav-identity">
+                  <strong>{workosSession.label}</strong>
+                  <small>{workosSession.email}</small>
+                </span>
+              </div>
               {signOut && (
                 <form action={signOut}>
-                  <button className="btn sm ghost" type="submit">
+                  <button className="btn sm ghost sidenav-logout" type="submit">
                     Sign out
                   </button>
                 </form>
@@ -175,30 +176,54 @@ export function Sidebar({
             </div>
           )}
           {mode === "sso" && me?.user && (
-            <div className="masthead-session" data-testid="session-shell">
-              <span className="masthead-session-id">
-                <strong>{me.org?.display_name ?? me.org?.slug ?? ""}</strong>
-                <small>{me.user.email}</small>
-              </span>
-              <button className="btn sm ghost" onClick={() => void logout()}>
+            <div className="sidenav-session" data-testid="session-shell">
+              <div
+                className="sidenav-account"
+                title={`${me.user.name || me.org?.display_name || ""} · ${me.user.email}`}
+              >
+                <span className="sidenav-avatar" aria-hidden="true">
+                  {initials(me.user.name ?? me.user.email ?? "")}
+                </span>
+                <span className="sidenav-identity">
+                  <strong>{me.org?.display_name ?? me.org?.slug ?? ""}</strong>
+                  <small>{me.user.email}</small>
+                </span>
+              </div>
+              <button
+                className="btn sm ghost sidenav-logout"
+                type="button"
+                onClick={() => void logout()}
+              >
                 Log out
               </button>
             </div>
           )}
-          <button
-            className="masthead-menu"
-            type="button"
-            aria-label={mobileOpen ? "Close navigation" : "Open navigation"}
-            aria-expanded={mobileOpen}
-            aria-controls="primary-navigation"
-            onClick={() => setMobileOpen((open) => !open)}
-          >
-            {mobileOpen ? <CloseIcon /> : <MenuIcon />}
-          </button>
         </div>
-      </div>
-    </header>
+      </aside>
+
+      {/* Mobile drawer scrim: click-away closes; it never exists on desktop
+          where the rail is static. */}
+      {mobileOpen && (
+        <button
+          className="sidenav-scrim"
+          type="button"
+          aria-label="Close navigation"
+          onClick={closeMobileNav}
+        />
+      )}
+    </>
   );
+}
+
+/** Up to two typographic initials for the account avatar ("Hrishikesh
+ *  Kakkad" → HK, "ops@corp.io" → O). Text, not iconography. */
+function initials(source: string): string {
+  const words = source
+    .split(/[\s@._-]+/)
+    .filter(Boolean)
+    .slice(0, 2);
+  const letters = words.map((word) => word[0]?.toUpperCase() ?? "");
+  return letters.join("") || "?";
 }
 
 function MenuIcon() {
