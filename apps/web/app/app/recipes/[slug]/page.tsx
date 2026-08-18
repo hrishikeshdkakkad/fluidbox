@@ -10,6 +10,8 @@
 import { use, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { Roboto } from "next/font/google";
+import "./gemini.css";
 import {
   apiGet,
   apiGetCached,
@@ -19,6 +21,45 @@ import {
   fetchConnectionTools,
 } from "../../../lib/api";
 import { LoadingRows, ModalShell, PageHead } from "../../../components/bits";
+import { Breadcrumb } from "../../../components/Breadcrumb";
+import { parseInline } from "../../../lib/markdown";
+
+// Loaded per-page on purpose: the Gemini skin is scoped to this route and the
+// face travels with it (next/font self-hosts, so no runtime fetch).
+const roboto = Roboto({
+  subsets: ["latin"],
+  weight: ["400", "500", "700"],
+  variable: "--font-gem",
+  display: "swap",
+});
+
+/** Inline-markdown for recipe summaries (bold/code/links) via the tested
+ *  pure parser the docs already use — raw asterisks read as a bug here. */
+function GemInline({ text }: { text: string }) {
+  return (
+    <>
+      {parseInline(text).map((node, i) => {
+        switch (node.kind) {
+          case "strong":
+            return <strong key={i}>{node.text}</strong>;
+          case "em":
+            return <em key={i}>{node.text}</em>;
+          case "code":
+            return <code key={i}>{node.text}</code>;
+          case "link":
+            return (
+              <a key={i} href={node.href} target="_blank" rel="noreferrer">
+                {node.text}
+              </a>
+            );
+          case "text":
+            return <span key={i}>{node.text}</span>;
+        }
+      })}
+    </>
+  );
+}
+
 import { CopyBlock } from "../../../components/AutomationContract";
 import {
   blockingIssue,
@@ -67,15 +108,21 @@ export default function RecipeDetailPage({
     void load();
   }, [load]);
 
+  // The head renders even when the load failed: the route already tells us
+  // where we are, so the crumb trail and an <h1> (RouteFocus's landing target)
+  // must not depend on a fetch. The slug is the one identity we always know.
   if (loadErr && !detail) {
     return (
-      <div className="launch-empty">
-        <p>Could not load this recipe.</p>
-        <p className="err">{loadErr}</p>
-        <Link className="btn" href="/app/recipes">
-          Back to recipes
-        </Link>
-      </div>
+      <>
+        <PageHead title={slug} leaf={slug} />
+        <div className="launch-empty">
+          <p>Could not load this recipe.</p>
+          <p className="err">{loadErr}</p>
+          <Link className="btn" href="/app/recipes">
+            Back to recipes
+          </Link>
+        </div>
+      </>
     );
   }
   if (!detail) return <LoadingRows rows={4} />;
@@ -83,133 +130,130 @@ export default function RecipeDetailPage({
   const r = detail.recipe;
   const f = detail.facets;
   return (
-    <>
-      <PageHead
-        leaf={r.name}
-        title={r.name}
-        sub={r.tagline}
-        right={
-          <button className="btn primary" onClick={() => setDeploying(true)}>
-            Deploy…
+    <div className={`gem ${roboto.variable}`}>
+      <Breadcrumb leaf={r.name} />
+
+      <header className="gem-hero">
+        <h1 className="gem-title">{r.name}</h1>
+        <p className="gem-tagline">{r.tagline}</p>
+        <div className="chips">
+          {r.tier === "official" ? (
+            <span className="badge brand">Official</span>
+          ) : (
+            <span className="badge">Custom</span>
+          )}
+          <span className="chip">v{detail.version.version}</span>
+          {f.trigger_kinds.map((k) => (
+            <span key={k} className="chip">
+              {triggerLabel(k)}
+            </span>
+          ))}
+          {f.multi_agent && <span className="chip">{f.agent_count} agents</span>}
+          <span className="chip">≤ ${f.cost_ceiling_usd.toFixed(2)} / run</span>
+        </div>
+        <div className="gem-actions">
+          <button className="btn primary gem-cta" onClick={() => setDeploying(true)}>
+            Deploy
           </button>
-        }
-      />
-      <div className="chips" style={{ marginBottom: 18 }}>
-        {r.tier === "official" ? (
-          <span className="badge brand">Official</span>
-        ) : (
-          <span className="badge">Custom</span>
-        )}
-        <span className="chip">v{detail.version.version}</span>
-        {f.trigger_kinds.map((k) => (
-          <span key={k} className="chip">
-            {triggerLabel(k)}
+          <span className="helper">
+            Review shows the full plan before anything is created.
+          </span>
+        </div>
+      </header>
+
+      <section className="gem-card">
+        <h2>What it does</h2>
+        {(detail.summary_md ?? r.description)
+          .split(/\n\n+/)
+          .filter(Boolean)
+          .map((p, i) => (
+            <p key={i} className="gem-prose">
+              <GemInline text={p} />
+            </p>
+          ))}
+      </section>
+
+      {f.success_criteria.length > 0 && (
+        <section className="gem-card">
+          <h2>What “working” means</h2>
+          <ul className="gem-checks">
+            {f.success_criteria.map((c, i) => (
+              <li key={i}>{c}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      <div className="gem-grid">
+        <section className="gem-card">
+          <h2>What gets created</h2>
+          <ul className="gem-plain">
+            {detail.manifest.policy && <li>1 dedicated policy (tunable afterward in Governance)</li>}
+            <li>
+              {detail.manifest.agents.length} agent
+              {detail.manifest.agents.length === 1 ? "" : "s"} (
+              {detail.manifest.agents.map((a) => a.slot).join(", ")})
+            </li>
+            {detail.manifest.subscriptions.length > 0 && (
+              <li>
+                {detail.manifest.subscriptions.length} automation
+                {detail.manifest.subscriptions.length === 1 ? "" : "s"} (
+                {detail.manifest.subscriptions.map((s) => triggerLabel(s.kind)).join(", ")})
+              </li>
+            )}
+            {detail.manifest.first_run && <li>An immediate first run</li>}
+          </ul>
+          <p className="helper">
+            Everything is stamped in one transaction and stays fully editable in
+            Agents, Automations, and Governance — that is the path to a custom
+            workflow.
+          </p>
+        </section>
+
+        <section className="gem-card">
+          <h2>Integrations required</h2>
+          {f.connectors.length === 0 ? (
+            <p className="helper">None — this recipe needs no external connection.</p>
+          ) : (
+            <ul className="gem-plain">
+              {f.connectors.map((c) => {
+                const have = eligibleConnections(
+                  { kind: "connection", provider: c.provider, mcp: c.mcp },
+                  connections,
+                );
+                return (
+                  <li key={c.param}>
+                    {c.title}
+                    {c.required ? "" : " (optional)"} —{" "}
+                    {have.length > 0 ? (
+                      <span className="badge ok">connected</span>
+                    ) : (
+                      <Link href="/app/capabilities?tab=store" className="badge warn">
+                        connect first →
+                      </Link>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+      </div>
+
+      <section className="gem-card">
+        <h2>Permissions</h2>
+        <PolicySummary summary={detail.policy_summary} />
+      </section>
+
+      <footer className="gem-versions">
+        {detail.versions.map((v) => (
+          <span key={v.version}>
+            v{v.version}
+            {v.changelog ? ` — ${v.changelog}` : ""} ({v.author})
+            {v.version === detail.versions[detail.versions.length - 1].version ? "" : " · "}
           </span>
         ))}
-        {f.multi_agent && <span className="chip">{f.agent_count} agents</span>}
-        <span className="chip">≤ ${f.cost_ceiling_usd.toFixed(2)} / run</span>
-      </div>
-
-      <div className="recipe-detail-grid">
-        <div>
-          <section className="panel pad">
-            <h2 className="sectitle">What it does</h2>
-            {(detail.summary_md ?? r.description)
-              .split(/\n\n+/)
-              .filter(Boolean)
-              .map((p, i) => (
-                <p key={i} className="recipe-prose">
-                  {p}
-                </p>
-              ))}
-          </section>
-
-          {f.success_criteria.length > 0 && (
-            <section className="panel pad">
-              <h2 className="sectitle">What “working” means</h2>
-              <ul className="recipe-list">
-                {f.success_criteria.map((c, i) => (
-                  <li key={i}>{c}</li>
-                ))}
-              </ul>
-            </section>
-          )}
-
-          <section className="panel pad">
-            <h2 className="sectitle">Permissions</h2>
-            <PolicySummary summary={detail.policy_summary} />
-          </section>
-        </div>
-
-        <div>
-          <section className="panel pad">
-            <h2 className="sectitle">What gets created</h2>
-            <ul className="recipe-list">
-              {detail.manifest.policy && <li>1 dedicated policy (tunable afterward in Governance)</li>}
-              <li>
-                {detail.manifest.agents.length} agent
-                {detail.manifest.agents.length === 1 ? "" : "s"} (
-                {detail.manifest.agents.map((a) => a.slot).join(", ")})
-              </li>
-              {detail.manifest.subscriptions.length > 0 && (
-                <li>
-                  {detail.manifest.subscriptions.length} automation
-                  {detail.manifest.subscriptions.length === 1 ? "" : "s"} (
-                  {detail.manifest.subscriptions.map((s) => triggerLabel(s.kind)).join(", ")})
-                </li>
-              )}
-              {detail.manifest.first_run && <li>An immediate first run</li>}
-            </ul>
-            <p className="helper">
-              Everything is stamped in one transaction and stays fully editable in
-              Agents, Automations, and Governance — that is the path to a custom
-              workflow.
-            </p>
-          </section>
-
-          <section className="panel pad">
-            <h2 className="sectitle">Integrations required</h2>
-            {f.connectors.length === 0 ? (
-              <p className="helper">None — this recipe needs no external connection.</p>
-            ) : (
-              <ul className="recipe-list">
-                {f.connectors.map((c) => {
-                  const have = eligibleConnections(
-                    { kind: "connection", provider: c.provider, mcp: c.mcp },
-                    connections,
-                  );
-                  return (
-                    <li key={c.param}>
-                      {c.title}
-                      {c.required ? "" : " (optional)"} —{" "}
-                      {have.length > 0 ? (
-                        <span className="badge ok">connected</span>
-                      ) : (
-                        <Link href="/app/capabilities?tab=store" className="badge warn">
-                          connect first →
-                        </Link>
-                      )}
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </section>
-
-          <section className="panel pad">
-            <h2 className="sectitle">Versions</h2>
-            <ul className="recipe-list">
-              {detail.versions.map((v) => (
-                <li key={v.version}>
-                  <strong>v{v.version}</strong>
-                  {v.changelog ? ` — ${v.changelog}` : ""}{" "}
-                  <span className="helper">({v.author})</span>
-                </li>
-              ))}
-            </ul>
-          </section>
-        </div>
-      </div>
+      </footer>
 
       {deploying && (
         <DeployWizard
@@ -219,7 +263,7 @@ export default function RecipeDetailPage({
           onClose={() => setDeploying(false)}
         />
       )}
-    </>
+    </div>
   );
 }
 
@@ -545,12 +589,13 @@ function ParamField({
     case "connection":
       return (
         <ConnectionField
+          title={spec.title}
           label={label}
           hint={hint}
           widget={w}
           value={typeof value === "string" ? value : ""}
           connections={connections}
-          onChange={onChange}
+          onChange={(v) => onChange(v)}
         />
       );
     case "connection_tools":
@@ -703,7 +748,31 @@ function ParamField({
   }
 }
 
+/** The MCP endpoint's host — the honest, human way to tell two mcp_http
+ *  connections apart ("mcp.linear.app", not the wire slug "(mcp_http)"). */
+function connectionHost(connection: Connection): string {
+  const raw = connection.metadata.endpoint_url ?? connection.metadata.base_url ?? "";
+  try {
+    return raw ? new URL(raw).host : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Does this connection read as the one the parameter is asking for?
+ *  Token-match the param title ("Linear connection") against the connection's
+ *  name and endpoint host — pure heuristic, only ever used to PRE-select. */
+function matchesParamTitle(title: string, connection: Connection): boolean {
+  const haystack = `${connection.display_name} ${connectionHost(connection)}`.toLowerCase();
+  return title
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((word) => word.length > 2 && word !== "connection")
+    .some((word) => haystack.includes(word));
+}
+
 function ConnectionField({
+  title,
   label,
   hint,
   widget,
@@ -711,6 +780,7 @@ function ConnectionField({
   connections,
   onChange,
 }: {
+  title: string;
   label: React.ReactNode;
   hint: React.ReactNode;
   widget: Extract<RecipeWidget, { kind: "connection" }>;
@@ -719,6 +789,23 @@ function ConnectionField({
   onChange: (v: string) => void;
 }) {
   const eligible = eligibleConnections(widget, connections);
+
+  // A "Linear connection" parameter must not OFFER Notion — a wrong pick
+  // deploys cleanly and then fails at run time when the frozen tool surface
+  // carries none of the tools the agent calls. Connections whose name or
+  // endpoint match the parameter's title are the offered set; the full
+  // eligible list returns only when nothing matches, so an unusually named
+  // connection is narrowed to, never hidden entirely.
+  const matches = eligible.filter((c) => matchesParamTitle(title, c));
+  const offered = matches.length > 0 ? matches : eligible;
+  const preselectId = offered.length === 1 ? offered[0].id : null;
+  useEffect(() => {
+    if (!value && preselectId) onChange(preselectId);
+    // Deliberately NOT keyed on onChange: the parent recreates it per render,
+    // and this effect must fire only when the resolved default changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, preselectId]);
+
   return (
     <div className="field">
       {label}
@@ -730,12 +817,16 @@ function ConnectionField({
         </p>
       ) : (
         <select className="inp" value={value} onChange={(e) => onChange(e.target.value)}>
-          <option value="">Choose a connection…</option>
-          {eligible.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.display_name} ({c.provider})
-            </option>
-          ))}
+          {offered.length > 1 && <option value="">Choose a connection…</option>}
+          {offered.map((c) => {
+            const host = connectionHost(c);
+            return (
+              <option key={c.id} value={c.id}>
+                {c.display_name}
+                {host ? ` — ${host}` : ""}
+              </option>
+            );
+          })}
         </select>
       )}
       {hint}

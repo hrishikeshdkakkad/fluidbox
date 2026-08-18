@@ -10,7 +10,7 @@ import { use, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { apiDelete, apiGet, apiPost, Session } from "../../../../lib/api";
-import { LoadingRows, ModalShell, PageHead, Pill, timeAgo } from "../../../../components/bits";
+import { LoadingRows, ModalShell, PageHead, Pill, short, timeAgo } from "../../../../components/bits";
 import { CopyBlock } from "../../../../components/AutomationContract";
 import { useSmartPolling } from "../../../../lib/useSmartPolling";
 import {
@@ -75,15 +75,21 @@ export default function RecipeInstancePage({
     }
   };
 
+  // As in recipes/[slug]: the crumb trail and the <h1> come from the route, so
+  // a failed load must not take them down with it. A deployment id is not a
+  // readable label, so the crumb carries the short form the run pages use.
   if (loadErr && !detail) {
     return (
-      <div className="launch-empty">
-        <p>Could not load this deployment.</p>
-        <p className="err">{loadErr}</p>
-        <Link className="btn" href="/app/recipes?tab=deployments">
-          Back to deployments
-        </Link>
-      </div>
+      <>
+        <PageHead title="Deployment" leaf={short(id)} />
+        <div className="launch-empty">
+          <p>Could not load this deployment.</p>
+          <p className="err">{loadErr}</p>
+          <Link className="btn" href="/app/recipes?tab=deployments">
+            Back to deployments
+          </Link>
+        </div>
+      </>
     );
   }
   if (!detail) return <LoadingRows rows={4} />;

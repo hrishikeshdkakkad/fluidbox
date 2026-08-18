@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
+import { Roboto, Roboto_Mono } from "next/font/google";
 import { AuthKitProvider } from "@workos-inc/authkit-nextjs/components";
+import "./material.css";
 import { RouteFocus } from "../components/RouteFocus";
 import { Sidebar, type WorkosSessionBadge } from "../components/Sidebar";
 import { webMode } from "../lib/proxy-auth";
@@ -33,6 +35,22 @@ export const dynamic = "force-dynamic";
 const WEB_MODE = webMode(process.env.FLUIDBOX_WEB_MODE);
 const AUTH = webAuthMode(process.env.FLUIDBOX_WEB_AUTH);
 
+// The Material skin's faces (material.css --font-sans/--font-mono). Loaded on
+// the app segment so the public site never pays for them; next/font
+// self-hosts, so nothing is fetched at runtime.
+const gemSans = Roboto({
+  subsets: ["latin"],
+  weight: ["400", "500", "700"],
+  variable: "--font-gem-app",
+  display: "swap",
+});
+const gemMono = Roboto_Mono({
+  subsets: ["latin"],
+  weight: ["400", "500"],
+  variable: "--font-gem-mono",
+  display: "swap",
+});
+
 export default async function AppLayout({ children }: LayoutProps<"/app">) {
   // Defense in depth behind proxy.ts: any document request that reaches this
   // segment in workos mode re-validates the session server-side and redirects
@@ -50,7 +68,7 @@ export default async function AppLayout({ children }: LayoutProps<"/app">) {
   }
 
   const shell = (
-    <div className="shell">
+    <div className={`shell ${gemSans.variable} ${gemMono.variable}`}>
       {/* First focusable element on the page; tabIndex on main makes the
           fragment target reliably take focus in every browser. RouteFocus
           handles the CLIENT-navigation half of the same contract. */}

@@ -1579,10 +1579,10 @@ pub fn build_runner_env(
     if let Some(sp) = &run_spec.system_prompt {
         env.push(("FLUIDBOX_SYSTEM_PROMPT".into(), sp.clone()));
     }
-    if !run_spec.capabilities.is_empty() {
+    if !run_spec.capabilities.is_empty() || !run_spec.brokered.is_empty() {
         env.push((
             "FLUIDBOX_CAPABILITIES".into(),
-            runner_capability_manifest(&run_spec.capabilities).to_string(),
+            runner_capability_manifest(&run_spec.capabilities, &run_spec.brokered).to_string(),
         ));
     }
     env
@@ -1720,12 +1720,23 @@ pub fn env_size_breakdown(env: &[(String, String)]) -> String {
 /// The sandbox-facing slice of the frozen capability set. The runner needs:
 /// sandbox servers' launch specs (command/args), and brokered servers'
 /// frozen tool snapshots (to advertise them via the broker shim). Broker
-/// internals — URLs, connection ids — stay out of the sandbox.
+/// internals — URLs, connection ids, binding ids — stay out of the sandbox.
+///
+/// Brokered tools arrive from TWO frozen sources that the gate already treats
+/// as one union (`internal.rs::decide_tool_call`): legacy pre-Phase-C bundles
+/// (`RunSpec.capabilities`, `CapabilityServer::Brokered`) and the
+/// binding-backed surfaces Phase C froze into `RunSpec.brokered`. The runner
+/// manifest must carry BOTH — omitting the binding-backed surfaces left every
+/// post-Phase-C brokered agent with an empty MCP toolset in the sandbox while
+/// the gate stood ready to allow the calls (found live 2026-08-16: codex
+/// reported "I don't have the Linear or Notion MCP tools" against a RunSpec
+/// whose `brokered` field was fully populated).
 fn runner_capability_manifest(
     capabilities: &[fluidbox_core::capability::FrozenBundle],
+    brokered: &[fluidbox_core::spec::BrokeredSurface],
 ) -> serde_json::Value {
     use fluidbox_core::capability::CapabilityServer;
-    let servers: Vec<serde_json::Value> = capabilities
+    let mut servers: Vec<serde_json::Value> = capabilities
         .iter()
         .flat_map(|b| &b.servers)
         .map(|s| match s {
@@ -1747,6 +1758,16 @@ fn runner_capability_manifest(
             }),
         })
         .collect();
+    servers.extend(brokered.iter().map(|surface| {
+        serde_json::json!({
+            "class": "brokered", "name": surface.slot,
+            "tools": surface.tools.iter().map(|t| serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            })).collect::<Vec<_>>(),
+        })
+    }));
     serde_json::json!({ "servers": servers })
 }
 

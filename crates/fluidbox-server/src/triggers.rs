@@ -1543,6 +1543,161 @@ pub async fn invoke(
     }
 }
 
+/// POST /v1/triggers/{id}/run-now — the dashboard's "fire this automation
+/// now". Principal-authenticated (admin/owner, the same bar as
+/// enable/disable), which is safe precisely because it accepts ZERO
+/// overrides: the run is byte-parity with what the subscription's own
+/// trigger would produce if it fired this instant (the template renders
+/// with `fire_time` = now, exactly like a schedule tick), so the endpoint
+/// can never widen the subscription's authority. The trigger-token /invoke
+/// contract is untouched — tokens still cannot reach the admin API and the
+/// admin token still cannot reach /invoke. Every press claims a unique
+/// `manual-…` invocation row (auditable under the automation's firings) and
+/// converges on run_service::create_run, where the subscription's
+/// concurrency policy applies unchanged.
+pub async fn run_now(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    if !rbac::can_manage_subscriptions(&principal) {
+        return Err(ApiError::Forbidden(
+            "running an automation now requires admin or owner".into(),
+        ));
+    }
+    let scope = principal.scope();
+    let sub = fluidbox_db::get_trigger_subscription(&state.pool, scope, id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if !sub.enabled {
+        return Err(ApiError::Conflict(
+            "trigger subscription is disabled".into(),
+        ));
+    }
+    // Event automations render their task from an event payload; there is no
+    // honest "now" for them — a manual fire would fabricate a webhook.
+    if sub.trigger_kind == "event" {
+        return Err(ApiError::BadRequest(
+            "this automation runs from repository events and cannot be fired manually".into(),
+        ));
+    }
+
+    // Render exactly as a schedule firing would, with the clock at "now".
+    let now = chrono::Utc::now();
+    let fire_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let template = sub
+        .task_template
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("subscription has no task_template to run".into()))?;
+    let task = render_task_template(template, &schedule_context(&fire_str))
+        .map_err(ApiError::BadRequest)?;
+
+    let SubRunParams {
+        autonomy,
+        budget_override,
+        result_destinations,
+        workspace: explicit_workspace,
+    } = sub_run_params(&sub)?;
+
+    // A unique key per press: run-now is a deliberate human action, never a
+    // retried machine call — the claim row exists for the audit trail, not
+    // for dedup.
+    let key = format!("manual-{}", Uuid::now_v7());
+    let digest = canonical_digest(&None, &BTreeMap::new(), &None);
+    let invocation_id =
+        match fluidbox_db::claim_invocation(&state.pool, scope, sub.id, &key, &digest).await? {
+            fluidbox_db::InvocationClaim::Claimed { invocation_id } => invocation_id,
+            // Unreachable with a fresh UUIDv7 key; fail loudly, not silently.
+            _ => {
+                return Err(ApiError::Internal(
+                    "fresh run-now idempotency key collided".into(),
+                ))
+            }
+        };
+
+    let actor = principal
+        .user_id()
+        .map(|user| format!("user:{user}"))
+        .unwrap_or_else(|| "operator".to_string());
+
+    let created = crate::run_service::create_run(
+        &state,
+        scope,
+        crate::run_service::CreateRun {
+            agent: sub.agent_id.to_string(),
+            revision: match sub.pinned_revision_id {
+                Some(rid) => crate::run_service::RevisionSelector::Pinned(rid),
+                None => crate::run_service::RevisionSelector::Latest,
+            },
+            task,
+            explicit_workspace,
+            // Any local_copy arrives via the stored revision default, which
+            // passed the operator-only save gate — same as every firing.
+            local_path_authority: crate::api::LocalPathAuthority::Operator,
+            autonomy,
+            trust_tier: fluidbox_core::spec::TrustTier::Trusted,
+            budget_override,
+            // The subscription's stored keep-list applies inside create_run;
+            // run-now adds no further narrowing (and no widening).
+            capability_selection: None,
+            invocation: InvocationContext {
+                kind: InvocationKind::Manual,
+                subscription_id: Some(sub.id),
+                actor: Some(actor),
+                attributes: json!({
+                    "run_now": true,
+                    "fire_time": fire_str,
+                }),
+                received_at: Some(now),
+                ..Default::default()
+            },
+            // Unlike a schedule tick, run-now HAS a directly-authenticated
+            // user — stamp it so visibility and approval authority follow
+            // the person who pressed the button.
+            invoked_by_user_id: principal.user_id(),
+            invoking_token_id: None,
+            // Server-derived authority only; run-now names no explicit binding.
+            explicit_bindings: std::collections::HashMap::new(),
+            result_destinations,
+            bound_invocation: Some(invocation_id),
+            bound_dispatch: None,
+            network_override: None,
+        },
+    )
+    .await;
+
+    match created {
+        Ok(crate::run_service::RunCreation::Created(session)) => Ok(Json(json!({
+            "session_id": session.id,
+            "status": session.status,
+        }))),
+        Ok(crate::run_service::RunCreation::SkippedOverlap { running_session_id }) => {
+            // Terminal outcome of this key — recorded, not retried.
+            fluidbox_db::mark_invocation_skipped(&state.pool, scope, invocation_id, "overlap")
+                .await
+                .ok();
+            Err(ApiError::Conflict(format!(
+                "skipped: run {running_session_id} from this automation is still active (concurrency_policy=skip_if_running)"
+            )))
+        }
+        Ok(crate::run_service::RunCreation::ReplaceUnpersisted { running_session_id }) => {
+            // Transient, NOT terminal: free the key so a retry isn't wedged.
+            fluidbox_db::release_invocation(&state.pool, scope, invocation_id)
+                .await
+                .ok();
+            Err(ApiError::ServiceUnavailable(format!(
+                "could not persist cancellation of running session {running_session_id} for replace; retry"
+            )))
+        }
+        Err(e) => {
+            fluidbox_db::release_invocation(&state.pool, scope, invocation_id)
+                .await
+                .ok();
+            Err(e)
+        }
+    }
+}
+
 /// Scoped polling: a trigger token reads exactly its SUBSCRIPTION's runs.
 /// Deliberately subscription-scoped rather than token-scoped (PR #27 review,
 /// settled): every token of a subscription already shares its invoke

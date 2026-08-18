@@ -16,7 +16,14 @@ import {
 } from "../../../lib/api";
 import { ApprovalActions } from "../../../components/ApprovalActions";
 import { Breadcrumb } from "../../../components/Breadcrumb";
-import { Pill, AutoPill, DiffView, LoadingRows, short } from "../../../components/bits";
+import {
+  Pill,
+  AutoPill,
+  DiffView,
+  InlineMarkdown,
+  LoadingRows,
+  short,
+} from "../../../components/bits";
 import { StateError } from "../../../components/state";
 import { useSmartPolling } from "../../../lib/useSmartPolling";
 
@@ -143,6 +150,44 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
   const diff = artifacts.find((a) => a.kind === "diff");
   const summary = artifacts.find((a) => a.kind === "summary");
   const terminal = session ? isTerminal(session.status) : false;
+  // The session row already carries the summary, so the outcome can render
+  // while the separate /artifacts read is still in flight; the artifact wins
+  // once it lands because it is the fuller text.
+  const resultText = summary?.content ?? session?.result_summary ?? null;
+
+  /**
+   * What the run actually did. For a finished run this is the whole point of
+   * the page, so it renders ABOVE the timeline — it used to sit below ~60 rows
+   * of tool/model/decision entries, which meant the one sentence a person came
+   * for was the last thing they could reach. A live run has no outcome yet, so
+   * there it stays below and the streaming timeline keeps the lead.
+   */
+  const outcome = (
+    <>
+      {resultText && (
+        <>
+          <div className="sectitle">result</div>
+          <div className="panel pad" style={{ whiteSpace: "pre-wrap", fontSize: 13.5 }}>
+            <InlineMarkdown text={resultText} />
+          </div>
+        </>
+      )}
+      {terminal && !resultText && !loadError && (
+        <>
+          <div className="sectitle">result</div>
+          <div className="panel pad">
+            <div className="empty">No result was collected for this run.</div>
+          </div>
+        </>
+      )}
+      {diff && (
+        <>
+          <div className="sectitle">changes</div>
+          <DiffView content={diff.content} />
+        </>
+      )}
+    </>
+  );
 
   return (
     <>
@@ -248,6 +293,8 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
           />
         </div>
       ))}
+
+      {terminal && outcome}
 
       <div className="session-detail-grid">
         {/* Timeline */}
@@ -356,23 +403,9 @@ export default function SessionDetail({ params }: { params: Promise<{ id: string
         </div>
       </div>
 
-      {/* Result summary */}
-      {summary && (
-        <>
-          <div className="sectitle">result</div>
-          <div className="panel pad" style={{ whiteSpace: "pre-wrap", fontSize: 13.5 }}>
-            {summary.content}
-          </div>
-        </>
-      )}
-
-      {/* Diff */}
-      {diff && (
-        <>
-          <div className="sectitle">changes</div>
-          <DiffView content={diff.content} />
-        </>
-      )}
+      {/* A live run's outcome arrives later, so it stays below the timeline
+          it is still writing. Terminal runs render it at the top instead. */}
+      {!terminal && outcome}
       </>
       )}
     </>

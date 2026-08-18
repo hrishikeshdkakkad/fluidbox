@@ -27,6 +27,12 @@ import {
 import { NetworkRequestEditor } from "./NetworkRequestEditor";
 import { AddServerWizard } from "../app/capabilities/AddServerWizard";
 import { defaultModelFor, modelsFor, useHarnesses } from "../lib/harnesses";
+import {
+  clearComposerUrl,
+  composerHref,
+  readComposerUrl,
+  writeComposerUrl,
+} from "../lib/composer-url";
 import { CopyBlock, TemplateChips } from "./AutomationContract";
 import { buildCurl, classifyVariables } from "../lib/automation-contract";
 import { useAuthMe } from "../lib/useAuthMe";
@@ -377,6 +383,88 @@ export function RunComposer({
     onRestore: restoreDraft,
     shouldPersist: hasDraft,
   });
+
+  // ── Selections live in the address bar ────────────────────────────────
+  // A configured run is now linkable: every discrete choice rides the query
+  // string, so a reload keeps it, the back button means something, and one
+  // person can send another the exact configuration they are looking at.
+  // Free text (task, prompts, names) deliberately stays out — see
+  // lib/composer-url.ts for why.
+  const urlSeed = useMemo(
+    () =>
+      typeof window === "undefined"
+        ? {}
+        : readComposerUrl(new URLSearchParams(window.location.search)),
+    []
+  );
+  const mountedPath = useRef(typeof window === "undefined" ? "" : window.location.pathname);
+
+  // Declared AFTER useSessionDraft on purpose: effects run in order, so the
+  // draft restores first and the URL then overrides the keys it names. An
+  // explicit link should beat a stale draft left in this tab.
+  useEffect(() => {
+    if (urlSeed.mode) setMode(urlSeed.mode);
+    if (urlSeed.agentChoice && !agentOnly) setAgentChoice(urlSeed.agentChoice);
+    if (urlSeed.agent) setSelectedAgentName(urlSeed.agent);
+    if (urlSeed.harness) setHarness(urlSeed.harness);
+    if (urlSeed.model) setModel(urlSeed.model);
+    if (urlSeed.policy) setPolicyName(urlSeed.policy);
+    if (urlSeed.approvals) setAutonomous(urlSeed.approvals === "auto");
+    if (urlSeed.trigger) setKind(urlSeed.trigger);
+    // Only the MODE comes from the URL; a repository or path already restored
+    // from the draft is not a selection this module owns, so it survives.
+    const wsMode = urlSeed.workspace;
+    if (wsMode) {
+      setWorkspace((current) => (current.mode === wsMode ? current : { ...current, mode: wsMode }));
+    }
+    // Mount-only: the URL seeds state once, then state owns the URL (below).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const search = writeComposerUrl(
+      {
+        compose: agentOnly ? "agent" : "run",
+        mode: agentOnly ? undefined : mode,
+        agentChoice,
+        agent: selectedAgentName,
+        harness,
+        model,
+        policy: policyName,
+        approvals: autonomous ? "auto" : "wait",
+        workspace: workspace.mode,
+        // Only meaningful once the run is saved behind a trigger.
+        trigger: !agentOnly && mode === "automation" ? kind : undefined,
+      },
+      new URLSearchParams(window.location.search)
+    );
+    window.history.replaceState({}, "", composerHref(window.location.pathname, search));
+  }, [
+    agentOnly,
+    mode,
+    agentChoice,
+    selectedAgentName,
+    harness,
+    model,
+    policyName,
+    autonomous,
+    workspace.mode,
+    kind,
+  ]);
+
+  // Closing puts the address bar back the way it was found. Skipped when the
+  // page has navigated (a created run pushes to /app/activity) — rewriting the
+  // query of a route we just left would clobber the destination.
+  useEffect(() => {
+    const openedAt = mountedPath.current;
+    return () => {
+      if (typeof window === "undefined") return;
+      if (window.location.pathname !== openedAt) return;
+      const search = clearComposerUrl(new URLSearchParams(window.location.search));
+      window.history.replaceState({}, "", composerHref(window.location.pathname, search));
+    };
+  }, []);
 
   // Policy summaries feed the attachment select AND the autonomy gate; the
   // server computed autonomy_summary — the browser only renders it.
@@ -1416,6 +1504,15 @@ export function RunComposer({
                       </>
                     ) : null;
                   };
+                  // A preset that edits the agent must say so where it is
+                  // chosen, not only in the sentence underneath.
+                  // Neutral on purpose: it labels what an option would do. The
+                  // amber banner below carries the alarm for what is actually
+                  // selected, and three shouting cards would just be noise.
+                  const ruleBadge = (preset: "autopilot" | "ask" | "free") =>
+                    presetChangesRules(preset) ? (
+                      <span className="badge preset-rule-badge">changes agent rules</span>
+                    ) : null;
                   return (
                     <>
                       <button
@@ -1431,6 +1528,7 @@ export function RunComposer({
                             <span className="selected-label">Selected</span>
                           )}
                         </span>
+                        {ruleBadge("autopilot")}
                         <div className="d">
                           {governedTarget !== null && !governedTarget.autonomy_summary?.permitted
                             ? `The ${governedTarget.name} rules require a person to approve — autopilot is off the table.`
@@ -1457,6 +1555,7 @@ export function RunComposer({
                           Ask me as it works
                           {activePreset === "ask" && <span className="selected-label">Selected</span>}
                         </span>
+                        {ruleBadge("ask")}
                         <div className="d">
                           Pauses for your OK whenever it wants to do something the rules flag
                           {mode === "automation" ? " — approvals land in Activity" : ""}.
@@ -1477,6 +1576,7 @@ export function RunComposer({
                           Free rein
                           {activePreset === "free" && <span className="selected-label">Selected</span>}
                         </span>
+                        {ruleBadge("free")}
                         <div className="d">
                           {freeBlocked
                             ? "No fully-permissive rules exist yet — create them in Governance."
@@ -1494,24 +1594,37 @@ export function RunComposer({
                   );
                 })()}
               </div>
-              {activePreset !== null ? (
-                <button
-                  className="btn ghost sm"
-                  type="button"
-                  style={{ justifySelf: "start" }}
-                  onClick={() => setCustomGuardrails((current) => !current)}
-                >
-                  {customGuardrails
-                    ? "Hide the separate controls"
-                    : "Choose rules and approvals separately"}
-                </button>
-              ) : (
-                <span className="helper" style={{ margin: 0 }}>
-                  These settings don&apos;t match a preset — shown in full below.
-                </span>
+              {/* Starting a run can also APPEND a revision to the agent,
+                  changing its rules for every future run. That is a large
+                  consequence for a launch-time click, and it used to be a
+                  clause inside a card's body copy. */}
+              {agentChoice === "existing" && revisionTouched && policyOverride && (
+                <div className="note" role="status">
+                  This also updates <b>{selectedAgentName || "the agent"}</b>&apos;s rules to{" "}
+                  <b>{policyOverride}</b> — a new revision, which applies to future runs of this
+                  agent. This run is unaffected either way.
+                </div>
               )}
-              {(customGuardrails || activePreset === null) && (
-                <>
+
+              {/* The raw axes live behind one disclosure so three presets are
+                  the whole decision by default. A selection no preset matches
+                  is Custom, and must stay open — those controls are the only
+                  explanation of what is currently selected. */}
+              <details className="advanced-config" open={activePreset === null || customGuardrails}>
+                <summary
+                  onClick={(event) => {
+                    event.preventDefault();
+                    if (activePreset === null) return;
+                    setCustomGuardrails((current) => !current);
+                  }}
+                >
+                  Advanced: rules and approvals
+                </summary>
+                {activePreset === null && (
+                  <span className="helper" style={{ margin: 0 }}>
+                    These settings don&apos;t match a preset — shown in full below.
+                  </span>
+                )}
               {/*
                 One explicit either/or instead of a flip-toggle whose label
                 changed under the cursor. The rules (policy) are NAMED here so
@@ -1572,8 +1685,7 @@ export function RunComposer({
                   </div>
                 </button>
               </div>
-                </>
-              )}
+              </details>
               {mode === "automation" && !autonomous && (
                 <span className="field-hint">
                   Automations can fire while you&apos;re away — approvals wait in Activity and are
