@@ -872,6 +872,21 @@ h1.title {
   min-width: 0;
   padding: 25px 26px 27px 4px;
   position: relative;
+  /* Each metric is a link into Activity (2026-08-17): the number IS the
+     navigation, so it must not read as link text. */
+  display: block;
+  color: inherit;
+  text-decoration: none;
+  border-radius: var(--radius);
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+.ops-metric:hover {
+  background: var(--interactive-subtle);
+}
+.ops-metric:hover strong {
+  color: var(--accent-dim);
 }
 .ops-metric + .ops-metric {
   padding-left: 26px;
@@ -945,9 +960,6 @@ h1.title {
   display: flex;
   flex-direction: column;
   gap: 9px;
-}
-.recent-heading {
-  animation: enter 0.5s 0.1s ease both;
 }
 .run-list {
   overflow: hidden;
@@ -1422,9 +1434,6 @@ h1.title {
 
 /* ─── Unified runs + automations ───────────────────────────────────── */
 
-.operate-tabs {
-  margin-bottom: 28px;
-}
 .operate-view {
   animation: enter 0.35s cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
@@ -2015,6 +2024,12 @@ h1.title {
 .creation-footer > :last-child {
   justify-self: end;
 }
+/* Note: `enter` is used with fill-mode `both`, so every section carrying it
+   retains a transform after it finishes — an identity one, but ANY transform
+   makes that element the containing block for position:fixed descendants.
+   Dropping the `to` keyframe does NOT change this (measured). Modals are
+   immune because ModalShell portals to <body>; anything else using
+   position:fixed inside an animated section must do the same. */
 @keyframes enter {
   from {
     opacity: 0;
@@ -8344,12 +8359,14 @@ a.st-use:hover p {
 }
 
 /* ── The run table (activity workbench) ───────────────────────────────
-   Real columns under a mono header: run · agent · trigger · status · age.
-   Shares the day-divider and rail language with the compact run rows. */
+   Real columns under a mono header: run · agent · trigger · status · age
+   · re-run · chevron. ONE template, declared here and nowhere else — the
+   skin files restyle type and shape but never re-cut the grid. Shares the
+   day-divider and rail language with the compact run rows. */
 .run-thead {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 150px 90px 170px 64px 14px;
-  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) 150px 90px 156px 60px 84px 16px;
+  gap: 12px;
   padding: 9px 18px 8px;
   border-bottom: 1px solid var(--border);
   background: var(--interactive-subtle);
@@ -8367,8 +8384,8 @@ a.st-use:hover p {
   min-height: 64px;
   padding: 11px 18px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 150px 90px 170px 64px 14px;
-  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) 150px 90px 156px 60px 84px 16px;
+  gap: 12px;
   align-items: center;
   border-bottom: 1px solid var(--border);
   color: inherit;
@@ -8444,18 +8461,377 @@ a.st-use:hover p {
   color: var(--ink);
   transform: translateX(2px);
 }
+/* The responsive ladder sheds columns in triage order: trigger first (its
+   kind is repeated in the meta line's voice anyway), then agent/age, and
+   the re-run affordance last — status never leaves. */
+@media (max-width: 1180px) {
+  .run-thead,
+  .run-tr {
+    grid-template-columns: minmax(0, 1fr) 132px 156px 60px 76px 14px;
+  }
+  .run-th-trigger,
+  .run-td-trigger {
+    display: none;
+  }
+}
 @media (max-width: 900px) {
   .run-thead {
     display: none;
   }
   .run-tr {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     gap: 10px;
   }
   .run-td-agent,
-  .run-td-trigger,
   .run-td-age,
   .run-tr .run-arrow {
+    display: none;
+  }
+}
+@media (max-width: 560px) {
+  .run-tr {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .run-td-rerun {
+    display: none;
+  }
+}
+
+/* ── The activity board ───────────────────────────────────────────────
+   One instrument card: heading + triage chips, the 24h pulse band, the
+   run table, and the pager share a single container — the pulse reads as
+   a seismograph strip directly above the log it summarizes. Children keep
+   their own classes; the board only re-frames them. */
+.activity-board {
+  /* Measured height of the sticky header (33.75px rendered); the day label
+     tucks a fraction under it so no seam opens while scrolling. */
+  --run-thead-h: 33px;
+
+  margin-bottom: 56px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--panel-shadow);
+}
+.activity-board .section-heading {
+  margin-bottom: 0;
+  padding: 18px 18px 14px;
+}
+.activity-board .activity-pulse {
+  margin: 0;
+  padding: 14px 18px 11px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+.activity-board .run-list {
+  /* position:sticky dies inside a clipped ancestor — the board's rounded
+     corners are safe because no child paints at them. */
+  overflow: visible;
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  animation: none;
+}
+.activity-board .run-thead {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background:
+    linear-gradient(var(--interactive-subtle), var(--interactive-subtle)),
+    var(--surface);
+}
+.activity-board .run-day-label {
+  position: sticky;
+  top: var(--run-thead-h);
+  z-index: 2;
+  background:
+    linear-gradient(var(--interactive-subtle), var(--interactive-subtle)),
+    var(--surface);
+}
+@media (max-width: 900px) {
+  .activity-board .run-day-label {
+    top: 0;
+  }
+}
+
+/* The pager: range readout on the left, density + page walk on the right.
+   Mono voice for the numbers — they are data, not chrome. */
+.run-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  padding: 10px 18px;
+  border-top: 1px solid var(--border);
+}
+.pager-range {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: lowercase;
+}
+.pager-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+}
+.pager-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: lowercase;
+}
+.pager-size select {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink-2);
+  font: inherit;
+  cursor: pointer;
+}
+.pager-pages {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.pager-step,
+.pager-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s,
+    border-color 0.15s;
+}
+.pager-step:hover:not(:disabled),
+.pager-num:hover {
+  background: var(--interactive-hover);
+  color: var(--ink);
+}
+.pager-num.on {
+  background: var(--accent-tint);
+  color: var(--accent-dim);
+}
+.pager-step:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* ── Agent detail (2026-08-17) ────────────────────────────────────────
+   The system prompt is shown VERBATIM: it is the agent's whole character,
+   and the list view used to compress it to the words "prompt set". */
+.agent-prompt {
+  margin: 0;
+  max-height: 460px;
+  overflow: auto;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* A revision row is a control (it swaps what the page reports), so it needs
+   the affordances a plain row does not have. */
+button.agent-rev-row {
+  width: 100%;
+  border: 0;
+  background: none;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+button.agent-rev-row:hover {
+  background: var(--interactive-hover);
+}
+button.agent-rev-row.on {
+  background: var(--accent-tint);
+  color: var(--accent-dim);
+}
+button.agent-rev-row.on .faint {
+  color: inherit;
+}
+
+/* Sits under a preset's title, not inside it: inline, the badge stole enough
+   width to wrap two-word titles onto two lines. */
+.preset-rule-badge {
+  align-self: start;
+  margin: 6px 0 2px;
+}
+
+/* ── Home: quiet state + hand-offs (2026-08-17) ───────────────────────
+   Overview stopped embedding the run list, the automations panel and the
+   resource cards. Two small pieces replace them: the last-run card that
+   gives the (usual) quiet state something true to say, and the hand-off
+   row that points at the surfaces which own that content. */
+/* Inside the Operations panel the strip is the last thing in the card, so its
+   own bottom margin would paint an empty band under the numbers. */
+.overview-panel .ops-strip {
+  margin-bottom: 0;
+}
+
+.last-run {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+a.last-run:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+.last-run-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.last-run strong {
+  display: block;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+.last-run p {
+  margin: 6px 0 0;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.home-handoff {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 34px 0 58px;
+}
+.handoff-card {
+  display: block;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: inherit;
+  text-decoration: none;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.handoff-card:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+.handoff-card strong {
+  display: block;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 500;
+}
+.handoff-card small {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.45;
+}
+@media (max-width: 760px) {
+  .home-handoff {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ── The workbench split ──────────────────────────────────────────────
+   Wide viewports place the automations rail BESIDE the run board so both
+   halves of the workbench are on screen at once; below the split they
+   stack, and the pagehead's jump link announces the buried half. The
+   split threshold accounts for the 264px nav rail: 1560px viewport ⇒
+   ~1250px of main column, enough for board + 420px rail. */
+.activity-workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+@media (min-width: 1560px) {
+  /* Only this page earns the wider column — every other page keeps the
+     1200px reading measure. */
+  .main:has(.activity-workbench) {
+    max-width: 1760px;
+  }
+  .activity-workbench {
+    grid-template-columns: minmax(0, 1fr) 420px;
+    gap: 28px;
+    align-items: start;
+  }
+  .activity-board {
+    margin-bottom: 0;
+  }
+  /* The rail stays put while long run lists scroll; its own overflow
+     takes over if the automation list outgrows the viewport. */
+  .automation-rail {
+    position: sticky;
+    top: 24px;
+    max-height: calc(100dvh - 48px);
+    overflow-y: auto;
+  }
+  .automations-jump {
+    display: none;
+  }
+  /* Rail compression: the panel's row grid assumes full width. */
+  .automation-rail .section-heading {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+  .automation-rail .automation-row-main {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+    min-height: 0;
+  }
+  .automation-rail .automation-kind {
+    justify-self: start;
+  }
+  .automation-rail .automation-actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+  .automation-rail .automation-activity {
+    grid-template-columns: minmax(0, 1fr);
+    padding-left: 18px;
+  }
+}
+/* Split-but-narrow: the board column lands under ~1000px, the same squeeze
+   the stacked 1180 step handles — shed the trigger column here too. */
+@media (min-width: 1560px) and (max-width: 2140px) {
+  .activity-workbench .run-thead,
+  .activity-workbench .run-tr {
+    grid-template-columns: minmax(0, 1fr) 132px 156px 60px 76px 14px;
+  }
+  .activity-workbench .run-th-trigger,
+  .activity-workbench .run-td-trigger {
     display: none;
   }
 }

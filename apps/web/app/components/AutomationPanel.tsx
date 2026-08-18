@@ -16,7 +16,6 @@ import {
   TriggerSubscription,
 } from "../lib/api";
 import { LoadingRows, Pill, short } from "./bits";
-import { MintedAutomation, ShowAutomationSecrets } from "./RunComposer";
 import { useSmartPolling } from "../lib/useSmartPolling";
 
 export function AutomationPanel({
@@ -31,7 +30,6 @@ export function AutomationPanel({
   const [subscriptions, setSubscriptions] = useState<TriggerSubscription[]>([]);
   const [schedules, setSchedules] = useState<Record<string, Schedule>>({});
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [minted, setMinted] = useState<MintedAutomation | null>(null);
   const [err, setErr] = useState("");
   const [loadErr, setLoadErr] = useState("");
   const [loading, setLoading] = useState(true);
@@ -75,28 +73,9 @@ export function AutomationPanel({
     }
   };
 
-  const rotate = async (subscription: TriggerSubscription) => {
-    setErr("");
-    try {
-      const response = await apiPost<{
-        token: string;
-        base_url: string | null;
-        invoke_url: string | null;
-        poll_url_template: string | null;
-      }>(`/triggers/${subscription.id}/rotate_token`, {});
-      setMinted({
-        subscription,
-        token: response.token,
-        callback_secret: null,
-        rotated: true,
-        base_url: response.base_url,
-        invoke_url: response.invoke_url,
-        poll_url_template: response.poll_url_template,
-      });
-    } catch (error) {
-      setErr(String(error));
-    }
-  };
+  // Token rotation lives on the automation's own page (behind a confirm), not
+  // in this list: a credential-destroying control does not belong at the same
+  // weight as "Activity" on a row you scan past.
 
   return (
     <section className="automation-panel" aria-labelledby="automations-heading">
@@ -155,15 +134,64 @@ export function AutomationPanel({
                 schedule={schedules[subscription.id]}
                 agentName={agentName(subscription.agent_id)}
                 onToggle={setEnabled}
-                onRotate={rotate}
               />
             ))}
           </div>
         )}
       </div>
 
-      {minted && <ShowAutomationSecrets minted={minted} onClose={() => setMinted(null)} />}
     </section>
+  );
+}
+
+/**
+ * Fire this automation right now: POST /triggers/{id}/run-now creates a run
+ * exactly as the subscription's own trigger would (template rendered with
+ * fire_time = now, same concurrency policy), then navigates to the live run.
+ * Event automations have no honest "now" (their task needs an event payload)
+ * and disabled ones must be enabled first — no button in either case.
+ */
+function RunNowButton({ subscription }: { subscription: TriggerSubscription }) {
+  const router = useRouter();
+  const [state, setState] = useState<"idle" | "busy" | "failed">("idle");
+  const [failure, setFailure] = useState("");
+
+  if (subscription.trigger_kind === "event" || !subscription.enabled) return null;
+
+  const runNow = async () => {
+    if (state === "busy") return;
+    setState("busy");
+    try {
+      const response = await apiPost<{ session_id?: string }>(
+        `/triggers/${subscription.id}/run-now`,
+        {}
+      );
+      if (response.session_id) {
+        router.push(`/app/sessions/${response.session_id}`);
+      } else {
+        setFailure("The run could not be started.");
+        setState("failed");
+      }
+    } catch (error) {
+      setFailure(String(error));
+      setState("failed");
+    }
+  };
+
+  return (
+    <button
+      className="btn sm run-now"
+      type="button"
+      onClick={() => void runNow()}
+      disabled={state === "busy"}
+      title={
+        state === "failed"
+          ? failure
+          : "Start a run from this configuration right now"
+      }
+    >
+      {state === "busy" ? "Starting…" : state === "failed" ? "Retry" : "Run now"}
+    </button>
   );
 }
 
@@ -190,13 +218,11 @@ function AutomationRow({
   schedule,
   agentName,
   onToggle,
-  onRotate,
 }: {
   subscription: TriggerSubscription;
   schedule?: Schedule;
   agentName: string;
   onToggle: (subscription: TriggerSubscription, enabled: boolean) => void;
-  onRotate: (subscription: TriggerSubscription) => void;
 }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -242,18 +268,18 @@ function AutomationRow({
             </div>
           )}
         </div>
+        {/* One primary action. The row previously carried five of equal
+            weight — including "Rotate token", which destroys a live
+            credential — beside a row that already opens on click and a title
+            that is already a link. "Open →" was the third way to do the same
+            thing; rotation moved to the detail page, behind a confirm. */}
         <div className="automation-actions">
+          <RunNowButton subscription={subscription} />
           <button className="btn ghost sm" type="button" onClick={() => setOpen((current) => !current)}>
             {open ? "Hide activity" : "Activity"}
           </button>
-          <Link className="btn ghost sm" href={`/automations/${subscription.id}`}>
-            Open →
-          </Link>
-          <button className="btn ghost sm" type="button" onClick={() => onRotate(subscription)}>
-            Rotate token
-          </button>
           <button
-            className="btn sm"
+            className="btn ghost sm"
             type="button"
             onClick={() => onToggle(subscription, !subscription.enabled)}
           >

@@ -1,0 +1,691 @@
+/* Material/Gemini skin for the WHOLE dashboard (2026-08-16 demo ask #2).
+   Scope is `.shell` — the authenticated app chrome — so the public marketing
+   site keeps its own identity. The dashboard's stylesheets already resolve
+   every component through the kernel token layer (primitives --ds-*, then
+   semantic --bg/--surface/--accent/…), so this file restyles "every aspect of
+   all pages and components" the honest way: it re-points the PRIMITIVES to
+   the Gemini/M3 palette (Google Blue replaces kernel-chartreuse; white/tinted
+   surfaces in light, #131314/#1e1f20 in dark), swaps the type to Roboto, and
+   moves the shape scale to M3 (12/20px + pills). A short primitive block then
+   covers the few places where the kernel look is structural rather than
+   token-driven (flood-on-hover buttons, hairline-bordered panels, square
+   chips). No iconography is added anywhere — type, surface, and shape carry
+   the whole look. Loaded from app/app/layout.tsx, i.e. AFTER globals/kernel
+   in the cascade, which is what lets equal-specificity overrides win. */
+
+.shell {
+  /* stylelint-disable color-no-hex -- M3 light token block; the sanctioned literal home */
+  --ds-background-100: #fff;
+  --ds-background-200: #f0f4f9;
+  --ds-gray-100: #e9eef6;
+  --ds-gray-200: #dde3ea;
+  --ds-gray-300: #dadce0;
+  --ds-gray-400: #c4c7c5;
+  --ds-gray-500: #9aa0a6;
+  --ds-gray-600: #80868b;
+  --ds-gray-700: #5e6368;
+  --ds-gray-800: #474b4f;
+  --ds-gray-900: #3c4043;
+  --ds-gray-1000: #1f1f1f;
+  --ds-gray-alpha-100: #1f1f1f0a;
+  --ds-gray-alpha-200: #1f1f1f21;
+  --ds-gray-alpha-300: #1f1f1f38;
+  --ds-gray-alpha-400: #1f1f1f59;
+  --ds-gray-alpha-500: #1f1f1f80;
+  --ds-gray-alpha-600: #1f1f1fa6;
+  /* LIGHT = Material monochrome (the NotebookLM/Workspace scheme): the
+     accent/primary family is near-black ink, containers are neutral tint.
+     Dark mode keeps Google Blue — black-on-black has no primary. */
+  --ds-green-100: #e4e7eb;
+  --ds-green-700: #1f1f1f;
+  --ds-green-900: #000;
+  --ds-gold-100: #feefc3;
+  --ds-gold-700: #855c00;
+  --ds-gold-900: #5f4600;
+  --ds-red-100: #f9dedc;
+  --ds-red-700: #b3261e;
+  --ds-red-900: #8c1d18;
+  --flood: #1f1f1f;
+  --flood-ink: #fff;
+  --gold: #f9ab00;
+  --chrome-bg: rgb(255 255 255 / 92%);
+  --control-bg: #f0f4f9;
+  --primary-bg: #1f1f1f;
+  --primary-hover: #000;
+  --primary-ink: #fff;
+  --overlay-bg: rgb(31 31 31 / 45%);
+  --selection-bg: #dbdfe4;
+  --surface-soft: rgb(240 244 249 / 94%);
+  --canvas-glow: transparent;
+  --flood-glow: 0 1px 3px rgb(31 31 31 / 28%);
+  --panel-shadow: none;
+  --modal-shadow: 0 8px 40px rgb(31 31 31 / 22%);
+  /* True M3 success green — decoupled from the accent family, which the
+     kernel shared (success states must not read blue). */
+  --m3-green-text: #146c2e;
+  --m3-green-container: #c4eed0;
+  --m3-green-on-container: #0f5223;
+  /* stylelint-enable color-no-hex */
+
+  /* Re-derive the semantic layer HERE. Custom properties substitute their
+     var() references on the element where they are DECLARED, so kernel.css's
+     `--accent-tint: var(--ds-green-100)` froze against kernel primitives at
+     the html element — overriding primitives on .shell alone changed nothing
+     that flows through a semantic token (caught live: the masthead pill
+     stayed chartreuse). Declared once, theme-agnostic: the primitives above
+     and in the dark block below are what flip. */
+  --bg: var(--ds-background-100);
+  --surface: var(--ds-background-200);
+  --raised: var(--ds-gray-100);
+  --surface-hover: var(--ds-gray-100);
+  --border: var(--ds-gray-alpha-300);
+  --border-strong: var(--ds-gray-alpha-500);
+  --ink: var(--ds-gray-1000);
+  --ink-2: var(--ds-gray-900);
+  --ink-3: var(--ds-gray-700);
+  --accent: var(--ds-green-700);
+  --accent-dim: var(--ds-green-900);
+  --accent-tint: var(--ds-green-100);
+  --amber: var(--ds-gold-700);
+  --amber-tint: var(--ds-gold-100);
+  --amber-dim: var(--ds-gold-900);
+  --green: var(--m3-green-text);
+  --green-tint: var(--m3-green-container);
+  --green-dim: var(--m3-green-on-container);
+  --red: var(--ds-red-700);
+  --red-tint: var(--ds-red-100);
+  --red-dim: var(--ds-red-900);
+  --interactive-subtle: var(--ds-gray-alpha-100);
+  --interactive-hover: var(--ds-gray-alpha-200);
+  --scrollbar: var(--ds-gray-300);
+  --scrollbar-hover: var(--ds-gray-500);
+
+  /* Monochrome light: hover is a quiet ink wash. (Declared after the
+     derivation above so it wins within this block.) */
+  --interactive-hover: rgb(31 31 31 / 6%);
+  min-height: 100dvh;
+
+  /* M3 shape scale + Google type, through the system's own tokens. */
+  --radius: 12px;
+  --radius-lg: 20px;
+  --font-sans: var(--font-gem-app), roboto, "Helvetica Neue", arial, sans-serif;
+  --font-display: var(--font-gem-app), roboto, "Helvetica Neue", arial, sans-serif;
+  --font-mono: var(--font-gem-mono), "Roboto Mono", ui-monospace, menlo, monospace;
+
+  background: var(--bg);
+}
+
+html[data-theme="dark"] .shell {
+  /* stylelint-disable color-no-hex -- M3 TRUE-BLACK token block: #000 canvas,
+     #131314 containers, #1e1f20 raised — the Gemini OLED ramp. */
+  --ds-background-100: #000;
+  --ds-background-200: #131314;
+  --ds-gray-100: #1e1f20;
+  --ds-gray-200: #242628;
+  --ds-gray-300: #2e3033;
+  --ds-gray-400: #444746;
+  --ds-gray-500: #5e6368;
+  --ds-gray-600: #80868b;
+  --ds-gray-700: #9aa0a6;
+  --ds-gray-800: #bdc1c6;
+  --ds-gray-900: #c4c7c5;
+  --ds-gray-1000: #e3e3e3;
+  --ds-gray-alpha-100: #e3e3e30d;
+  --ds-gray-alpha-200: #e3e3e31f;
+  --ds-gray-alpha-300: #e3e3e338;
+  --ds-gray-alpha-400: #e3e3e352;
+  --ds-gray-alpha-500: #e3e3e37a;
+  --ds-gray-alpha-600: #e3e3e3a3;
+  /* DARK mirrors light's monochrome: inverted near-white primary, neutral
+     containers. The blue trio (lavender pill / saturated container / blue
+     avatar) read as three systems at once — one ink voice, like light. */
+  --ds-green-100: #2d2f31;
+  --ds-green-700: #e3e3e3;
+  --ds-green-900: #fff;
+  --ds-gold-100: #533f00;
+  --ds-gold-700: #fdd663;
+  --ds-gold-900: #ffdf99;
+  --ds-red-100: #8c1d18;
+  --ds-red-700: #f2b8b5;
+  --ds-red-900: #f9dedc;
+  --flood: #e3e3e3;
+  --flood-ink: #131314;
+  --gold: #fdd663;
+  --chrome-bg: rgb(0 0 0 / 86%);
+  --control-bg: #1e1f20;
+  --primary-bg: #e3e3e3;
+  --primary-hover: #fff;
+  --primary-ink: #131314;
+  --overlay-bg: rgb(0 0 0 / 62%);
+  --selection-bg: rgb(227 227 227 / 24%);
+  --surface-soft: rgb(19 19 20 / 94%);
+  --canvas-glow: transparent;
+  --flood-glow: 0 2px 8px rgb(227 227 227 / 20%);
+  --panel-shadow: none;
+  --modal-shadow: 0 8px 48px rgb(0 0 0 / 70%);
+  --m3-green-text: #6dd58c;
+  --m3-green-container: #0f5223;
+  --m3-green-on-container: #c4eed0;
+  /* stylelint-enable color-no-hex */
+
+  /* Monochrome dark: hover is a quiet ink-light wash. */
+  --interactive-hover: rgb(227 227 227 / 8%);
+}
+
+/* ── Primitives where the kernel look is structural, not token-driven ───── */
+
+/* Buttons: M3 pills. The kernel floods EVERY button chartreuse on hover;
+   with Google Blue as the flood that reads as a shout on ghost buttons, so
+   hover becomes the quiet M3 state layer and only .primary stays filled. */
+.shell .btn {
+  border-radius: 999px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  text-transform: capitalize;
+}
+
+.shell .btn:hover {
+  background: var(--interactive-hover);
+  border-color: var(--border-strong);
+  color: var(--ink);
+}
+
+.shell .btn.primary:hover {
+  background: var(--primary-hover);
+  border-color: transparent;
+  color: var(--primary-ink);
+  box-shadow: var(--flood-glow);
+}
+
+.shell .chip,
+.shell .badge,
+.shell .pill {
+  border-radius: 999px;
+}
+
+/* Cards: borderless surface tint, the Gemini container. */
+.shell .panel {
+  border-color: transparent;
+}
+
+/* Inputs: M3 filled fields. */
+.shell .inp,
+.shell select.inp,
+.shell textarea.inp {
+  background: var(--control-bg);
+  border-color: transparent;
+  border-radius: var(--radius);
+}
+
+.shell .inp:focus {
+  border-color: var(--accent);
+}
+
+/* Modals: M3 dialog shape. */
+.shell .modal {
+  border-color: transparent;
+  border-radius: var(--radius-lg);
+}
+
+/* The masthead active pill keeps its tint tokens (now blue); round it. */
+.shell .masthead-nav a {
+  border-radius: 999px;
+}
+
+/* ── Structure pass (round 2): retire the terminal idioms ───────────────────
+   The token remap changed colour and shape but the kernel's STRUCTURE still
+   read as a terminal: mono-font kickers, forced-lowercase display type,
+   hairline-boxed stat strips, thin 300-weight headings. Google's feel is the
+   opposite — Roboto at 400/500, sentence case, generous rhythm, and tonal
+   containers instead of rules. Every override here targets a named kernel
+   idiom at equal-or-higher specificity; the cascade position does the rest. */
+
+/* Display type: sentence case, regular weight, product-page scale. */
+.shell h1.title,
+.shell .dashboard-header h1 {
+  font-size: 34px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.shell .section-heading h2,
+.shell .configuration-head h2,
+.shell .overview-panel-head h2 {
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.shell .sub {
+  font-size: 15px;
+  color: var(--ink-3);
+}
+
+/* Kickers, notes, crumbs, metric labels: Roboto 500, sentence case — the
+   mono voice stays reserved for real data (ids, hashes, cron strings). */
+.shell .section-kicker,
+.shell .home-kicker,
+.shell .metric-label,
+.shell .section-note,
+.shell .crumbs,
+.shell .tab .n {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  text-transform: none;
+}
+
+.shell .crumbs {
+  font-size: 12.5px;
+}
+
+/* Labels render their source text — they are sentences, and capitalize
+   turned "What should the agent accomplish?" into Title Case noise.
+   (Button casing lives on the pill rule above.) */
+.shell .lab,
+.shell label.field .lab,
+.shell .field .lab {
+  text-transform: none;
+  font-family: var(--font-sans);
+  font-weight: 500;
+}
+
+/* Dialog headers: Google dialogs use quiet 500-weight sentence case. */
+.shell .modal .mh .t {
+  font-family: var(--font-sans);
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.shell .field-hint,
+.shell .helper {
+  text-transform: none;
+}
+
+/* Stat strip → four tonal stat cards (the Gemini "at a glance" row). */
+.shell .ops-strip {
+  gap: 12px;
+  border: 0;
+}
+
+.shell .ops-metric,
+.shell .ops-metric + .ops-metric {
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--raised);
+  padding: 18px 20px;
+}
+
+.shell .ops-metric strong {
+  font-size: 32px;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+/* Tabs: M3 primary tabs — taller hit area, rounded 3px indicator. */
+.shell .tabs {
+  gap: 8px;
+  border-bottom-color: var(--border);
+}
+
+.shell .tab {
+  min-height: 44px;
+  padding: 0 14px;
+  font-weight: 500;
+  text-transform: none;
+}
+
+.shell .tab.active::after {
+  height: 3px;
+  border-radius: 999px 999px 0 0;
+  background: var(--accent);
+}
+
+/* Page rhythm: a little more air under every page head. */
+.shell .pagehead {
+  margin-bottom: 36px;
+}
+
+/* App bar: Google height, quiet hairline. */
+.shell .topbar {
+  border-bottom-color: var(--border);
+}
+
+.shell .topbar-inner {
+  min-height: 64px;
+}
+
+/* ── Activity workbench (round 3) ─────────────────────────────────────── */
+
+/* The grid template itself lives in globals.css (one source); the skin only
+   retypes the header voice and rounds the board's controls. */
+.shell .run-thead,
+.shell .run-day-label {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  text-transform: none;
+}
+
+.shell .run-rerun {
+  height: 30px;
+  min-height: 30px;
+  padding: 0 14px;
+}
+
+/* The activity board is an M3 tonal card, like .panel: surface, no rule. */
+.shell .activity-board {
+  border-color: transparent;
+}
+
+/* Pager controls read as Google text buttons: pills, sans voice. The range
+   readout stays mono — it is data. */
+.shell .pager-step,
+.shell .pager-num {
+  border-radius: 999px;
+  font-family: var(--font-sans);
+}
+
+.shell .pager-size {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  text-transform: none;
+}
+
+.shell .pager-size select {
+  border-color: transparent;
+  border-radius: 999px;
+  background: var(--control-bg);
+}
+
+/* Text buttons (Activity / Open / Rotate Token) read as Google text buttons:
+   accent-coloured, tonal pill on hover (hover comes from the shared rule). */
+.shell .btn.ghost {
+  color: var(--accent);
+  border-color: transparent;
+}
+
+/* Automation rows: tonal cards instead of hairline stripes. */
+.shell .automation-list {
+  border: 0;
+  background: transparent;
+}
+
+.shell .automation-rows {
+  display: grid;
+  gap: 12px;
+}
+
+.shell .automation-row {
+  background: var(--surface);
+  border: 0;
+  border-radius: var(--radius);
+}
+
+.shell .automation-heading {
+  align-items: center;
+}
+
+/* ── Navigation rail (round 4): the crowded top bar becomes a Gemini-style
+   left drawer. Desktop: a static 264px rail beside the content column.
+   Mobile (≤900px): a slim brand bar plus a slide-in drawer with scrim.
+   All the old .topbar/.masthead-nav rules go inert with their markup. ── */
+
+@media (min-width: 901px) {
+  .shell {
+    display: grid;
+    grid-template-columns: 264px minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .shell .sidenav-mobilebar {
+    display: none;
+  }
+
+  .shell .sidenav {
+    position: sticky;
+    top: 0;
+    height: 100dvh;
+    overflow-y: auto;
+  }
+
+  /* The skip link spans the grid without occupying a track. */
+  .shell > .skip-link {
+    grid-column: 1 / -1;
+  }
+}
+
+.shell .sidenav {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 20px 16px;
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+}
+
+.shell .sidenav-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 12px 14px;
+  text-decoration: none;
+}
+
+.shell .sidenav-new {
+  margin: 0 4px 14px;
+  justify-content: center;
+  text-align: center;
+  padding: 12px 20px;
+}
+
+.shell .sidenav-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.shell .sidenav-nav a {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 999px;
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 500;
+  text-decoration: none;
+  text-transform: capitalize;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.shell .sidenav-nav a:hover {
+  background: var(--interactive-hover);
+  color: var(--ink);
+}
+
+.shell .sidenav-nav a.active {
+  background: var(--accent-tint);
+  color: var(--accent-dim);
+}
+
+.shell .sidenav-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 12px;
+  padding: 14px 12px 6px;
+  border-top: 1px solid var(--border);
+}
+
+/* Status + theme share one row; the old horizontal-masthead styles fought
+   the vertical rail (mono lowercase status, right-aligned account text). */
+.shell .sidenav-foot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.shell .sidenav-foot .masthead-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+  color: var(--ink-2);
+  text-transform: none;
+}
+
+/* Account block: the Google drawer pattern — initials avatar, identity
+   stacked beside it, and a full-width quiet Log out beneath. */
+.shell .sidenav-session {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.shell .sidenav-account {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--raised);
+}
+
+.shell .sidenav-avatar {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-tint);
+  color: var(--accent-dim);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+
+.shell .sidenav-identity {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+  text-align: left;
+}
+
+.shell .sidenav-identity strong {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .sidenav-identity small {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .sidenav-session form {
+  display: contents;
+}
+
+.shell .sidenav-logout {
+  width: 100%;
+  justify-content: center;
+  text-align: center;
+}
+
+/* The page ground behind the shell: html/body still carry the kernel beige,
+   which flashes on overscroll bounce above/below the dashboard. Pin the
+   ground to the Material canvas whenever the shell is mounted. */
+/* stylelint-disable color-no-hex, scale-unlimited/declaration-strict-value --
+   ground literals; body sits OUTSIDE .shell so its tokens are out of reach */
+html:has(.shell),
+body:has(.shell) {
+  background: #fff;
+}
+
+html[data-theme="dark"]:has(.shell),
+html[data-theme="dark"] body:has(.shell) {
+  background: #000;
+}
+/* stylelint-enable color-no-hex, scale-unlimited/declaration-strict-value */
+
+/* Resource cards, post-glyph: the count becomes a neutral chip in the title
+   row, and the tone-era accent styling stays retired. */
+.shell .resource-count {
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--raised);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+/* Mobile: slim bar + drawer. `display` lives ONLY in the media blocks — a
+   base `display:flex` here sits later in the file than the desktop
+   `display:none`, wins the cascade, and steals grid column 1 (caught live:
+   the rail rendered full-width with the content shoved below the fold). */
+.shell .sidenav-mobilebar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: var(--chrome-bg);
+  backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--border);
+}
+
+@media (max-width: 900px) {
+  .shell .sidenav-mobilebar {
+    display: flex;
+  }
+
+  .shell .sidenav {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 40;
+    width: min(300px, 84vw);
+    transform: translateX(-104%);
+    transition: transform 0.2s ease;
+    box-shadow: var(--modal-shadow);
+  }
+
+  .shell .sidenav.open {
+    transform: translateX(0);
+  }
+
+  .shell .sidenav-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 35;
+    border: 0;
+    background: var(--overlay-bg);
+  }
+}
