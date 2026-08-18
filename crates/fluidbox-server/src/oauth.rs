@@ -474,6 +474,24 @@ fn admit_oauth(url: &str, policy: &crate::egress::EgressPolicy) -> Result<(), St
     crate::egress::admit_url(url, policy).map_err(|e| format!("egress blocked: {e}"))
 }
 
+/// The RFC 8414 / OIDC metadata URLs to try for an authorization-server base,
+/// most specific first. Split out of `discover` so the candidate ORDER stays
+/// unit-testable: a path-bearing AS base must try the path-suffixed well-known
+/// ahead of the bare one, while a base reached through the no-PRM fallback
+/// (origin only, empty path) goes straight to the bare well-known — which is
+/// the document Atlassian actually serves.
+fn as_metadata_candidates(a_origin: &str, a_path: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    if !a_path.is_empty() {
+        urls.push(format!(
+            "{a_origin}/.well-known/oauth-authorization-server{a_path}"
+        ));
+    }
+    urls.push(format!("{a_origin}/.well-known/oauth-authorization-server"));
+    urls.push(format!("{a_origin}/.well-known/openid-configuration"));
+    urls
+}
+
 // ─── Discovery (network) ──────────────────────────────────────────────────
 
 /// 401-probe the MCP endpoint, walk RFC 9728 → RFC 8414/OIDC, and return
@@ -546,20 +564,21 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
             break;
         }
     }
-    let as_base = as_base.ok_or(
-        "could not discover an authorization server for this MCP endpoint \
-         (no WWW-Authenticate resource_metadata and no /.well-known/oauth-protected-resource)",
-    )?;
+    // RFC 9728 is the happy path, but some MCP servers demand OAuth in the
+    // WWW-Authenticate challenge while publishing NO protected-resource document
+    // at either well-known path — Atlassian's `mcp.atlassian.com/v1/mcp` does
+    // exactly that — and still serve valid RFC 8414 metadata on their own
+    // origin. Falling back to "the resource is its own authorization server" is
+    // the pre-PRM default and the conservative choice: it points discovery at
+    // the SAME host the operator already configured as the MCP endpoint, never
+    // at an attacker-nominated third party. Every candidate below is still
+    // admitted before it is dialed, and RFC 8414 §3.3 (`issuer_matches_discovery`)
+    // still binds the metadata's issuer to the origin that served it.
+    let prm_missing = as_base.is_none();
+    let as_base = as_base.unwrap_or(origin);
 
     let (a_origin, a_path) = origin_and_path(&as_base)?;
-    let mut meta_urls = Vec::new();
-    if !a_path.is_empty() {
-        meta_urls.push(format!(
-            "{a_origin}/.well-known/oauth-authorization-server{a_path}"
-        ));
-    }
-    meta_urls.push(format!("{a_origin}/.well-known/oauth-authorization-server"));
-    meta_urls.push(format!("{a_origin}/.well-known/openid-configuration"));
+    let meta_urls = as_metadata_candidates(&a_origin, &a_path);
     for mu in &meta_urls {
         // `as_base` came from the (attacker-influenced) PRM document, so admit
         // each metadata candidate before dialing; a blocked one is skipped and
@@ -595,9 +614,20 @@ pub async fn discover(state: &AppState, mcp_url: &str) -> Result<AsMeta, String>
         issuer_matches_discovery(&meta.issuer, &a_origin)?;
         return Ok(meta);
     }
-    Err(format!(
-        "authorization server '{as_base}' publishes no discoverable metadata (RFC 8414/OIDC)"
-    ))
+    Err(if prm_missing {
+        // Keep the pre-fallback diagnostic: reaching here with no PRM means BOTH
+        // discovery routes came up empty, which is a different fix than "the AS
+        // the PRM named is broken".
+        format!(
+            "could not discover an authorization server for this MCP endpoint: no \
+             WWW-Authenticate resource_metadata, no /.well-known/oauth-protected-resource, \
+             and '{as_base}' publishes no RFC 8414/OIDC metadata either"
+        )
+    } else {
+        format!(
+            "authorization server '{as_base}' publishes no discoverable metadata (RFC 8414/OIDC)"
+        )
+    })
 }
 
 /// RFC 8414 §3.3 issuer validation: the `issuer` an AS publishes must identify
@@ -3694,6 +3724,42 @@ mod tests {
         });
         assert_eq!(parse_resource_metadata(&prm).unwrap(), "https://as.test");
         assert!(parse_resource_metadata(&serde_json::json!({})).is_err());
+    }
+
+    /// The no-PRM fallback resolves the AS base to the RESOURCE ORIGIN, which
+    /// carries no path — so the very first candidate must be the bare
+    /// well-known. Atlassian serves its RFC 8414 document there and publishes
+    /// no protected-resource document at all; before the fallback existed,
+    /// discovery gave up before ever asking.
+    #[test]
+    fn as_metadata_candidates_try_path_suffixed_first_then_bare() {
+        // Path-bearing AS base (the PRM-supplied shape): most specific first.
+        assert_eq!(
+            as_metadata_candidates("https://as.test", "/tenant-a"),
+            vec![
+                "https://as.test/.well-known/oauth-authorization-server/tenant-a",
+                "https://as.test/.well-known/oauth-authorization-server",
+                "https://as.test/.well-known/openid-configuration",
+            ]
+        );
+
+        // Origin-only base (the no-PRM fallback shape): no path-suffixed guess
+        // is invented, so the bare well-known is asked first.
+        let atlassian = as_metadata_candidates("https://mcp.atlassian.com", "");
+        assert_eq!(
+            atlassian,
+            vec![
+                "https://mcp.atlassian.com/.well-known/oauth-authorization-server",
+                "https://mcp.atlassian.com/.well-known/openid-configuration",
+            ]
+        );
+
+        // The fallback base is derived from the MCP URL's origin, so a
+        // path-bearing endpoint still yields a path-free AS base.
+        let (origin, path) = origin_and_path("https://mcp.atlassian.com/v1/mcp").unwrap();
+        assert_eq!(origin, "https://mcp.atlassian.com");
+        assert_eq!(path, "/v1/mcp");
+        assert_eq!(as_metadata_candidates(&origin, ""), atlassian);
     }
 
     fn reg_row(endpoint: Option<&str>) -> fluidbox_db::OauthClientRegistrationRow {

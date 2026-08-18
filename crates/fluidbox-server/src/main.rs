@@ -599,6 +599,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/triggers/{id}/disable", post(triggers::disable))
         .route("/triggers/{id}/rotate_token", post(triggers::rotate_token))
         .route("/triggers/{id}/invoke", post(triggers::invoke))
+        .route("/triggers/{id}/run-now", post(triggers::run_now))
         .route("/triggers/{id}/runs/{sid}", get(triggers::poll_run));
 
     // The internal plane (runner contract, workspace archive, LLM facade).

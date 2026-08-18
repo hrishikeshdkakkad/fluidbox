@@ -199,14 +199,20 @@ export function ResourceOverview({
             href="/app/capabilities"
             eyebrow="Optional"
             title="MCP"
-            count={latestBundles.length}
+            // Post-Phase-C the brokered tool surface lives on CONNECTIONS;
+            // bundles are only the in-image sandbox servers. Counting bundles
+            // alone showed "0" while Linear and Notion sat connected.
+            count={activeToolConnections.length + latestBundles.length}
             description={
-              latestBundles.length === 0
+              activeToolConnections.length + latestBundles.length === 0
                 ? "Add a remote tool server when an agent needs governed access to an external service."
-                : `${activeToolConnections.length} active tool connection${activeToolConnections.length === 1 ? "" : "s"}; exact bundle versions are pinned on agents.`
+                : "Governed tool servers — credentials stay in the control plane; every call crosses the permission gate."
             }
-            items={latestBundles.map((bundle) => `${bundle.name}@${bundle.version}`)}
-            action={<button className="btn sm" type="button" onClick={onAddCapability}>{latestBundles.length === 0 ? "Add MCP Server" : "Add Another"}</button>}
+            items={[
+              ...activeToolConnections.map((connection) => connection.display_name),
+              ...latestBundles.map((bundle) => `${bundle.name}@${bundle.version}`),
+            ]}
+            action={<button className="btn sm" type="button" onClick={onAddCapability}>{activeToolConnections.length + latestBundles.length === 0 ? "Add MCP Server" : "Add Another"}</button>}
             secondary={<Link className="resource-secondary" href="/app/capabilities">Manage</Link>}
           />
         </div>
@@ -246,7 +252,6 @@ function ResourceCard({
         router.push(href);
       }}
     >
-      <ResourceGlyph tone={tone} />
       <div className="resource-card-content">
         <div className="resource-card-top">
           <h3>{title}</h3>
@@ -269,37 +274,7 @@ function ResourceCard({
   );
 }
 
-function ResourceGlyph({ tone }: { tone: "integration" | "capability" | "agent" }) {
-  if (tone === "integration") {
-    return (
-      <span className="resource-glyph" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none">
-          <circle cx="7" cy="12" r="3.5" />
-          <circle cx="17" cy="7" r="2.5" />
-          <circle cx="17" cy="17" r="2.5" />
-          <path d="m10 10.5 4.6-2.3M10 13.5l4.6 2.3" />
-        </svg>
-      </span>
-    );
-  }
-
-  if (tone === "capability") {
-    return (
-      <span className="resource-glyph" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none">
-          <path d="M8 5H5v14h3M16 5h3v14h-3M9.5 12h5" />
-          <circle cx="12" cy="12" r="2.25" />
-        </svg>
-      </span>
-    );
-  }
-
-  return (
-    <span className="resource-glyph" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none">
-        <rect x="5" y="4.5" width="14" height="15" rx="3" />
-        <path d="M8.5 9h7M8.5 12h4.5M8.5 15h6" />
-      </svg>
-    </span>
-  );
-}
+// The tone glyph tiles are gone (2026-08-17 monochrome pass): pictographic
+// chips — one of them gold — were the last off-system color in the chrome,
+// and the standing design rule is no iconography. The title row carries the
+// card; `tone` survives on the class for any future per-tone treatment.

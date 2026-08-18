@@ -36,7 +36,11 @@ export function RouteFocus() {
       const current = document.activeElement;
       // Focus is "unclaimed" while it still sits where the navigation left it:
       // the body, or the masthead link that was clicked.
-      return current === document.body || current === null || !!current.closest(".topbar");
+      return (
+        current === document.body ||
+        current === null ||
+        !!current.closest(".topbar, .sidenav, .sidenav-mobilebar")
+      );
     };
     const focusHeading = (): boolean => {
       const heading = document.querySelector<HTMLElement>("main h1");

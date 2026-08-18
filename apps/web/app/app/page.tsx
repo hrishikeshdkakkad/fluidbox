@@ -2,12 +2,10 @@
 
 import { Suspense, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { apiGet, apiPost, Approval, isTerminal, Session } from "../lib/api";
+import { splitTask } from "../lib/activity";
 import { ApprovalActions } from "../components/ApprovalActions";
-import { AutomationPanel } from "../components/AutomationPanel";
-import { ResourceOverview } from "../components/ResourceOverview";
-import { RunHistory } from "../components/RunHistory";
 import { AddServerWizard } from "./capabilities/AddServerWizard";
 import {
   MintedAutomation,
@@ -15,26 +13,29 @@ import {
   RunMode,
   ShowAutomationSecrets,
 } from "../components/RunComposer";
-import { LoadingRows, short } from "../components/bits";
+import { InlineMarkdown, Pill, short, timeAgo } from "../components/bits";
 import { useSmartPolling } from "../lib/useSmartPolling";
 
-type OperateView = "history" | "automations";
-
+// The home page — a SUMMARY, not a second workbench.
+//
+// Until 2026-08-17 this page embedded three other surfaces wholesale: the run
+// list (Activity's), the automations panel (Activity's), and the resource
+// cards (the Resources page's). It even shipped a worse copy of the run list —
+// unpaginated and unfiltered. Everything here now either cannot be seen
+// elsewhere (pending approvals) or is a number that LINKS to where the real
+// work happens. Nothing is rendered in two places.
 export default function Runs() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
-  const [view, setView] = useState<OperateView>("history");
   const [composerMode, setComposerMode] = useState<RunMode | null>(null);
   const [agentComposer, setAgentComposer] = useState(false);
   const [showCapabilityWizard, setShowCapabilityWizard] = useState(false);
   const [minted, setMinted] = useState<MintedAutomation | null>(null);
-  const [automationCount, setAutomationCount] = useState<number | null>(null);
-  const [automationRefresh, setAutomationRefresh] = useState(0);
-  const [resourceRefresh, setResourceRefresh] = useState(0);
   const [loading, setLoading] = useState(true);
   const [hasSnapshot, setHasSnapshot] = useState(false);
   const [offline, setOffline] = useState(false);
   const [actionErr, setActionErr] = useState("");
+  const router = useRouter();
 
   const load = useCallback(async () => {
     try {
@@ -57,12 +58,6 @@ export default function Runs() {
 
   useSmartPolling(load, 2500);
 
-  const selectView = (nextView: OperateView) => {
-    setView(nextView);
-    const nextUrl = nextView === "automations" ? "/?view=automations" : "/";
-    window.history.replaceState({}, "", nextUrl);
-  };
-
   const decide = async (id: string, decision: string) => {
     setActionErr("");
     try {
@@ -77,12 +72,13 @@ export default function Runs() {
   const done = sessions.filter((session) => session.status === "completed").length;
   const terminal = sessions.filter((session) => isTerminal(session.status)).length;
   const completionRate = terminal > 0 ? `${Math.round((done / terminal) * 100)}%` : "—";
+  // The list is newest-first, so the head is the last thing that happened.
+  const lastRun = sessions[0];
 
   return (
     <>
       <Suspense fallback={null}>
         <QueryActions
-          setView={setView}
           setComposerMode={setComposerMode}
           setAgentComposer={setAgentComposer}
           setShowCapabilityWizard={setShowCapabilityWizard}
@@ -104,57 +100,88 @@ export default function Runs() {
             <h2 id="operations-summary-heading">Operations</h2>
             <p>Current activity across manual runs and automations.</p>
           </div>
-          <span className="overview-status">
-            <span className={`signal ${offline ? "down" : ""}`} />
-            {offline ? "Offline" : loading && !hasSnapshot ? "Checking" : "Operational"}
-          </span>
+          {/* Control-plane status lives ONCE, in the navigation rail's foot —
+              a second "Operational" chip here just duplicated it. */}
         </div>
+        {/* Each metric is a link into the workbench with its filter applied:
+            a summary page earns its place by handing off, not by restating. */}
         <div className="ops-strip" aria-label="Run summary">
-          <div className="ops-metric">
-            <span className="metric-label">Active</span>
-            <strong>{hasSnapshot ? active : "—"}</strong>
-            {/* Only claim the control plane is unavailable once a read has
-              * actually FAILED. `hasSnapshot` is false during the normal first
-              * fetch too, so keying the copy on it alone made a healthy system
-              * announce an outage on every cold load — and contradicted the
-              * status pill above, which correctly says "Checking". */}
-            <small>{hasSnapshot ? (active === 1 ? "sandbox running" : "sandboxes running") : offline ? "control plane unavailable" : "checking…"}</small>
-          </div>
-          <div className={`ops-metric ${approvals.length ? "attention" : ""}`}>
-            <span className="metric-label">Needs Review</span>
-            <strong>{hasSnapshot ? approvals.length : "—"}</strong>
-            <small>{hasSnapshot ? (approvals.length ? "decision required" : "no pending decisions") : offline ? "status unavailable" : "checking…"}</small>
-          </div>
-          <div className="ops-metric">
-            <span className="metric-label">Completed</span>
-            <strong>{hasSnapshot ? done : "—"}</strong>
-            <small>{hasSnapshot ? "recent runs" : offline ? "history unavailable" : "checking…"}</small>
-          </div>
-          <div className="ops-metric">
-            <span className="metric-label">Success Rate</span>
-            <strong>{hasSnapshot ? completionRate : "—"}</strong>
-            <small>{hasSnapshot ? "terminal runs" : offline ? "history unavailable" : "checking…"}</small>
-          </div>
+          <Metric
+            label="Active"
+            value={hasSnapshot ? String(active) : "—"}
+            href="/app/activity?filter=live"
+            note={
+              hasSnapshot
+                ? active === 1
+                  ? "sandbox running"
+                  : "sandboxes running"
+                : offline
+                  ? "control plane unavailable"
+                  : "checking…"
+            }
+          />
+          <Metric
+            label="Needs Review"
+            value={hasSnapshot ? String(approvals.length) : "—"}
+            href="/app/activity?filter=attention"
+            attention={approvals.length > 0}
+            note={
+              hasSnapshot
+                ? approvals.length
+                  ? "decision required"
+                  : "no pending decisions"
+                : offline
+                  ? "status unavailable"
+                  : "checking…"
+            }
+          />
+          <Metric
+            label="Completed"
+            value={hasSnapshot ? String(done) : "—"}
+            href="/app/activity?filter=completed"
+            note={hasSnapshot ? "recent runs" : offline ? "history unavailable" : "checking…"}
+          />
+          <Metric
+            label="Success Rate"
+            value={hasSnapshot ? completionRate : "—"}
+            href="/app/activity"
+            note={hasSnapshot ? "terminal runs" : offline ? "history unavailable" : "checking…"}
+          />
         </div>
       </section>
 
-      <ResourceOverview
-        refreshKey={resourceRefresh}
-        onCreateAgent={() => setAgentComposer(true)}
-        onAddCapability={() => setShowCapabilityWizard(true)}
-      />
-
       {actionErr && <div className="err">{actionErr}</div>}
 
-      {approvals.length > 0 && (
-        <section className="attention-section">
-          <div className="section-heading">
-            <div>
-              <span className="section-kicker">Action required</span>
-              <h2>Needs your attention</h2>
-            </div>
-            <span className="section-note">Policy paused these runs before acting.</span>
+      {/* The attention band renders in BOTH states on purpose. A home whose
+          only content is conditional is blank on a quiet day — which is most
+          days — so when nothing is waiting it still says what happened last. */}
+      <section className="attention-section" aria-labelledby="attention-heading">
+        <div className="section-heading">
+          <div>
+            {/* "All clear" is a CLAIM, and we can only make it from a read
+                that succeeded. Without a snapshot the honest answer is that
+                we do not know yet. */}
+            <span className="section-kicker">
+              {approvals.length > 0
+                ? "Action required"
+                : hasSnapshot
+                  ? "Nothing is waiting on you"
+                  : "Waiting on the control plane"}
+            </span>
+            <h2 id="attention-heading">
+              {approvals.length > 0
+                ? "Needs your attention"
+                : hasSnapshot
+                  ? "All clear"
+                  : "Approvals unknown"}
+            </h2>
           </div>
+          {approvals.length > 0 && (
+            <span className="section-note">Policy paused these runs before acting.</span>
+          )}
+        </div>
+
+        {approvals.length > 0 ? (
           <div className="attention-list">
             {approvals.map((approval) => (
               <div className="approval" key={approval.id}>
@@ -167,7 +194,10 @@ export default function Runs() {
                   <div className="d">
                     <b className="mono">{approval.tool}</b>{" "}
                     <span className="mono mut">{approval.summary}</span>{" "}
-                    <Link href={`/app/sessions/${approval.session_id}`} className="link mono approval-session-link">
+                    <Link
+                      href={`/app/sessions/${approval.session_id}`}
+                      className="link mono approval-session-link"
+                    >
                       {short(approval.session_id)}
                     </Link>
                   </div>
@@ -179,84 +209,26 @@ export default function Runs() {
               </div>
             ))}
           </div>
-        </section>
-      )}
+        ) : (
+          <LastRun session={lastRun} loading={loading} offline={offline && !hasSnapshot} />
+        )}
+      </section>
 
-      <div className="tabs operate-tabs" id="operations" role="tablist" aria-label="Runs and automations">
-        <button
-          className={`tab ${view === "history" ? "active" : ""}`}
-          type="button"
-          role="tab"
-          aria-selected={view === "history"}
-          onClick={() => selectView("history")}
-        >
-          Run history <span className="n">{sessions.length}</span>
-        </button>
-        <button
-          className={`tab ${view === "automations" ? "active" : ""}`}
-          type="button"
-          role="tab"
-          aria-selected={view === "automations"}
-          onClick={() => selectView("automations")}
-        >
-          Automations {automationCount !== null && <span className="n">{automationCount}</span>}
-        </button>
-      </div>
-
-      {view === "history" ? (
-        <section className="operate-view" role="tabpanel">
-          <div className="section-heading recent-heading">
-            <div>
-              <span className="section-kicker">Every invocation</span>
-              <h2>Run history</h2>
-            </div>
-            <span className="section-note">Manual and automated runs share one timeline.</span>
-          </div>
-
-          <div className="run-list">
-            {loading ? (
-              <LoadingRows />
-            ) : offline && !hasSnapshot ? (
-              <div className="launch-empty">
-                <div>
-                  <h3>Control plane unavailable.</h3>
-                  <p>Run history could not be loaded. Your browser will keep retrying in the background.</p>
-                </div>
-                <div className="empty-actions">
-                  <button className="btn" type="button" onClick={() => void load()}>
-                    Retry now
-                  </button>
-                </div>
-              </div>
-            ) : sessions.length === 0 ? (
-              <div className="launch-empty">
-                <div>
-                  <h3>Your workspace is ready.</h3>
-                  <p>Configure a run now; you can launch it once or add an automation before saving.</p>
-                </div>
-                <div className="empty-actions">
-                  <button className="btn primary" type="button" onClick={() => setComposerMode("once")}>
-                    Configure a run
-                  </button>
-                  <button className="btn" type="button" onClick={() => setAgentComposer(true)}>
-                    Create an agent
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <RunHistory sessions={sessions} />
-            )}
-          </div>
-        </section>
-      ) : (
-        <div className="operate-view" role="tabpanel">
-          <AutomationPanel
-            onNew={() => setComposerMode("automation")}
-            refreshKey={automationRefresh}
-            onCountChange={setAutomationCount}
-          />
-        </div>
-      )}
+      {/* Where the work actually lives. These are hand-offs, not previews. */}
+      <nav className="home-handoff" aria-label="Go to">
+        <Link className="handoff-card" href="/app/activity">
+          <strong>Activity</strong>
+          <small>Every run, filtered and paged</small>
+        </Link>
+        <Link className="handoff-card" href="/app/activity#automations-heading">
+          <strong>Automations</strong>
+          <small>Schedules, API endpoints, repository events</small>
+        </Link>
+        <Link className="handoff-card" href="/app/resources">
+          <strong>Resources</strong>
+          <small>Agents, MCP servers, integrations</small>
+        </Link>
+      </nav>
 
       {composerMode && (
         <RunComposer
@@ -264,14 +236,13 @@ export default function Runs() {
           onClose={() => setComposerMode(null)}
           onRunCreated={() => {
             setComposerMode(null);
-            selectView("history");
             void load();
+            // The run you just started lives on the workbench, not here.
+            router.push("/app/activity");
           }}
           onAutomationCreated={(automation) => {
             setComposerMode(null);
             setMinted(automation);
-            setAutomationRefresh((current) => current + 1);
-            selectView("automations");
           }}
         />
       )}
@@ -284,43 +255,132 @@ export default function Runs() {
           onAutomationCreated={() => {}}
           onAgentCreated={() => {
             setAgentComposer(false);
-            setResourceRefresh((current) => current + 1);
+            router.push("/app/resources");
           }}
         />
       )}
 
       {showCapabilityWizard && (
-        <AddServerWizard
+        <AddServerWizard onClose={() => setShowCapabilityWizard(false)} />
+      )}
+
+      {minted && (
+        <ShowAutomationSecrets
+          minted={minted}
           onClose={() => {
-            setShowCapabilityWizard(false);
-            setResourceRefresh((current) => current + 1);
+            setMinted(null);
+            router.push("/app/activity#automations-heading");
           }}
         />
       )}
-
-      {minted && <ShowAutomationSecrets minted={minted} onClose={() => setMinted(null)} />}
     </>
   );
 }
 
+/** One at-a-glance number, and the door it opens. */
+function Metric({
+  label,
+  value,
+  note,
+  href,
+  attention = false,
+}: {
+  label: string;
+  value: string;
+  note: string;
+  href: string;
+  attention?: boolean;
+}) {
+  return (
+    <Link className={`ops-metric${attention ? " attention" : ""}`} href={href}>
+      <span className="metric-label">{label}</span>
+      <strong>{value}</strong>
+      <small>{note}</small>
+    </Link>
+  );
+}
+
+/**
+ * The quiet state's content: what happened last. One line, never a list — the
+ * point of this page's rewrite was to stop duplicating the run list, and
+ * `result_summary` already rides the /sessions payload, so this costs no extra
+ * read.
+ */
+function LastRun({
+  session,
+  loading,
+  offline,
+}: {
+  session: Session | undefined;
+  loading: boolean;
+  offline: boolean;
+}) {
+  if (loading) return null;
+  if (offline) {
+    // A failed read is never rendered as "no runs" — the standing rule.
+    return (
+      <div className="panel pad last-run">
+        <p className="faint">Run history is unavailable right now. Retrying in the background.</p>
+      </div>
+    );
+  }
+  if (!session) {
+    return (
+      <div className="panel pad last-run">
+        <p className="faint">No runs yet. Start one and it will appear here.</p>
+      </div>
+    );
+  }
+
+  const { headline } = splitTask(session.task);
+  return (
+    <Link className="panel pad last-run" href={`/app/sessions/${session.id}`}>
+      <div className="last-run-head">
+        <span className="metric-label">Last run</span>
+        <Pill status={session.status} />
+        <span className="faint">{timeAgo(session.created_at)}</span>
+      </div>
+      <strong>{headline}</strong>
+      {session.result_summary && (
+        <p>
+          <InlineMarkdown text={session.result_summary} />
+        </p>
+      )}
+    </Link>
+  );
+}
+
 function QueryActions({
-  setView,
   setComposerMode,
   setAgentComposer,
   setShowCapabilityWizard,
 }: {
-  setView: React.Dispatch<React.SetStateAction<OperateView>>;
   setComposerMode: React.Dispatch<React.SetStateAction<RunMode | null>>;
   setAgentComposer: React.Dispatch<React.SetStateAction<boolean>>;
   setShowCapabilityWizard: React.Dispatch<React.SetStateAction<boolean>>;
 }) {
   const params = useSearchParams();
   const query = params.toString();
+  const router = useRouter();
 
   useEffect(() => {
-    const requestedView = params.get("view");
+    // Automations moved to the Activity workbench; keep old bookmarks working
+    // rather than silently landing them on a page that no longer lists them.
+    if (params.get("view") === "automations") {
+      router.replace("/app/activity#automations-heading");
+      return;
+    }
+
+    // `compose=` is the composer's own URL state (lib/composer-url.ts), so a
+    // shared link reopens it with the same selections; `action=` remains the
+    // one-shot entry point other pages link to.
+    const compose = params.get("compose");
+    if (compose === "run") {
+      setComposerMode(params.get("mode") === "automation" ? "automation" : "once");
+    }
+    if (compose === "agent") setAgentComposer(true);
+
     const action = params.get("action");
-    if (requestedView === "automations") setView("automations");
     if (action === "new-agent") setAgentComposer(true);
     if (action === "add-capability") setShowCapabilityWizard(true);
     if (action === "new-run") setComposerMode("once");
@@ -328,9 +388,11 @@ function QueryActions({
     if (action) {
       const consumed = new URLSearchParams(query);
       consumed.delete("action");
-      window.history.replaceState({}, "", consumed.size > 0 ? `/?${consumed}` : "/");
+      // Consuming the ?action= param must leave the browser on /app, not on
+      // the marketing home — "/" is the public site since the 2026-07-30 split.
+      window.history.replaceState({}, "", consumed.size > 0 ? `/app?${consumed}` : "/app");
     }
-  }, [params, query, setAgentComposer, setComposerMode, setShowCapabilityWizard, setView]);
+  }, [params, query, router, setAgentComposer, setComposerMode, setShowCapabilityWizard]);
 
   return null;
 }
