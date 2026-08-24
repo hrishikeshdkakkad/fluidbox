@@ -1981,6 +1981,7 @@ mod tests {
             session_reauth_secs: 0,
             max_request_body_bytes: crate::config::DEFAULT_MAX_REQUEST_BODY_BYTES,
             workload_identity: crate::config::WorkloadIdentityMode::default(),
+            queue: None,
             // Task 4 (archive store): inert here — the governor reads none of it.
             archive_store: fluidbox_workspace::ArchiveStoreConfig::Fs,
             metrics_bind: None,
