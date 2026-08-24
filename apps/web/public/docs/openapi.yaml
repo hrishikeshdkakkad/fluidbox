@@ -4026,9 +4026,24 @@ components:
         `awaiting_authorization` is the pre-provisioning pause: the run's spec
         (including its network grant) is frozen, but no sandbox exists and no
         model spend is possible until a human authorizes the grant.
+
+        `queued` is the pre-provisioning capacity park: the run's spec is
+        frozen but no sandbox exists and no model spend is possible until the
+        dispatcher admits it under `FLUIDBOX_MAX_CONCURRENT_RUNS`. It appears
+        only on deployments that have configured that cap; without it runs
+        launch on creation and this value is never written. Runs are admitted
+        oldest-first, and a queued session carries `queued_at` plus a
+        `queue_position` field on the single-session response (the number of
+        older queued runs in the same organization — a lower bound on the
+        deployment-wide position, which is deliberately not exposed).
+
+        The two pauses compose: a run needing network authorization waits for a
+        human first and for capacity second, and its queue-wait clock starts
+        only when it becomes dispatchable.
       enum:
         - created
         - awaiting_authorization
+        - queued
         - provisioning
         - initializing
         - running

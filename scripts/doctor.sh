@@ -420,6 +420,59 @@ case "$web_mode" in
       "must be \"admin\" or \"sso\" (or unset for the local admin default) — the dashboard proxy refuses to boot on any other value";;
 esac
 
+say "run admission (queueing)"
+# The four queue knobs, checked the way the server checks them — so an operator
+# learns about a bad value here rather than from a refused boot. The cap is the
+# feature switch; the other three are DEAD CONFIG without it, which the server
+# treats as a boot failure rather than silently ignoring.
+q_cap=$(env_get "$ENV" FLUIDBOX_MAX_CONCURRENT_RUNS)
+q_depth=$(env_get "$ENV" FLUIDBOX_QUEUE_MAX_DEPTH)
+q_wait=$(env_get "$ENV" FLUIDBOX_QUEUE_MAX_WAIT_SECS)
+q_requeue=$(env_get "$ENV" FLUIDBOX_QUEUE_REQUEUE_MAX)
+
+positive_int() { case "$1" in ''|*[!0-9]*) return 1;; *) [ "$1" -ge 1 ];; esac; }
+
+if [ -z "$q_cap" ]; then
+  orphans=""
+  [ -n "$q_depth" ]   && orphans="$orphans FLUIDBOX_QUEUE_MAX_DEPTH"
+  [ -n "$q_wait" ]    && orphans="$orphans FLUIDBOX_QUEUE_MAX_WAIT_SECS"
+  [ -n "$q_requeue" ] && orphans="$orphans FLUIDBOX_QUEUE_REQUEUE_MAX"
+  if [ -n "$orphans" ]; then
+    bad "queue knob(s) set without FLUIDBOX_MAX_CONCURRENT_RUNS:$orphans" \
+      "dead config — the server REFUSES TO BOOT rather than ignore them. Set FLUIDBOX_MAX_CONCURRENT_RUNS to enable the queue, or unset these."
+  else
+    ok "run admission off (FLUIDBOX_MAX_CONCURRENT_RUNS unset) — runs launch on creation"
+  fi
+else
+  if positive_int "$q_cap"; then
+    ok "FLUIDBOX_MAX_CONCURRENT_RUNS=$q_cap (runs above the cap wait in a FIFO queue)"
+  else
+    bad "FLUIDBOX_MAX_CONCURRENT_RUNS='$q_cap' is not an integer >= 1" \
+      "the server refuses to boot: 0 or negative admits no work at all, which would wedge every run"
+  fi
+  for pair in "FLUIDBOX_QUEUE_MAX_DEPTH:$q_depth" "FLUIDBOX_QUEUE_MAX_WAIT_SECS:$q_wait" "FLUIDBOX_QUEUE_REQUEUE_MAX:$q_requeue"; do
+    name=${pair%%:*}; val=${pair#*:}
+    if [ -n "$val" ] && ! positive_int "$val"; then
+      bad "$name='$val' is not an integer >= 1" "the server refuses to boot naming this variable"
+    fi
+  done
+  # Benign but a reliable sign of operator confusion: a queue wait longer than
+  # the session-token TTL. It is harmless — a redispatch mints fresh tokens —
+  # but someone who set it that high usually meant hours of RUNTIME, not hours
+  # of waiting.
+  if [ -n "$q_wait" ] && positive_int "$q_wait" && [ "$q_wait" -ge 10800 ]; then
+    warn "FLUIDBOX_QUEUE_MAX_WAIT_SECS=$q_wait is at or past the 3h session-token TTL" \
+      "harmless (a redispatch re-mints tokens) but usually a mix-up between how long a run may WAIT and how long it may RUN"
+  fi
+  # The misconfiguration that makes every over-cap run take the slow
+  # bounce-and-retry path instead of simply waiting its turn.
+  quota_pods=$(grep -A 6 '^  quota:' deploy/helm/fluidbox/values.yaml 2>/dev/null | grep -m1 '    pods:' | tr -d ' "' | cut -d: -f2)
+  if [ -n "$quota_pods" ] && positive_int "$q_cap" && positive_int "$quota_pods" && [ "$q_cap" -gt "$quota_pods" ]; then
+    warn "FLUIDBOX_MAX_CONCURRENT_RUNS=$q_cap exceeds the chart's sandbox.quota.pods=$quota_pods" \
+      "on Kubernetes the namespace quota would fire first, so over-cap runs bounce with backoff instead of queueing. Keep the cap <= quota.pods (values.yaml explains both)."
+  fi
+fi
+
 say "control plane"
 if curl -fsS -m 2 "http://127.0.0.1:8787/v1/health" >/dev/null 2>&1; then
   ok "server responding on :8787 (note: just e2e needs this port free — stop just dev first)"
