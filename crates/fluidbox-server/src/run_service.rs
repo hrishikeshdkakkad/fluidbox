@@ -21,6 +21,7 @@ use fluidbox_core::spec::{
     Autonomy, Budgets, InvocationContext, InvocationKind, ResultDestination, RunSpec, TrustTier,
     WorkspaceSpec,
 };
+use fluidbox_core::state::SessionStatus;
 use fluidbox_db::TenantScope;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -603,7 +604,35 @@ pub async fn create_run(
         return Ok(RunCreation::Created(Box::new(parked)));
     }
 
-    // ── Tail 1 — FREEZE AND SPAWN ────────────────────────────────────────
+    // ── Tail 1 — FREEZE, THEN PARK OR SPAWN ──────────────────────────────
+    //
+    // Queueing enabled: EVERY run parks and the dispatcher admits it (design
+    // 2026-08-23 §7.1). The uniform path is deliberate — the rejected
+    // fast-path-when-under-cap alternative (§15) buys ≤1 s of latency and
+    // costs a create-time headroom check that genuinely races, a second launch
+    // path to test, and the orphan class surviving on that path.
+    //
+    // The park is POST-COMMIT, exactly like the network-grant park above, so
+    // the `create_session` transaction stays byte-for-byte untouched
+    // (invariant 3) and its exactly-once claim semantics are unaffected. The
+    // crash window that opens — a replica dying between the commit and this
+    // transition — is the same one the netgrant park already accepts, and
+    // unlike netgrant it is HEALED: the dispatcher's adoption arm converts
+    // stale `created` rows to `queued`.
+    if state.cfg.queueing_enabled() {
+        orchestrator::transition(
+            state,
+            scope,
+            session.id,
+            SessionStatus::Queued,
+            Some("parked at admission: waiting for a capacity slot"),
+        )
+        .await;
+        let parked = fluidbox_db::get_session(&state.pool, scope, session.id)
+            .await?
+            .unwrap_or(session);
+        return Ok(RunCreation::Created(Box::new(parked)));
+    }
     orchestrator::spawn_run(state.clone(), session.id);
 
     Ok(RunCreation::Created(Box::new(session)))
