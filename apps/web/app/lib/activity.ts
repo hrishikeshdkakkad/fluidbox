@@ -13,13 +13,28 @@ export type ActivityFilter = "all" | "live" | "attention" | "failed" | "complete
 
 const ATTENTION_STATUSES = new Set(["awaiting_approval", "awaiting_authorization"]);
 const FAILED_STATUSES = new Set(["failed", "budget_exceeded"]);
+/**
+ * Not-yet-started but healthy: nothing is being waited on except a machine.
+ * `queued` is the capacity park — deliberately NOT "attention", because unlike
+ * `awaiting_authorization` no human decision is outstanding, and putting it in
+ * the attention chip would train operators to ignore that chip on a busy
+ * deployment.
+ *
+ * These share the "live" group with running work, which is the right answer
+ * among the five: they are non-terminal and they will start on their own.
+ */
+const WAITING_STATUSES = new Set(["created", "queued"]);
 
 /**
  * Map a raw session status onto a triage group. Unknown statuses read as
  * "live" on purpose: a status this UI has never heard of is an in-flight
  * shape from a newer server, and hiding it would be the one wrong answer.
+ * `WAITING_STATUSES` therefore changes no behaviour — it records that these
+ * two were CLASSIFIED rather than defaulted, which is the difference between
+ * "we decided" and "we never heard of it".
  */
 export function runGroup(status: string): RunGroup {
+  if (WAITING_STATUSES.has(status)) return "live";
   if (ATTENTION_STATUSES.has(status)) return "attention";
   if (FAILED_STATUSES.has(status)) return "failed";
   if (status === "completed") return "completed";

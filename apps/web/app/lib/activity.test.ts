@@ -43,6 +43,18 @@ describe("runGroup", () => {
     expect(runGroup("finalizing")).toBe("live");
   });
 
+  test("the capacity park is a neutral wait, not an attention state", () => {
+    // `queued` is non-terminal and needs no human, so it shares the live
+    // group with `created`. It must NOT join the attention chip: unlike
+    // `awaiting_authorization` there is no decision outstanding, and a busy
+    // deployment would fill that chip with runs nobody can act on — which
+    // trains operators to ignore the one chip that should always mean
+    // "someone is blocked on you".
+    expect(runGroup("queued")).toBe("live");
+    expect(runGroup("created")).toBe("live");
+    expect(runGroup("queued")).not.toBe("attention");
+  });
+
   test("treats an unknown status as live so it stays visible", () => {
     expect(runGroup("some_future_status")).toBe("live");
   });
