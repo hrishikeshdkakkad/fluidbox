@@ -31,7 +31,9 @@
 //!     [`count_queued_sessions`] — the depth backstop the create path checks;
 //!     [`expired_queued_sessions`] — runs past the configured maximum wait;
 //!     [`orphaned_created_sessions`] — `created` rows nothing is driving, which
-//!     heals both the park crash window and the pre-existing orphan class) each
+//!     heals both the park crash window and the pre-existing orphan class;
+//!     [`queue_gauges`] — the deployment-wide depth and oldest-wait the metrics
+//!     endpoint reads at render time) each
 //!     act on ids/status across ALL tenants by construction (a global scan),
 //!     then scope every mutation to the `tenant_id` of the row they just
 //!     fetched. The capacity queue is DEPLOYMENT-WIDE on purpose: a per-tenant
@@ -944,6 +946,33 @@ pub async fn expired_queued_sessions(
     .await?;
     tx.commit().await?;
     Ok(out)
+}
+
+/// The two operator gauges: `(queue depth, oldest wait in seconds)`.
+///
+/// One query, deployment-wide, read at RENDER time rather than shadowed by an
+/// event-driven gauge — the registry's own doctrine for point-in-time values a
+/// durable source already holds. An event-driven depth gauge would drift on
+/// every restart and on every path that leaves the queue without passing
+/// through the counter's insertion point.
+///
+/// Returns `(0, 0)` on an empty queue rather than a null oldest-wait, so the
+/// exposition always carries a real number and a scrape on a quiet deployment
+/// is not a gap in the series.
+pub async fn queue_gauges(pool: &PgPool) -> sqlx::Result<(i64, i64)> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let row: (i64, i64) = sqlx::query_as(
+        "select
+           count(*)::bigint,
+           coalesce(
+             extract(epoch from (now() - min(queued_at)))::bigint,
+             0)
+         from sessions where status = 'queued'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// `created` rows nothing is driving — the park crash window (a replica that
