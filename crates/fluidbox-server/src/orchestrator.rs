@@ -1390,7 +1390,20 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         abandon_launch(&state, scope, session_id).await;
         anyhow::bail!("session ownership lost before provisioning; launch abandoned");
     }
-    let handle = state.provider.provision(&sandbox_spec).await?;
+    let handle = match state.provider.provision(&sandbox_spec).await {
+        Ok(h) => h,
+        // Capacity pressure is not a run failure: the run is healthy and the
+        // world is full, so it goes back in the queue with backoff rather than
+        // dying (design 2026-08-23 §7.4). Only when queueing is ON — with the
+        // feature off there is no queue to return to, so this stays today's
+        // terminal path byte for byte.
+        Err(fluidbox_core::traits::ProviderError::CapacityDenied(detail))
+            if state.cfg.queueing_enabled() =>
+        {
+            return requeue_capacity_denied(&state, scope, session_id, epoch, &detail).await;
+        }
+        Err(e) => return Err(e.into()),
+    };
     // Gap 6 (Phase F): record the workload identity the provider reported, BEFORE
     // the handle attach. The ordering is the point — `provision` returns only once
     // the runner container is Running, so the sandbox may already be posting to
@@ -1972,6 +1985,116 @@ async fn abandon_launch(state: &AppState, scope: TenantScope, id: Uuid) {
     let _ = delete_archive(state, id).await;
 }
 
+/// Backoff before redispatching a capacity-bounced run: 30 s · 2^(attempt-1),
+/// capped at 300 s.
+///
+/// The 30 s FLOOR is derived, not chosen — it must be at least
+/// [`SESSION_LEASE_TTL_SECS`] so a bounced row cannot be re-claimed while a
+/// stale lease could still read live. The 300 s CAP bounds the tail: with
+/// [`crate::config::QueueCfg::requeue_max`] at its default of 5, the series
+/// spans roughly 13 minutes of sustained external quota pressure before the run
+/// fails with an explained reason, which is long enough to ride out a
+/// neighbouring workload finishing and short enough that a genuinely wedged
+/// deployment tells the operator rather than queueing silently.
+pub(crate) fn capacity_backoff_secs(attempt: i32) -> i64 {
+    let shift = attempt.saturating_sub(1).clamp(0, 4) as u32;
+    (30i64 << shift).min(300)
+}
+
+/// A `CapacityDenied` bounce re-parks the run instead of failing it (design
+/// 2026-08-23 §7.4).
+///
+/// ORDER MATTERS, and each step is placed for a reason:
+///
+/// 1. **Revoke this attempt's tokens first.** `run()` minted four
+///    audience-scoped credentials before provisioning; a bounced attempt must
+///    not leave live secrets behind, and the redispatch mints fresh ones
+///    anyway. Doing this before anything that can return early is what makes it
+///    unconditional.
+/// 2. **Clean up what this attempt created** via [`abandon_launch`], which is
+///    already the "a launch I lost" cleanup: it removes the workspace and
+///    archive, and — importantly — REFUSES when a finalization intent survives,
+///    because then the finalizer owns collection and deleting would destroy the
+///    evidence it is about to collect. It mutates no ownership state, so it is
+///    correct to reuse verbatim here.
+/// 3. **Re-park under the fence**, so a driver another replica has since
+///    displaced cannot re-queue a run that has moved on.
+/// 4. **Set the backoff gate last**, because it also CLEARS the lease. A crash
+///    between 3 and 4 leaves a queued row with a live lease: it re-enters the
+///    claim pool at lease expiry (~30 s) without a backoff gate — bounded and
+///    harmless. The reverse order would gate a row that never re-parked.
+///
+/// Returns `Ok(())` so `spawn_run`'s catch-all never converts a bounce into a
+/// terminal `fail()`: a capacity bounce is not a run failure.
+async fn requeue_capacity_denied(
+    state: &AppState,
+    scope: TenantScope,
+    session_id: Uuid,
+    epoch: i64,
+    detail: &str,
+) -> anyhow::Result<()> {
+    if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, session_id).await {
+        tracing::warn!("revoking tokens for bounced run {session_id} failed: {e}");
+    }
+    abandon_launch(state, scope, session_id).await;
+
+    let session = fluidbox_db::get_session(&state.pool, scope, session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session vanished during requeue"))?;
+    let q = state
+        .cfg
+        .queue
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("requeue reached with queueing disabled"))?;
+
+    // The CLAIM incremented `dispatch_attempts`, so this reads the number of
+    // attempts already made — including this one.
+    if session.dispatch_attempts >= q.requeue_max {
+        tracing::warn!(
+            "run {session_id}: provider refused capacity {} times — failing",
+            session.dispatch_attempts
+        );
+        state.metrics.queue_shed.inc("requeue_exhausted");
+        fail(
+            state,
+            session_id,
+            &format!(
+                "provider refused capacity {} times: {detail}",
+                session.dispatch_attempts
+            ),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // The verbatim provider message rides `status_reason` into the ledger's
+    // StatusChanged event, so the timeline names the exact blocker.
+    if !transition_fenced(
+        state,
+        scope,
+        session_id,
+        SessionStatus::Queued,
+        Some(&format!("provider at capacity: {detail}")),
+        epoch,
+    )
+    .await
+    {
+        // A finalizer or another replica took the session — nothing to re-park.
+        return Ok(());
+    }
+    if let Err(e) = fluidbox_db::set_dispatch_backoff(
+        &state.pool,
+        scope,
+        session_id,
+        capacity_backoff_secs(session.dispatch_attempts),
+    )
+    .await
+    {
+        tracing::warn!("setting dispatch backoff for {session_id} failed: {e}");
+    }
+    Ok(())
+}
+
 /// Phase C workspace fetch: resolve the git auth header from the run's frozen
 /// `workspace_fetch` binding. Mechanically enforces the frozen resource scope
 /// (the URL — and ref/commit when pinned — actually about to be fetched must
@@ -2120,6 +2243,61 @@ mod tests {
 
     fn dl() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now() + chrono::Duration::seconds(30)
+    }
+
+    /// This file's PRODUCTION half — the guard below searches source, and a
+    /// test module that quotes what it searches for would find itself.
+    fn production_src() -> &'static str {
+        let src = include_str!("orchestrator.rs");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this file has a test module");
+        &src[..end]
+    }
+
+    /// INERT BY DEFAULT, asserted rather than trusted. The capacity-bounce arm
+    /// must be gated on the feature: with no queue configured there is nowhere
+    /// to re-park, so `requeue_capacity_denied` would revoke the tokens, clean
+    /// up the launch, fail to find a `QueueCfg`, and return an error from a
+    /// path whose whole contract is to return `Ok(())` — turning a provider
+    /// error into a confusing one. Ungated, a deployment that never asked for
+    /// queueing would behave differently from before the feature existed,
+    /// which is the one thing this epic promises never to do.
+    #[test]
+    fn the_capacity_bounce_is_gated_on_the_feature() {
+        let src = production_src();
+        let at = src
+            .find(concat!("CapacityDenied", "(detail)"))
+            .expect("the bounce arm exists");
+        let window: String = src[at..].chars().take(200).collect();
+        assert!(
+            window.contains("queueing_enabled()"),
+            "the capacity-bounce arm must be gated on the feature; found: {window}"
+        );
+    }
+
+    /// The backoff floor is DERIVED, not chosen: it must be >= the driver lease
+    /// TTL, or a bounced row could be re-claimed while its stale lease still
+    /// reads live. Deriving the assertion from the constant means a future TTL
+    /// change that breaks the relationship fails here rather than in production.
+    #[test]
+    fn capacity_backoff_series_floors_at_the_lease_ttl_and_caps_at_five_minutes() {
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6].map(capacity_backoff_secs),
+            [30, 60, 120, 240, 300, 300]
+        );
+        // Defensive: the first bounce reads attempt 1, but never trust a caller
+        // to have incremented.
+        assert_eq!(capacity_backoff_secs(0), 30);
+        assert_eq!(capacity_backoff_secs(-5), 30);
+        // Saturating, not panicking, at the top of the range.
+        assert_eq!(capacity_backoff_secs(i32::MAX), 300);
+
+        assert!(
+            capacity_backoff_secs(1) >= SESSION_LEASE_TTL_SECS,
+            "the floor must clear the lease TTL ({SESSION_LEASE_TTL_SECS}s) or a bounced \
+             row is re-claimable while its stale lease still reads live"
+        );
     }
 
     /// H5's poster race: /result wins the intent (no quiesce, NULL deadline);
