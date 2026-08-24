@@ -212,6 +212,15 @@ fn resolve_queue_cfg(
     }))
 }
 
+impl Config {
+    /// True iff run admission is configured — the single predicate every call
+    /// site branches on, so "is the queue on" is asked exactly one way and a
+    /// future knob cannot make two sites disagree about it.
+    pub fn queueing_enabled(&self) -> bool {
+        self.queue.is_some()
+    }
+}
+
 /// Read `FLUIDBOX_WORKLOAD_IDENTITY`. Split out (rather than inlined in
 /// [`Config::from_env`]) so the failure message is testable without an env var,
 /// and so the source guard below can prove `from_env` passes the SAME name it

@@ -85,7 +85,7 @@ const COLLECT_TIMEOUT: Duration = Duration::from_secs(120);
 /// the TTL shortens the stall but raises the risk of stealing a session from a
 /// slow-but-live driver; releasing the lease at the end of `run()` is the real
 /// fix and is not built.
-const SESSION_LEASE_TTL_SECS: i64 = 30;
+pub(crate) const SESSION_LEASE_TTL_SECS: i64 = 30;
 
 /// This replica's identity, minted ONCE per process (Phase E, #33; Gap 13).
 ///
@@ -150,7 +150,7 @@ pub fn spawn_run(state: AppState, session_id: Uuid) {
     });
 }
 
-async fn transition(
+pub(crate) async fn transition(
     state: &AppState,
     scope: TenantScope,
     id: Uuid,
@@ -1239,7 +1239,12 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         anyhow::bail!("another replica owns this session's orchestrator lease");
     };
 
-    // created → provisioning
+    // → provisioning, from wherever the session lawfully sits. There are three
+    // lawful predecessors now — `created` (direct spawn), `awaiting_authorization`
+    // (a released network grant), and `queued` (dispatched by the capacity
+    // worker) — and this stays ONE writer of the edge because
+    // `transition_fenced` reads the current status under the same `for update`
+    // lock that guards the epoch and lets `can_transition_to` decide.
     if !transition_fenced(
         &state,
         scope,
