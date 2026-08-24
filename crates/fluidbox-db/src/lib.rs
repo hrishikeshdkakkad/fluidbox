@@ -4682,6 +4682,48 @@ pub async fn session_lease(
     Ok(row)
 }
 
+/// Gate a capacity-bounced run behind a not-before instant and RELEASE its
+/// driver lease (run admission, design 2026-08-23 §7.4).
+///
+/// Tenant-scoped, NOT a bypass: the caller is the orchestrator driving one
+/// known run, so it already holds a verified scope.
+///
+/// Two properties are deliberate:
+///
+/// * **The lease columns are cleared, the epoch is NOT bumped here.** Clearing
+///   the lease is what returns the row to the claim predicate; the next
+///   claimant is then a different owner, so the CLAIM's own
+///   `owner is distinct from` rule bumps the epoch. Bumping it here as well
+///   would fence the bounced driver twice for one handover and break the
+///   "epoch moves only on owner CHANGE" rule the whole fencing scheme rests on.
+/// * **`dispatch_after` is set AFTER the re-park transition, never with it.**
+///   A crash in between leaves a queued row with a live lease: it simply
+///   re-enters the claim pool when that lease expires, without a backoff gate.
+///   Bounded and harmless — the alternative (gate first, transition second)
+///   would gate a row that never re-parked.
+pub async fn set_dispatch_backoff(
+    pool: &PgPool,
+    scope: TenantScope,
+    id: Uuid,
+    not_before_secs: i64,
+) -> sqlx::Result<()> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    sqlx::query(
+        "update sessions set
+            dispatch_after           = now() + make_interval(secs => $3),
+            orchestrator_owner_id    = null,
+            orchestrator_lease_until = null,
+            updated_at               = now()
+          where id = $1 and tenant_id = $2",
+    )
+    .bind(id)
+    .bind(scope.tenant_id())
+    .bind(not_before_secs.max(0) as f64)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
 /// Attach the sandbox handle — REFUSED (returns false) unless the session is
 /// still in an ACTIVE (pre-wind-down) state AND no finalization intent
 /// exists: the intent is the single source of truth for ownership, and it
@@ -15593,6 +15635,331 @@ mod tests {
 
         cleanup_sw_tenant(&pool, tenant).await;
         cleanup_sw_tenant(&pool, tenant2).await;
+    }
+
+    // ─── Dispatch-claim tests run against a DEDICATED database ──────────────
+    //
+    // Capacity occupancy is DEPLOYMENT-WIDE by design (design 2026-08-23 §7.2 —
+    // "the count IS the truth"), so `dispatch_claim` counts every tenant's rows.
+    // In the shared test database that makes a cap assertion an assertion about
+    // every OTHER test's rows: `seed_tenant_session` leaves a session in
+    // `created`, which the occupancy predicate counts as active, and a sibling's
+    // `queued` row is claimed ahead of mine because `order by created_at` is
+    // global too.
+    //
+    // The GLOBAL_SCAN cure above does not reach this: it narrows the RETURNED
+    // BATCH, and here the interference is in the COUNT and in the ORDER. So
+    // these tests get their own database — created once, migrated exactly as
+    // production migrates — and hold [`DISPATCH_SERIAL`] while they run. That
+    // is the same isolation posture the hermetic queue e2e uses, and it turns
+    // probabilistic assertions into deterministic ones.
+    static DISPATCH_DB: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    static DISPATCH_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Swap the database component of a Postgres URL, preserving any query
+    /// string (`?sslmode=…`). Used to reach the maintenance database on the
+    /// same server so the dedicated one can be created.
+    fn swap_db(url: &str, db: &str) -> String {
+        let (head, query) = match url.split_once('?') {
+            Some((h, q)) => (h, Some(q)),
+            None => (url, None),
+        };
+        let base = head.rsplit_once('/').map(|(b, _)| b).unwrap_or(head);
+        match query {
+            Some(q) => format!("{base}/{db}?{q}"),
+            None => format!("{base}/{db}"),
+        }
+    }
+
+    /// The dedicated database's URL, created on first use.
+    ///
+    /// This deliberately caches the URL and NOT a `PgPool`. A pool stored in a
+    /// `static` belongs to the `#[tokio::test]` runtime that built it — sqlx
+    /// spawns the pool's connection tasks there — so when that first test's
+    /// runtime is dropped the pool goes inert and every later borrower blocks
+    /// until `acquire_timeout` and fails `PoolTimedOut`. Sharing the DATABASE
+    /// and letting each test build its own pool costs one cheap no-op migration
+    /// check and is runtime-safe.
+    async fn dispatch_db_url(url: &str) -> String {
+        DISPATCH_DB
+            .get_or_init(|| async move {
+                let admin = PgPool::connect(&swap_db(url, "postgres"))
+                    .await
+                    .expect("connect to the maintenance database");
+                sqlx::query("drop database if exists fluidbox_dispatch_test")
+                    .execute(&admin)
+                    .await
+                    .ok();
+                sqlx::query("create database fluidbox_dispatch_test")
+                    .execute(&admin)
+                    .await
+                    .expect("create the dedicated dispatch database");
+                admin.close().await;
+                swap_db(url, "fluidbox_dispatch_test")
+            })
+            .await
+            .clone()
+    }
+
+    /// Seed `n` sessions already parked in `queued`, oldest first, each in its
+    /// own tenant — the queue is deployment-wide, so cross-tenant rows are
+    /// exactly what the dispatcher must handle.
+    async fn seed_queued(pool: &PgPool, n: usize) -> Vec<(Uuid, Uuid)> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let (tenant, session) = seed_tenant_session(pool).await;
+            transition_session(
+                pool,
+                TenantScope::assume(tenant),
+                session,
+                fluidbox_core::state::SessionStatus::Queued,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            out.push((tenant, session));
+        }
+        out
+    }
+
+    /// A capacity cap of 1 admits exactly one run, and — the mutation guard for
+    /// design §7.3 — a CLAIMED row still sitting in `queued` counts as occupied
+    /// through its live lease. Drop the `filter (… orchestrator_lease_until …)`
+    /// clause from the occupancy query and the second pass double-admits, so
+    /// this test fails.
+    #[tokio::test]
+    async fn dispatch_claim_honors_cap_counting_leased_queued_as_occupied() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let _serial = DISPATCH_SERIAL.lock().await;
+        let pool = &test_connect(&dispatch_db_url(&url).await)
+            .await
+            .expect("connect to the dedicated dispatch database");
+        let seeded = seed_queued(pool, 3).await;
+
+        let owner = Uuid::now_v7();
+        let one = system_worker::dispatch_claim(pool, 1, 200, owner, 30)
+            .await
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(one.claimed.len(), 1, "cap 1 admits exactly one");
+        assert_eq!(one.active, 0, "queued rows are not active until dispatched");
+        assert_eq!(
+            one.claimed[0].dispatch_attempts, 1,
+            "the claim increments attempts"
+        );
+        assert!(
+            one.claimed[0].queued_at.is_some(),
+            "the wait clock is carried"
+        );
+
+        // The claimed row is STILL status='queued' — run() is the single writer
+        // of queued → provisioning. Its live lease is what must make it count
+        // as occupied, or the next tick admits it a second time.
+        let two = system_worker::dispatch_claim(pool, 1, 200, owner, 30)
+            .await
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(two.claimed.len(), 0, "leased-queued must count as occupied");
+        assert_eq!(two.leased_queued, 1);
+
+        // Expire the lease → the row returns to the pool (crash reclaim, §7.3),
+        // and it is the SAME row: a crashed claimant costs one redispatch, not
+        // a lost run.
+        sqlx::query(
+            "update sessions set orchestrator_lease_until = now() - interval '1 second'
+             where id = $1",
+        )
+        .bind(one.claimed[0].id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let three = system_worker::dispatch_claim(pool, 1, 200, owner, 30)
+            .await
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(three.claimed.len(), 1);
+        assert_eq!(three.claimed[0].id, one.claimed[0].id);
+        assert_eq!(three.claimed[0].dispatch_attempts, 2);
+
+        for (tenant, _) in seeded {
+            cleanup_sw_tenant(pool, tenant).await;
+        }
+        pool.close().await;
+    }
+
+    /// FIFO is `order by created_at`, the `dispatch_after` backoff gate hides a
+    /// bounced row until its not-before passes, and a batch never exceeds the
+    /// headroom.
+    #[tokio::test]
+    async fn dispatch_claim_is_fifo_and_respects_the_backoff_gate() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let _serial = DISPATCH_SERIAL.lock().await;
+        let pool = &test_connect(&dispatch_db_url(&url).await)
+            .await
+            .expect("connect to the dedicated dispatch database");
+        let seeded = seed_queued(pool, 3).await;
+        let ids: Vec<Uuid> = seeded.iter().map(|(_, s)| *s).collect();
+
+        // Gate the OLDEST row behind a future not-before: FIFO must skip it and
+        // keep walking rather than head-blocking the queue.
+        sqlx::query("update sessions set dispatch_after = now() + interval '1 hour' where id = $1")
+            .bind(ids[0])
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let owner = Uuid::now_v7();
+        let out = system_worker::dispatch_claim(pool, 10, 200, owner, 30)
+            .await
+            .unwrap()
+            .expect("the lock is free");
+        let claimed: Vec<Uuid> = out.claimed.iter().map(|c| c.id).collect();
+        assert_eq!(
+            claimed,
+            vec![ids[1], ids[2]],
+            "oldest-first, and the backoff-gated row is skipped, not head-blocking"
+        );
+
+        // Headroom, not the batch size, is what bounds a claim: three rows are
+        // now leased-queued, so a cap of 3 leaves no room for the gated one even
+        // after its gate passes.
+        sqlx::query("update sessions set dispatch_after = null where id = $1")
+            .bind(ids[0])
+            .execute(pool)
+            .await
+            .unwrap();
+        let full = system_worker::dispatch_claim(pool, 2, 200, owner, 30)
+            .await
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(full.claimed.len(), 0, "headroom is exhausted");
+        assert_eq!(full.leased_queued, 2);
+
+        for (tenant, _) in seeded {
+            cleanup_sw_tenant(pool, tenant).await;
+        }
+        pool.close().await;
+    }
+
+    /// A losing tick YIELDS rather than queueing behind the winner: the dispatch
+    /// decision is serialized with `pg_try_advisory_xact_lock`, so a replica
+    /// that loses simply re-polls in a second (design §7.2).
+    #[tokio::test]
+    async fn dispatch_claim_yields_when_another_connection_holds_the_lock() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let _serial = DISPATCH_SERIAL.lock().await;
+        let pool = &test_connect(&dispatch_db_url(&url).await)
+            .await
+            .expect("connect to the dedicated dispatch database");
+        let mut holder = pool.begin().await.unwrap();
+        let (locked,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+            .bind(system_worker::DISPATCH_ADVISORY_KEY)
+            .fetch_one(&mut *holder)
+            .await
+            .unwrap();
+        assert!(locked);
+
+        let out = system_worker::dispatch_claim(pool, 10, 200, Uuid::now_v7(), 30)
+            .await
+            .unwrap();
+        assert!(
+            out.is_none(),
+            "a losing tick yields instead of queueing behind the winner"
+        );
+        holder.rollback().await.unwrap();
+
+        // …and the lock is released with the holder's transaction, so the very
+        // next tick proceeds.
+        assert!(
+            system_worker::dispatch_claim(pool, 10, 200, Uuid::now_v7(), 30)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        pool.close().await;
+    }
+
+    /// The queue-age sweep measures from `queued_at`, NOT `created_at` — a run
+    /// that spent days parked for a human authorization must not be expired the
+    /// moment it becomes dispatchable. Adoption refuses a row a live driver
+    /// owns.
+    #[tokio::test]
+    async fn queue_scans_use_queued_at_and_skip_live_leases() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let _serial = DISPATCH_SERIAL.lock().await;
+        let pool = &test_connect(&dispatch_db_url(&url).await)
+            .await
+            .expect("connect to the dedicated dispatch database");
+
+        let seeded = seed_queued(pool, 1).await;
+        let (tenant, session) = seeded[0];
+        assert_eq!(system_worker::count_queued_sessions(pool).await.unwrap(), 1);
+
+        // Ancient created_at, fresh queued_at: it has waited seconds, not days.
+        sqlx::query("update sessions set created_at = now() - interval '2 hours' where id = $1")
+            .bind(session)
+            .execute(pool)
+            .await
+            .unwrap();
+        let expired = system_worker::expired_queued_sessions(pool, 60, 100)
+            .await
+            .unwrap();
+        assert!(
+            !expired.iter().any(|s| s.id == session),
+            "the age bound measures from queued_at, not created_at"
+        );
+
+        sqlx::query("update sessions set queued_at = now() - interval '2 hours' where id = $1")
+            .bind(session)
+            .execute(pool)
+            .await
+            .unwrap();
+        let expired = system_worker::expired_queued_sessions(pool, 60, 100)
+            .await
+            .unwrap();
+        assert!(expired.iter().any(|s| s.id == session));
+
+        // Adoption: a `created` row orphaned before its park is adopted, but a
+        // row a live driver is holding is left alone.
+        let (t2, orphan) = seed_tenant_session(pool).await;
+        let (t3, driven) = seed_tenant_session(pool).await;
+        sqlx::query(
+            "update sessions set created_at = now() - interval '10 minutes' where id = any($1)",
+        )
+        .bind(vec![orphan, driven])
+        .execute(pool)
+        .await
+        .unwrap();
+        acquire_session_lease(pool, TenantScope::assume(t3), driven, Uuid::now_v7(), 300)
+            .await
+            .unwrap()
+            .expect("lease");
+        let orphans = system_worker::orphaned_created_sessions(pool, 120, 100)
+            .await
+            .unwrap();
+        assert!(orphans.iter().any(|s| s.id == orphan));
+        assert!(
+            !orphans.iter().any(|s| s.id == driven),
+            "a row a live driver owns is not an orphan"
+        );
+
+        for t in [tenant, t2, t3] {
+            cleanup_sw_tenant(pool, t).await;
+        }
+        pool.close().await;
     }
 
     /// Design §3.10 — a LIVE bug in the shipped network-grants feature, not a
