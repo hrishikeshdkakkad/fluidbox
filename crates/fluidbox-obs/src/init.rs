@@ -233,7 +233,7 @@ mod tests {
         let w = capture(&c, || {
             let outer = crate::span::request("public", "POST", "/v1/sessions", "req-1", "t-1");
             let _o = outer.enter();
-            let inner = crate::span::run("sess-9", "tenant-3");
+            let inner = crate::span::run("sess-9", Some("tenant-3"));
             let _i = inner.enter();
             tracing::info!("deep inside");
         });
@@ -282,7 +282,7 @@ mod tests {
     fn an_event_field_overrides_the_span_field_of_the_same_name_exactly_once() {
         let c = cfg(Format::Json, "trace");
         let w = capture(&c, || {
-            let s = crate::span::run("outer-session", "t1");
+            let s = crate::span::run("outer-session", Some("t1"));
             let _g = s.enter();
             tracing::info!(session_id = "inner-session", "more specific");
         });
@@ -348,7 +348,7 @@ mod tests {
         let secret = format!("ghp_{}", "z".repeat(36));
         let s2 = secret.clone();
         let w = capture(&c, || {
-            let s = crate::span::run("sess-1", "ten-1");
+            let s = crate::span::run("sess-1", Some("ten-1"));
             let _g = s.enter();
             tracing::warn!(detail = %s2, "push rejected");
         });

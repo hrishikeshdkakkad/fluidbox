@@ -22,8 +22,13 @@ use fluidbox_core::traits::{
     CollectContext, CollectedArtifacts, SandboxHandle, SandboxSpec, SandboxTokens,
 };
 use fluidbox_db::{SessionRow, TenantScope};
+/// Short alias for the closed failure classification. Used on every error record
+/// in this module — `error_kind` is what an alert groups on, so it is spelled
+/// from the vocabulary rather than typed at each site.
+use fluidbox_obs::field::error_kind as EK;
 use std::path::PathBuf;
 use std::time::Duration;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 const SESSION_TOKEN_TTL_SECS: i64 = 3 * 3600;
@@ -128,13 +133,13 @@ async fn hold_lease(state: &AppState, scope: TenantScope, id: Uuid) -> Option<i6
     {
         Ok(Some(epoch)) => Some(epoch),
         Ok(None) => {
-            tracing::info!("session {id}: another replica holds the orchestrator lease");
+            tracing::info!(session_id = %id, "another replica holds the orchestrator lease");
             None
         }
         // A transient DB error is NOT proof of a lost lease, but it IS a reason to
         // stop mutating: without a proven epoch there is no fencing token to carry.
         Err(e) => {
-            tracing::warn!("session {id}: lease acquire failed: {e}");
+            tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, "orchestrator lease acquire failed");
             None
         }
     }
@@ -143,10 +148,20 @@ async fn hold_lease(state: &AppState, scope: TenantScope, id: Uuid) -> Option<i6
 /// Spawn the full run of a freshly-created session in the background.
 pub fn spawn_run(state: AppState, session_id: Uuid) {
     tokio::spawn(async move {
-        if let Err(e) = run(state.clone(), session_id).await {
-            tracing::error!("run {session_id} failed: {e}");
-            fail(&state, session_id, &format!("{e}")).await;
+        // The run span wraps the ENTIRE launch, so every record any layer emits
+        // beneath it — a provider call, a workspace fetch, a database error deep
+        // in a helper — is attributable to this run without that layer knowing
+        // the run exists. The tenant is filled in a query later, inside `run`,
+        // by `record_tenant`; until then records still carry the session.
+        let span = fluidbox_obs::span::run(&session_id.to_string(), None);
+        async {
+            if let Err(e) = run(state.clone(), session_id).await {
+                tracing::error!(session_id = %session_id, error = %e, "run failed");
+                fail(&state, session_id, &format!("{e}")).await;
+            }
         }
+        .instrument(span)
+        .await;
     });
 }
 
@@ -300,7 +315,7 @@ async fn transition_inner(
                 // the facade/gateway. The PRIMARY guard is each endpoint's own
                 // terminal/wind-down check.
                 if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, id).await {
-                    tracing::warn!("revoke_session_tokens {id} failed: {e}");
+                    tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, "revoking session tokens failed");
                 }
                 // Same reasoning for network authority: surrender it the moment
                 // the run is over. Idempotent by CAS, so the reconciler's retry
@@ -318,7 +333,7 @@ async fn transition_inner(
         }
         Ok(None) => TransitionOutcome::Refused,
         Err(e) => {
-            tracing::error!("transition {id}->{next:?} failed: {e}");
+            tracing::error!(session_id = %id, to = ?next, error = %e, error_kind = EK::DB, "status transition failed");
             TransitionOutcome::Failed
         }
     }
@@ -406,7 +421,7 @@ pub async fn fail(state: &AppState, id: Uuid, reason: &str) -> FinalizeStart {
         Ok(Some(s)) => TenantScope::assume(s.tenant_id),
         Ok(None) => return FinalizeStart::Missing,
         Err(e) => {
-            tracing::error!("fail {id} tenant resolve failed: {e}");
+            tracing::error!(session_id = %id, error = %e, error_kind = EK::DB, "cannot fail the run: tenant resolve failed");
             return FinalizeStart::DbError;
         }
     };
@@ -481,7 +496,7 @@ async fn begin_finalize(
             Ok(Some(s)) => TenantScope::assume(s.tenant_id),
             Ok(None) => return FinalizeStart::Missing,
             Err(e) => {
-                tracing::error!("begin_finalization {id} tenant resolve failed: {e}");
+                tracing::error!(session_id = %id, error = %e, error_kind = EK::DB, "cannot begin finalization: tenant resolve failed");
                 return FinalizeStart::DbError;
             }
         },
@@ -509,7 +524,7 @@ async fn begin_finalize(
             // Fail closed: no durable intent → no wind-down transition and no
             // success ACK. The recovery worker joins on `session_finalizations`,
             // so an intent-less wind-down state would strand forever.
-            tracing::error!("begin_finalization {id} failed, not winding down: {e}");
+            tracing::error!(session_id = %id, error = %e, "begin_finalization failed — the run is NOT winding down");
             return FinalizeStart::DbError;
         }
     };
@@ -627,6 +642,15 @@ fn plan_step(
 /// release the intent — only a session that verifiably does not exist, or a
 /// fully reconciled terminal session, does.
 pub async fn drive_finalization(state: &AppState, id: Uuid) {
+    // The finalize driver runs on a worker tick with no ambient request, so it
+    // opens the run span itself. `.instrument` rather than `Span::enter`: this
+    // function awaits at every step, and an entered guard held across an await
+    // attributes whatever the executor runs next to THIS run.
+    let span = fluidbox_obs::span::run(&id.to_string(), None);
+    drive_finalization_inner(state, id).instrument(span).await
+}
+
+async fn drive_finalization_inner(state: &AppState, id: Uuid) {
     // Recovery/terminal entry carries only a bare id (from the recovery worker
     // or a spawned finalize). Resolve the owning tenant once via the
     // cross-tenant loader; a finalization intent always has a session (FK), so
@@ -635,7 +659,7 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
         Ok(Some(s)) => TenantScope::assume(s.tenant_id),
         Ok(None) => return,
         Err(e) => {
-            tracing::warn!("drive_finalization {id}: tenant resolve failed: {e}");
+            tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, retrying = true, "finalize drive: tenant resolve failed");
             return;
         }
     };
@@ -645,7 +669,7 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
         Ok(Some(i)) => i,
         Ok(None) => return, // another driver owns it, or no intent — nothing to do
         Err(e) => {
-            tracing::warn!("claim_finalization {id} failed: {e}");
+            tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, retrying = true, "finalize claim failed");
             return;
         }
     };
@@ -690,7 +714,7 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
                 return;
             }
             Err(e) => {
-                tracing::warn!("drive_finalization {id}: session read failed: {e}");
+                tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, retrying = true, "finalize drive: session read failed");
                 return; // transient — leave the intent for the next drive
             }
         };
@@ -706,7 +730,10 @@ pub async fn drive_finalization(state: &AppState, id: Uuid) {
             }
             WinddownStep::Malformed => {
                 tracing::error!(
-                    "finalization intent for {id} wants quiesce but has no deadline — malformed; leaving for retry"
+                    session_id = %id,
+                    error_kind = EK::INTERNAL,
+                    retrying = true,
+                    "finalization intent wants quiesce but carries no deadline — malformed"
                 );
                 return;
             }
@@ -855,7 +882,7 @@ async fn collect_and_terminalize(
     let stored = match fluidbox_db::diff_artifact_content(&state.pool, scope, id).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("diff artifact read failed for {id}: {e} — retrying next drive");
+            tracing::warn!(session_id = %id, error = %e, artifact_kind = "diff", retrying = true, "artifact read failed");
             return;
         }
     };
@@ -900,7 +927,9 @@ async fn collect_and_terminalize(
                         < intent.created_at + chrono::Duration::seconds(PROVISION_SETTLE_SECS) =>
                 {
                     tracing::info!(
-                        "collect for {id} deferred: no stored handle yet (provisioning may be in flight)"
+                        session_id = %id,
+                        retrying = true,
+                        "artifact collection deferred: no sandbox handle stored yet (provisioning may be in flight)"
                     );
                     // A deliberate wait, not a failure: release the claim so
                     // the finalize worker retries at its cadence instead of
@@ -915,7 +944,10 @@ async fn collect_and_terminalize(
                         Ok(h) => h,
                         Err(()) => {
                             tracing::warn!(
-                                "sandbox discovery for {id} failed — retrying next drive"
+                                session_id = %id,
+                                error_kind = EK::PROVIDER,
+                                retrying = true,
+                                "sandbox discovery failed"
                             );
                             return;
                         }
@@ -944,7 +976,8 @@ async fn collect_and_terminalize(
                 // lease alive across a slow collection's start.
                 if hold_lease(state, scope, id).await != Some(epoch) {
                     tracing::info!(
-                        "collect for {id} abandoned: orchestrator lease moved to another replica"
+                        session_id = %id,
+                        "artifact collection abandoned: the orchestrator lease moved to another replica"
                     );
                     return;
                 }
@@ -968,7 +1001,7 @@ async fn collect_and_terminalize(
                     Err(_) => record_missing_once("collection_timeout".into()).await,
                 };
                 if stored_ok.is_err() {
-                    tracing::warn!("artifact persistence failed for {id} — retrying next drive");
+                    tracing::warn!(session_id = %id, error_kind = EK::DB, retrying = true, "artifact persistence failed");
                     return;
                 }
             }
@@ -1076,19 +1109,21 @@ async fn finish_terminal_cleanup(
                 Ok(true) => {}
                 _ => {
                     tracing::warn!(
-                        "terminal reconcile {id}: run.result append unverified — retrying next drive"
+                        session_id = %id,
+                        retrying = true,
+                        "terminal reconcile: the run.result append could not be verified"
                     );
                     return;
                 }
             }
         }
         Err(e) => {
-            tracing::warn!("terminal reconcile {id}: run.result check failed: {e}");
+            tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, retrying = true, "terminal reconcile: run.result check failed");
             return;
         }
     }
     if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, id).await {
-        tracing::warn!("terminal reconcile {id}: token revoke failed: {e}");
+        tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, retrying = true, "terminal reconcile: token revoke failed");
         return;
     }
     crate::netgrant::revoke_enforcement(state, scope, id, "terminal reconcile").await;
@@ -1101,7 +1136,9 @@ async fn finish_terminal_cleanup(
         .unwrap_or(false);
     if wants_delivery && !crate::deliveries::enqueue_for_session(state, id).await {
         tracing::warn!(
-            "terminal reconcile {id}: delivery enqueue incomplete — retrying next drive"
+            session_id = %id,
+            retrying = true,
+            "terminal reconcile: delivery enqueue incomplete"
         );
         return;
     }
@@ -1128,11 +1165,11 @@ async fn finish_terminal_cleanup(
     }
     if !state.cfg.keep_workspaces {
         if let Err(e) = fluidbox_workspace::cleanup_workspace(&state.cfg.data_dir, id) {
-            tracing::warn!("workspace cleanup failed for {id}: {e} — retrying next drive");
+            tracing::warn!(session_id = %id, error = %e, retrying = true, "workspace cleanup failed");
             return;
         }
         if let Err(e) = delete_archive(state, id).await {
-            tracing::warn!("archive removal failed for {id}: {e} — retrying next drive");
+            tracing::warn!(session_id = %id, error = %e, retrying = true, "workspace archive removal failed");
             return;
         }
     }
@@ -1221,7 +1258,21 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("session vanished"))?;
     let scope = TenantScope::assume(session.tenant_id);
+    fluidbox_obs::span::record_tenant(&session.tenant_id.to_string());
     let run_spec: RunSpec = serde_json::from_value(session.run_spec.clone())?;
+    // The launch's own identity, once, at the top: everything else about this
+    // run is either a status transition (logged canonically from the ledger) or
+    // a failure. These four fields are what an operator needs to reproduce a
+    // run's behaviour and are otherwise only recoverable by reading the frozen
+    // RunSpec out of the database.
+    tracing::info!(
+        harness = %run_spec.harness,
+        model = %run_spec.model,
+        autonomy = ?run_spec.autonomy,
+        trust_tier = ?run_spec.trust_tier,
+        provider = %state.provider.runtime_name(),
+        "launching run"
+    );
 
     // Phase E (#33; Gap 13): take this replica's driver lease BEFORE the first
     // lifecycle mutation and carry its epoch as the fencing token through the
@@ -1482,12 +1533,17 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         ) && !workload_addrs.is_empty()
         {
             tracing::error!(
-                "enforce: could not record workload identity for {session_id} ({e}); refusing to \
-                 run it unbound (terminating the sandbox)"
+                session_id = %session_id,
+                error = %e,
+                error_kind = EK::DB,
+                "could not record workload identity — refusing to run the sandbox unbound; terminating it"
             );
             if let Err(te) = state.provider.terminate(&handle).await {
                 tracing::warn!(
-                    "workload-fail terminate for {session_id} failed ({te}); finalizer discovery will reap"
+                    session_id = %session_id,
+                    error = %te,
+                    error_kind = EK::PROVIDER,
+                    "terminate after a workload-identity failure did not succeed; finalizer discovery will reap it"
                 );
             }
             abandon_launch(&state, scope, session_id).await;
@@ -1496,8 +1552,11 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
             );
         }
         tracing::warn!(
-            "failed to record workload identity for {session_id} ({e}); this run will be \
-             UNBINDABLE at the internal gateway (admitted on the bearer token alone)"
+            session_id = %session_id,
+            error = %e,
+            error_kind = EK::DB,
+            "failed to record workload identity — this run is UNBINDABLE at the internal gateway \
+             (admitted on the bearer token alone)"
         );
     }
     let attached = fluidbox_db::set_sandbox_handle(
@@ -1515,7 +1574,10 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         // verifiably gone, so nothing rides on this call succeeding.
         if let Err(e) = state.provider.terminate(&handle).await {
             tracing::warn!(
-                "late-provision terminate for {session_id} failed ({e}); finalizer discovery will reap"
+                session_id = %session_id,
+                error = %e,
+                error_kind = EK::PROVIDER,
+                "terminate after a late provision did not succeed; finalizer discovery will reap it"
             );
         }
         abandon_launch(&state, scope, session_id).await;
@@ -1758,7 +1820,7 @@ pub async fn stale_archive_candidates(
     match archive_store(state).stale_candidates(ttl).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("archive TTL sweep listing failed: {e}");
+            tracing::warn!(error = %e, "archive TTL sweep listing failed");
             Vec::new()
         }
     }
@@ -2018,12 +2080,12 @@ async fn abandon_launch(state: &AppState, scope: TenantScope, id: Uuid) {
         Ok(None) => {}
         Ok(Some(_)) => return, // the finalizer owns collection + cleanup
         Err(e) => {
-            tracing::warn!("abandon_launch {id}: intent read failed ({e}); leaving files");
+            tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, "abandon_launch: intent read failed; workspace files left in place");
             return;
         }
     }
     if let Err(e) = fluidbox_workspace::cleanup_workspace(&state.cfg.data_dir, id) {
-        tracing::warn!("abandoned-launch workspace cleanup for {id}: {e}");
+        tracing::warn!(session_id = %id, error = %e, "abandoned-launch workspace cleanup failed");
     }
     let _ = delete_archive(state, id).await;
 }
@@ -2094,7 +2156,7 @@ async fn requeue_capacity_denied(
     // runbook's alert keys on the distinction.
     state.metrics.queue_requeues.inc(kind.as_str());
     if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, session_id).await {
-        tracing::warn!("revoking tokens for bounced run {session_id} failed: {e}");
+        tracing::warn!(session_id = %session_id, error = %e, error_kind = EK::DB, "revoking tokens for a capacity-bounced run failed");
     }
     abandon_launch(state, scope, session_id).await;
 
@@ -2115,8 +2177,10 @@ async fn requeue_capacity_denied(
     // against the five and ~13 min the knob and the backoff series document).
     if session.dispatch_attempts > q.requeue_max {
         tracing::warn!(
-            "run {session_id}: provider refused capacity {} times — failing",
-            session.dispatch_attempts
+            session_id = %session_id,
+            attempt = session.dispatch_attempts,
+            error_kind = EK::CAPACITY,
+            "provider refused capacity too many times — failing the run"
         );
         state.metrics.queue_shed.inc("requeue_exhausted");
         // A failed intent write is the same persistence class as a failed
@@ -2167,7 +2231,7 @@ async fn requeue_capacity_denied(
     )
     .await
     {
-        tracing::warn!("setting dispatch backoff for {session_id} failed: {e}");
+        tracing::warn!(session_id = %session_id, error = %e, error_kind = EK::DB, "setting the dispatch backoff failed");
     }
     Ok(())
 }
@@ -2278,7 +2342,7 @@ pub async fn reap(state: &AppState, scope: TenantScope, id: Uuid) -> Result<(), 
         Ok(Some(s)) => s,
         Ok(None) => return Ok(()),
         Err(e) => {
-            tracing::warn!("reap {id}: session read failed: {e}");
+            tracing::warn!(session_id = %id, error = %e, error_kind = EK::DB, "orphan reap: session read failed");
             return Err(());
         }
     };
@@ -2287,7 +2351,7 @@ pub async fn reap(state: &AppState, scope: TenantScope, id: Uuid) -> Result<(), 
         StoredHandle::None | StoredHandle::Unparseable => match discover_handle(state, id).await {
             Ok(h) => h,
             Err(()) => {
-                tracing::warn!("reap {id}: sandbox discovery failed — retrying");
+                tracing::warn!(session_id = %id, error_kind = EK::PROVIDER, retrying = true, "orphan reap: sandbox discovery failed");
                 return Err(());
             }
         },
@@ -2298,11 +2362,11 @@ pub async fn reap(state: &AppState, scope: TenantScope, id: Uuid) -> Result<(), 
     match tokio::time::timeout(TERMINATE_TIMEOUT, state.provider.terminate(&handle)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
-            tracing::warn!("reap {id}: {e}");
+            tracing::warn!(session_id = %id, error = %e, "orphan reap failed");
             Err(())
         }
         Err(_) => {
-            tracing::warn!("reap {id}: terminate timed out");
+            tracing::warn!(session_id = %id, error_kind = EK::TIMEOUT, "orphan reap: terminate timed out");
             Err(())
         }
     }
