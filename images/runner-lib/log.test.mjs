@@ -162,6 +162,27 @@ test("text format carries the same data and the same redaction", () => {
   assert.ok(!line.includes("q".repeat(36)), line);
   assert.match(line, /tool=Bash/);
   assert.match(line, /push rejected/);
+  assert.match(line, /service=fluidbox-runner/);
+});
+
+test("text values cannot forge lines or terminal controls", () => {
+  const { log, lines } = capture({ format: "text" });
+  log.warn("first\nsecond\u001b[31m", {
+    detail: "value\twith\rcontrols",
+    c1: "before\u0085after",
+  });
+  assert.equal(lines.length, 1, "one event emitted exactly one write");
+  const line = lines[0];
+  assert.equal(line.split("\n").length, 2, "only the terminating newline is physical");
+  assert.ok(!line.includes("\t"), `raw tab reached stderr: ${JSON.stringify(line)}`);
+  assert.ok(!line.includes("\r"), `raw carriage return reached stderr: ${JSON.stringify(line)}`);
+  assert.ok(!line.includes("\u001b"), `raw ANSI escape reached stderr: ${JSON.stringify(line)}`);
+  assert.ok(!line.includes("\u0085"), `raw C1 control reached stderr: ${JSON.stringify(line)}`);
+  assert.match(line, /\\n/);
+  assert.match(line, /\\t/);
+  assert.match(line, /\\r/);
+  assert.match(line, /\\u001b/);
+  assert.match(line, /\\u0085/);
 });
 
 test("the pattern and field rules classify the way the Rust side does", () => {

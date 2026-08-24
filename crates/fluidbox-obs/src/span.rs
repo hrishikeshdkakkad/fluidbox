@@ -72,21 +72,37 @@ pub fn trace_id_of(request_id: &Uuid) -> String {
 /// validated for shape and length rather than trusted; a rejected header just
 /// means the request starts its own trace.
 pub fn trace_id_from_traceparent(header: &str) -> Option<String> {
-    let mut parts = header.trim().split('-');
-    let version = parts.next()?;
-    let trace_id = parts.next()?;
-    // Version `ff` is forbidden by the spec; anything else is forward-compatible
-    // as long as the trace-id field is where we expect it.
-    if version.len() != 2 || version.eq_ignore_ascii_case("ff") {
+    // The traceparent grammar contains no surrounding whitespace. Do not turn a
+    // malformed value into a valid one by trimming attacker-controlled input.
+    let parts: Vec<_> = header.split('-').collect();
+    if parts.len() < 4 {
         return None;
     }
-    if trace_id.len() != 32 || !trace_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let [version, trace_id, parent_id, flags, ..] = parts.as_slice() else {
+        return None;
+    };
+    let lower_hex = |s: &str, len: usize| {
+        s.len() == len
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    // Version 00 has exactly four fields. Future versions may append fields,
+    // but the shared prefix remains strict and empty extension fields are not a
+    // valid forward-compatible encoding.
+    if !lower_hex(version, 2)
+        || *version == "ff"
+        || (*version == "00" && parts.len() != 4)
+        || parts[4..].iter().any(|p| p.is_empty())
+        || !lower_hex(trace_id, 32)
+        || !lower_hex(parent_id, 16)
+        || !lower_hex(flags, 2)
+    {
         return None;
     }
-    if trace_id.bytes().all(|b| b == b'0') {
+    if trace_id.bytes().all(|b| b == b'0') || parent_id.bytes().all(|b| b == b'0') {
         return None;
     }
-    Some(trace_id.to_ascii_lowercase())
+    Some((*trace_id).to_string())
 }
 
 /// The span every record produced while serving one HTTP request lives inside.
@@ -219,12 +235,6 @@ mod tests {
             trace_id_from_traceparent(h).as_deref(),
             Some("4bf92f3577b34da6a3ce929d0e0e4736")
         );
-        // Case is normalised so two spellings of one trace do not become two.
-        assert_eq!(
-            trace_id_from_traceparent("00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01")
-                .as_deref(),
-            Some("4bf92f3577b34da6a3ce929d0e0e4736")
-        );
     }
 
     /// The header is attacker-controlled. Every malformed shape must fall back
@@ -235,14 +245,24 @@ mod tests {
             "",
             "garbage",
             "00",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            " 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 ",
             "00-tooshort-00f067aa0ba902b7-01",
             // All-zero trace id: explicitly invalid per the spec, and a great
             // way to collapse every request into one "trace".
             "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
             // Version ff is forbidden.
             "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
             // Non-hex.
             "00-zzf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            // W3C requires lowercase hexadecimal on the wire.
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "0A-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
             // 33 chars.
             "00-4bf92f3577b34da6a3ce929d0e0e47361-00f067aa0ba902b7-01",
         ] {

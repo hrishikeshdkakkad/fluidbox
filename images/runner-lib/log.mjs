@@ -145,6 +145,26 @@ const LEVELS = { trace: 10, debug: 20, info: 30, warn: 40, error: 50 };
 /// the same rule the Rust formatter applies.
 const RESERVED = new Set(["ts", "level", "target", "msg", "service", "session_id"]);
 
+// Escape one value for the human-readable single-line format. JSON's string
+// escaping covers quotes, backslashes, LF/CR/TAB, and ESC; DEL/C1 controls are
+// escaped explicitly because JSON permits some of them literally while a
+// terminal may still interpret them.
+function textFragment(value) {
+  const quoted = JSON.stringify(String(value));
+  const inner = quoted ? quoted.slice(1, -1) : "";
+  return inner.replace(/[\u007f-\u009f]/g, (ch) =>
+    `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+function textToken(value) {
+  const raw = String(value);
+  const escaped = textFragment(raw);
+  return raw.length === 0 || /[\s\u0000-\u001f\u007f-\u009f"\\]/u.test(raw)
+    ? `"${escaped}"`
+    : escaped;
+}
+
 export function createLogger({
   target = "runner",
   service = "fluidbox-runner",
@@ -183,9 +203,12 @@ export function createLogger({
     }
     const extra = Object.entries(rec)
       .filter(([k]) => !["ts", "level", "target", "msg", "service"].includes(k))
-      .map(([k, v]) => `${k}=${v}`)
+      .map(([k, v]) => `${textToken(k)}=${typeof v === "string" ? textToken(v) : String(v)}`)
       .join(" ");
-    write(`${rec.ts} ${lvl.padStart(5)} ${target}: ${rec.msg}${extra ? ` ${extra}` : ""}\n`);
+    write(
+      `${rec.ts} ${lvl.padStart(5)} service=${textToken(rec.service)} ${textToken(rec.target)}: ` +
+        `${textFragment(rec.msg)}${extra ? ` ${extra}` : ""}\n`,
+    );
   }
 
   const api = {};

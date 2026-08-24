@@ -14,6 +14,7 @@ use crate::format::{ObsLayer, Statics};
 use crate::throttle::Throttle;
 use std::sync::Arc;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 /// Kept by the caller after [`init`] so the parts of the subsystem that outlive
@@ -95,7 +96,14 @@ pub fn init(cfg: &LogConfig) -> Result<LogHandle, String> {
         throttle: l.throttle_handle(),
         cfg: cfg.clone(),
     };
-    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(filter).with(l))
+    // `try_init`, unlike a bare `set_global_default`, also installs the
+    // `tracing-log` bridge. Several dependencies (notably sqlx, reqwest,
+    // bollard, and rustls) still emit through the `log` facade; without this
+    // bridge their diagnostics disappear even though the filter names them.
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(l)
+        .try_init()
         .map_err(|e| format!("a tracing subscriber is already installed: {e}"))?;
     Ok(handle)
 }
@@ -344,7 +352,8 @@ mod tests {
     /// leak on every developer's terminal and in every CI artifact.
     #[test]
     fn text_output_is_redacted_and_correlated_too() {
-        let c = cfg(Format::Text, "trace");
+        let mut c = cfg(Format::Text, "trace");
+        c.thread_names = true;
         let secret = format!("ghp_{}", "z".repeat(36));
         let s2 = secret.clone();
         let w = capture(&c, || {
@@ -358,6 +367,47 @@ mod tests {
         assert!(line.contains("[run]"), "{line}");
         assert!(line.contains("push rejected"), "{line}");
         assert!(line.contains(" warn "), "{line}");
+        for field in [
+            "service=fluidbox-test",
+            "version=",
+            "instance=test-instance",
+            "pid=",
+            "span_id=",
+            "thread=",
+        ] {
+            assert!(
+                line.contains(field),
+                "text envelope omitted {field}: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_values_cannot_forge_lines_or_terminal_controls() {
+        let c = cfg(Format::Text, "trace");
+        let w = capture(&c, || {
+            tracing::warn!(detail = "value\twith\u{1b}[31m controls", "first\nsecond")
+        });
+        let lines = w.lines();
+        assert_eq!(lines.len(), 1, "one event forged extra records: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            !line.contains('\t'),
+            "raw tab reached text output: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "raw ANSI escape reached text output: {line:?}"
+        );
+        assert!(
+            line.contains("\\n"),
+            "newline was not visibly escaped: {line}"
+        );
+        assert!(line.contains("\\t"), "tab was not visibly escaped: {line}");
+        assert!(
+            line.contains("\\u001b"),
+            "ANSI escape was not visibly escaped: {line}"
+        );
     }
 
     /// The envelope statics are written by the formatter directly, not through
@@ -431,5 +481,26 @@ mod tests {
         let v = r["blob"].as_str().unwrap();
         assert!(v.len() < 400, "capped, got {} bytes", v.len());
         assert!(v.contains("truncated"), "and says so: {v}");
+    }
+
+    /// The smallest configuration the server accepts still has to produce one
+    /// valid JSON value. Prefix-slicing the original object failed this case even
+    /// for a basic event because the cut landed inside an envelope string.
+    #[test]
+    fn whole_record_truncation_at_the_64_byte_floor_is_valid_json() {
+        let mut c = cfg(Format::Json, "trace");
+        c.limits.max_field_bytes = 64;
+        c.limits.max_line_bytes = 64;
+        let w = capture(&c, || tracing::info!(field = "ordinary", "basic event"));
+        let lines = w.lines();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].len() <= 64,
+            "{} bytes: {}",
+            lines[0].len(),
+            lines[0]
+        );
+        let value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(value["truncated"], true);
     }
 }
