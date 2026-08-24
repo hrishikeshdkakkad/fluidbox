@@ -612,10 +612,15 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoRespons
 
 /// Whether a session status counts as an in-flight run for [`Metrics::active_runs`]:
 /// a sandbox exists / capacity is held from `provisioning` through `finalizing`.
-/// `created` and `awaiting_authorization` are both PRE-SANDBOX — a run parked
-/// for network authorization holds no compute, and counting it would make the
-/// gauge report capacity that is not held. The four terminal states have
-/// released it.
+/// `created`, `awaiting_authorization` and `queued` are all PRE-SANDBOX — a run
+/// parked for network authorization or for a capacity slot holds no compute,
+/// and counting it would make the gauge report capacity that is not held. The
+/// four terminal states have released it.
+///
+/// Note this gauge is deliberately REPLICA-LOCAL and is not the admission
+/// authority: the dispatcher derives occupancy by counting session rows inside
+/// its serialized decision (design 2026-08-23 §7.2), because a per-replica
+/// gauge cannot see the other replicas' runs.
 pub fn status_is_active(status: fluidbox_core::state::SessionStatus) -> bool {
     use fluidbox_core::state::SessionStatus::*;
     matches!(
@@ -701,6 +706,18 @@ mod tests {
         // Sum reconciles the observed integer milliseconds.
         assert!(out.contains("h_sum 555"), "{out}");
         assert_eq!(h.count(), 3);
+    }
+
+    #[test]
+    fn queued_is_not_active_for_the_gauge() {
+        use SessionStatus::*;
+        // The capacity park holds no sandbox, so it sits OUTSIDE the active
+        // band — dispatch is the edge in, a capacity bounce is the edge out.
+        assert!(!status_is_active(Queued));
+        assert_eq!(active_delta(Queued, Provisioning), 1); // dispatch enters the band
+        assert_eq!(active_delta(Provisioning, Queued), -1); // a capacity bounce leaves it
+        assert_eq!(active_delta(Created, Queued), 0); // parking moves nothing
+        assert_eq!(active_delta(AwaitingAuthorization, Queued), 0); // park to park
     }
 
     #[test]
