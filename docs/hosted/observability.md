@@ -137,8 +137,15 @@ Every value written is scrubbed twice over, by two independent mechanisms:
   so a credential nested inside a logged HTTP response is caught too.
 
 Redaction preserves the diagnostic. A scrubbed connection string keeps its host
-and role; a scrubbed OAuth callback keeps the parameter name. You lose the
-secret, not the ability to debug.
+and role; a scrubbed OAuth callback keeps the parameter name; a scrubbed pod name
+keeps everything but the credential-shaped part. You lose the secret, not the
+ability to debug.
+
+It applies to the envelope too, not just the fields — `service`, `instance` and
+`version` are scrubbed once when the subscriber is built. Those are
+operator-set, so that is defence in depth rather than a live hole; but "every
+byte reaching the sink passes through redaction" is the claim, and a claim with
+one exception is not the claim.
 
 **There is no switch to turn redaction off.** The only argument for one is
 "redaction is hiding something I need", which the design answers by keeping
@@ -222,6 +229,29 @@ genuinely wanted.
 `fluidbox_log_write_errors_total` is the only evidence a full disk or a closed
 pipe produced: logging never propagates a write failure, because a broken log
 must not take a control plane down.
+
+## Boot
+
+Logging is built **before configuration is read** — a config error is among the
+things most worth logging, and until that line runs every diagnostic is lost.
+So a replica that never came up still leaves records:
+
+```json
+{"level":"info","msg":"logging initialised …","format":"json","filter":"info,fluidbox_server=info,…","throttle_per_sec":200}
+{"level":"info","msg":"connecting to the database"}
+{"level":"error","msg":"BOOT FAILED — the control plane did not start","error":"…","error_kind":"internal"}
+```
+
+The one thing that cannot be a record is a malformed `FLUIDBOX_LOG_*` value
+itself — logging is not up yet, by definition. That refusal goes to stderr as
+plain text, names the variable and its accepted set, and `just doctor` catches
+it before you get there.
+
+Everything the boot banner reports is a field: pool sizing, RLS posture,
+provider, queue caps, sealing mode, LLM key mode, egress limits, listener binds,
+the workload-identity mode. "What was this replica configured with" is a
+group-by, and comparable across replicas — which is usually when you want to ask
+it.
 
 A **spike** in `fluidbox_log_redactions_total` is worth a look. A steady rate is
 normal (upstream errors quote URLs); a step change means something newly started
