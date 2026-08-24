@@ -17,8 +17,8 @@
 
 use async_trait::async_trait;
 use fluidbox_core::traits::{
-    CollectContext, CollectedArtifacts, ExecutionProvider, ProviderError, SandboxHandle,
-    SandboxSpec, SandboxStatus,
+    CapacityKind, CollectContext, CollectedArtifacts, ExecutionProvider, ProviderError,
+    SandboxHandle, SandboxSpec, SandboxStatus,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
@@ -70,9 +70,13 @@ impl ExecutionProvider for NullProvider {
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(ProviderError::CapacityDenied(
-                "null provider: injected quota denial".into(),
-            ));
+            // `Quota` rather than `Throttle`: the injected denial models the
+            // namespace ResourceQuota rejection the feature exists to survive,
+            // and the e2e asserts the operator metric carries that label.
+            return Err(ProviderError::CapacityDenied {
+                kind: CapacityKind::Quota,
+                detail: "null provider: injected quota denial".into(),
+            });
         }
         Ok(null_handle(spec.session_id))
     }

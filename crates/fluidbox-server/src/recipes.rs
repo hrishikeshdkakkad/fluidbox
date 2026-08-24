@@ -1387,6 +1387,10 @@ pub async fn deploy(
             });
             match agent_obj.and_then(|o| o["id"].as_str()) {
                 None => Some(json!({ "error": "first-run agent slot missing" })),
+                // The deploy is COMMITTED; a first-run failure reports on the
+                // response and the instance page and never unwinds it. That is
+                // why the structured error is flattened HERE and not inside
+                // `start_instance_run` — the run-now handler needs it intact.
                 Some(agent_id) => Some(
                     start_instance_run(
                         &state,
@@ -1396,7 +1400,8 @@ pub async fn deploy(
                         &fr.task,
                         fr.autonomous,
                     )
-                    .await,
+                    .await
+                    .unwrap_or_else(|e| json!({ "error": e.to_string() })),
                 ),
             }
         }
@@ -1431,8 +1436,20 @@ pub async fn deploy(
     ))
 }
 
-/// Start a run for an instance through the ONE funnel. Returns a JSON blob
-/// (session id or error) — callers surface it, they never fail on it.
+/// Start a run for an instance through the ONE funnel.
+///
+/// `Ok` carries the JSON blob callers surface: a `session_id`, or an `error`
+/// describing a run-level refusal the caller is expected to DISPLAY rather than
+/// fail on (an overlapping run, an unpersisted replacement).
+///
+/// `Err` carries the funnel's own [`ApiError`] UNCHANGED. That distinction is
+/// load-bearing: stringifying every error into the blob made `run_instance`
+/// convert all of them into a bare 409, which silently destroyed the run
+/// queue's backpressure contract — an `AtCapacity` shed reached recipe callers
+/// as a Conflict with no `Retry-After`, i.e. as "your request conflicts" rather
+/// than "retry in 30 s". It flattened the rest too (a database outage answered
+/// 409). The deploy path, which must never unwind on a first-run failure,
+/// stringifies at ITS call site instead.
 async fn start_instance_run(
     state: &AppState,
     principal: &Principal,
@@ -1440,7 +1457,7 @@ async fn start_instance_run(
     agent_id: &str,
     task: &str,
     autonomous: bool,
-) -> Value {
+) -> ApiResult<Value> {
     let scope = principal.scope();
     let req = CreateRun {
         agent: agent_id.to_string(),
@@ -1471,24 +1488,23 @@ async fn start_instance_run(
         bound_dispatch: None,
         network_override: None,
     };
-    match run_service::create_run(state, scope, req).await {
-        Ok(RunCreation::Created(session)) => {
+    match run_service::create_run(state, scope, req).await? {
+        RunCreation::Created(session) => {
             if let Err(e) =
                 db::record_instance_session(&state.pool, scope, instance.id, session.id, "run")
                     .await
             {
                 tracing::warn!(error = %e, "recipe run link not recorded");
             }
-            json!({ "session_id": session.id })
+            Ok(json!({ "session_id": session.id }))
         }
-        Ok(RunCreation::SkippedOverlap { running_session_id }) => {
+        RunCreation::SkippedOverlap { running_session_id } => Ok(
             json!({ "error": "another run of this deployment is still active",
-                    "running_session_id": running_session_id })
+                       "running_session_id": running_session_id }),
+        ),
+        RunCreation::ReplaceUnpersisted { .. } => {
+            Ok(json!({ "error": "could not persist the replacement — retry" }))
         }
-        Ok(RunCreation::ReplaceUnpersisted { .. }) => {
-            json!({ "error": "could not persist the replacement — retry" })
-        }
-        Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
@@ -1698,6 +1714,10 @@ pub async fn run_instance(
         .iter()
         .find(|o| o.kind == "agent" && o.slot == fr.agent_slot)
         .ok_or_else(|| ApiError::Internal("first-run agent object missing".into()))?;
+    // `?` is the fix: an `AtCapacity` shed must reach the caller as the queue's
+    // 429 + `Retry-After`, and every other funnel error as its own status —
+    // not as a blanket 409. Only the run-level refusals below (which arrive as
+    // `Ok`) are Conflicts.
     let result = start_instance_run(
         &state,
         &principal,
@@ -1706,7 +1726,7 @@ pub async fn run_instance(
         &task,
         rendered.first_run.map(|f| f.autonomous).unwrap_or(false),
     )
-    .await;
+    .await?;
     if result.get("session_id").is_some() {
         Ok((axum::http::StatusCode::CREATED, Json(result)))
     } else {

@@ -150,6 +150,33 @@ pub fn spawn_run(state: AppState, session_id: Uuid) {
     });
 }
 
+/// What a transition attempt actually did. The distinction that matters is the
+/// third arm: a compare-and-set that matched no row (the state moved, another
+/// driver owns it) and a compare-and-set that never reached the database are
+/// completely different facts, and a caller that cleaned something up before
+/// transitioning MUST be able to tell them apart. Collapsing both to `false` —
+/// which is what the `bool` forms below still do, correctly, for callers whose
+/// only question is "did I win" — hid a stalled run behind a transient error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransitionOutcome {
+    /// The CAS matched: this caller is the single winner and the side effects
+    /// (ledger event, terminal fan-out) have fired.
+    Applied,
+    /// The CAS matched no row: the session is not in a state this edge leaves,
+    /// or another replica moved it first. Nothing was written; nothing is owed.
+    Refused,
+    /// The statement did not complete. The intended state is NOT persisted and
+    /// the caller's own preceding work may already be undone — this must never
+    /// be mistaken for `Refused`.
+    Failed,
+}
+
+impl TransitionOutcome {
+    fn applied(self) -> bool {
+        self == TransitionOutcome::Applied
+    }
+}
+
 pub(crate) async fn transition(
     state: &AppState,
     scope: TenantScope,
@@ -166,6 +193,7 @@ pub(crate) async fn transition(
         fluidbox_db::transition_session(&state.pool, scope, id, next, reason).await,
     )
     .await
+    .applied()
 }
 
 /// The epoch-fenced form of [`transition`] — the one DRIVER lifecycle mutations
@@ -186,6 +214,21 @@ async fn transition_fenced(
     reason: Option<&str>,
     expected_epoch: i64,
 ) -> bool {
+    transition_fenced_outcome(state, scope, id, next, reason, expected_epoch)
+        .await
+        .applied()
+}
+
+/// [`transition_fenced`] for the one caller that must distinguish "the CAS
+/// matched nothing" from "the write failed" — see [`TransitionOutcome`].
+async fn transition_fenced_outcome(
+    state: &AppState,
+    scope: TenantScope,
+    id: Uuid,
+    next: SessionStatus,
+    reason: Option<&str>,
+    expected_epoch: i64,
+) -> TransitionOutcome {
     transition_inner(
         state,
         scope,
@@ -215,7 +258,7 @@ async fn transition_inner(
     next: SessionStatus,
     reason: Option<&str>,
     outcome: sqlx::Result<Option<(SessionStatus, fluidbox_db::SessionRow)>>,
-) -> bool {
+) -> TransitionOutcome {
     match outcome {
         Ok(Some((from, row))) => {
             ledger::record(
@@ -271,12 +314,12 @@ async fn transition_inner(
                 // idempotent) before the intent is ever released.
                 let _ = crate::deliveries::enqueue_for_session(state, id).await;
             }
-            true
+            TransitionOutcome::Applied
         }
-        Ok(None) => false,
+        Ok(None) => TransitionOutcome::Refused,
         Err(e) => {
             tracing::error!("transition {id}->{next:?} failed: {e}");
-            false
+            TransitionOutcome::Failed
         }
     }
 }
@@ -1397,10 +1440,10 @@ async fn run(state: AppState, session_id: Uuid) -> anyhow::Result<()> {
         // dying (design 2026-08-23 §7.4). Only when queueing is ON — with the
         // feature off there is no queue to return to, so this stays today's
         // terminal path byte for byte.
-        Err(fluidbox_core::traits::ProviderError::CapacityDenied(detail))
+        Err(fluidbox_core::traits::ProviderError::CapacityDenied { kind, detail })
             if state.cfg.queueing_enabled() =>
         {
-            return requeue_capacity_denied(&state, scope, session_id, epoch, &detail).await;
+            return requeue_capacity_denied(&state, scope, session_id, epoch, kind, &detail).await;
         }
         Err(e) => return Err(e.into()),
     };
@@ -2024,16 +2067,32 @@ pub(crate) fn capacity_backoff_secs(attempt: i32) -> i64 {
 ///    claim pool at lease expiry (~30 s) without a backoff gate — bounded and
 ///    harmless. The reverse order would gate a row that never re-parked.
 ///
-/// Returns `Ok(())` so `spawn_run`'s catch-all never converts a bounce into a
-/// terminal `fail()`: a capacity bounce is not a run failure.
+/// Returns `Ok(())` on every outcome that LEAVES THE RUN SOMEWHERE VALID — it
+/// re-parked, or a finalizer/another replica took it — so `spawn_run`'s
+/// catch-all never converts a bounce into a terminal `fail()`: a capacity
+/// bounce is not a run failure.
+///
+/// It returns `Err` for exactly one class: a PERSISTENCE failure. By the time
+/// the re-park is attempted this run's tokens are revoked and its launch
+/// artifacts are gone, so a session left un-parked cannot proceed AND holds an
+/// admission slot until the stale-launch watchdog notices. `TransitionOutcome`
+/// exists to make that distinguishable from a legitimate CAS loss; propagating
+/// puts the run on the same explained-failure path as every other run error
+/// instead of stalling it silently. If the database is down entirely the
+/// catch-all's own `fail()` also cannot write, which degrades to exactly the
+/// pre-existing behaviour (the watchdog sweeps it) rather than to a new one.
 async fn requeue_capacity_denied(
     state: &AppState,
     scope: TenantScope,
     session_id: Uuid,
     epoch: i64,
+    kind: fluidbox_core::traits::CapacityKind,
     detail: &str,
 ) -> anyhow::Result<()> {
-    state.metrics.queue_requeues.inc("capacity");
+    // Labelled with the substrate's OWN classification (quota vs throttle), not
+    // a merged "capacity": the two have opposite operator remedies, and the
+    // runbook's alert keys on the distinction.
+    state.metrics.queue_requeues.inc(kind.as_str());
     if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, session_id).await {
         tracing::warn!("revoking tokens for bounced run {session_id} failed: {e}");
     }
@@ -2049,14 +2108,21 @@ async fn requeue_capacity_denied(
         .ok_or_else(|| anyhow::anyhow!("requeue reached with queueing disabled"))?;
 
     // The CLAIM incremented `dispatch_attempts`, so this reads the number of
-    // attempts already made — including this one.
-    if session.dispatch_attempts >= q.requeue_max {
+    // attempts already made — including this one. The comparison is strictly
+    // GREATER THAN on purpose: `requeue_max` counts REQUEUES the deployment
+    // tolerates, so the Nth refusal must still be re-parked and only the
+    // (N+1)th fails. `>=` here consumed one of them (four delays, ~7.5 min,
+    // against the five and ~13 min the knob and the backoff series document).
+    if session.dispatch_attempts > q.requeue_max {
         tracing::warn!(
             "run {session_id}: provider refused capacity {} times — failing",
             session.dispatch_attempts
         );
         state.metrics.queue_shed.inc("requeue_exhausted");
-        fail(
+        // A failed intent write is the same persistence class as a failed
+        // re-park: nothing is durable, the run is stranded mid-teardown, and
+        // swallowing it would leave an admission slot held with no retry.
+        if fail(
             state,
             session_id,
             &format!(
@@ -2064,13 +2130,19 @@ async fn requeue_capacity_denied(
                 session.dispatch_attempts
             ),
         )
-        .await;
+        .await
+            == FinalizeStart::DbError
+        {
+            anyhow::bail!(
+                "run {session_id} exhausted its capacity retries but the finalization intent could not be persisted"
+            );
+        }
         return Ok(());
     }
 
     // The verbatim provider message rides `status_reason` into the ledger's
     // StatusChanged event, so the timeline names the exact blocker.
-    if !transition_fenced(
+    match transition_fenced_outcome(
         state,
         scope,
         session_id,
@@ -2080,8 +2152,12 @@ async fn requeue_capacity_denied(
     )
     .await
     {
+        TransitionOutcome::Applied => {}
         // A finalizer or another replica took the session — nothing to re-park.
-        return Ok(());
+        TransitionOutcome::Refused => return Ok(()),
+        TransitionOutcome::Failed => anyhow::bail!(
+            "run {session_id} could not be re-parked after a capacity refusal ({detail})"
+        ),
     }
     if let Err(e) = fluidbox_db::set_dispatch_backoff(
         &state.pool,
@@ -2268,12 +2344,36 @@ mod tests {
     fn the_capacity_bounce_is_gated_on_the_feature() {
         let src = production_src();
         let at = src
-            .find(concat!("CapacityDenied", "(detail)"))
+            .find(concat!("CapacityDenied", " { kind, detail }"))
             .expect("the bounce arm exists");
         let window: String = src[at..].chars().take(200).collect();
         assert!(
             window.contains("queueing_enabled()"),
             "the capacity-bounce arm must be gated on the feature; found: {window}"
+        );
+    }
+
+    /// `requeue_max` counts REQUEUES the deployment tolerates, so the budget
+    /// must be SPENT before exhaustion: with the default of 5, refusals at
+    /// attempts 1..=5 all re-park and only the 6th fails. The `>=` this
+    /// replaced spent one of them on the failure itself — four delays and
+    /// ~7.5 minutes, against the five and ~13 minutes the knob's own
+    /// documentation, the chart comment and the runbook all promise.
+    #[test]
+    fn the_requeue_budget_is_spent_before_exhaustion() {
+        let requeue_max: i32 = 5; // config.rs's default, pinned by its own test
+        let requeued: Vec<i32> = (1..=6).filter(|a| *a <= requeue_max).collect();
+        assert_eq!(requeued, vec![1, 2, 3, 4, 5], "five tolerated refusals");
+        let total: i64 = requeued.iter().copied().map(capacity_backoff_secs).sum();
+        assert_eq!(
+            total, 750,
+            "the tolerated refusals must span the ~13 minutes documented"
+        );
+        // …and the predicate itself, so an edit back to `>=` fails HERE rather
+        // than silently shortening the tail an operator was promised.
+        assert!(
+            production_src().contains(concat!("dispatch_attempts >", " q.requeue_max")),
+            "exhaustion must be strictly greater-than: `>=` spends one requeue on the failure"
         );
     }
 

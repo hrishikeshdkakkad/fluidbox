@@ -10,6 +10,18 @@
   archiveStore != "s3" is exactly the node-local / single-replica case.
 */}}
 {{- $nodeLocalArchive := ne .Values.server.archiveStore "s3" -}}
+{{- /*
+  Run admission is configured iff maxConcurrentRuns has a value. Note this is
+  NOT `with`/`if` on the value: Helm's truthiness treats a numeric 0 as empty,
+  so `{{- with .Values.server.maxConcurrentRuns }}` DROPS `--set
+  server.maxConcurrentRuns=0` and the operator gets a silently unqueued
+  deployment instead of the boot refusal the server has for exactly that value.
+  Every queue knob below therefore renders through `renderIfSet`, which asks
+  "was a value supplied" (not-nil AND not the empty string) and lets a zero
+  through to the server's own validation.
+*/}}
+{{- $queueOn := and (not (kindIs "invalid" .Values.server.maxConcurrentRuns))
+                    (ne (toString .Values.server.maxConcurrentRuns) "") -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -122,9 +134,25 @@ spec:
     {{- /* Single RWO archive PVC forces Recreate: the old pod must release the
            volume before the replacement can attach it. */}}
     type: Recreate
+    {{- else if $queueOn }}
+    {{- /* Run admission forces Recreate for a DIFFERENT reason: the cap is a
+           per-pod environment variable, so a RollingUpdate necessarily runs two
+           generations of replica at once — and during that window the
+           "deployment-wide cap" is not one cap. Enabling the feature leaves
+           still-ready old pods spawning runs directly with no queue at all;
+           changing the cap leaves each replica dispatching to its own ceiling,
+           and since any replica may win the dispatch advisory lock the
+           effective cap becomes max(old, new). Neither is the property the
+           chart documents. Recreate makes activation and every later cap change
+           atomic across the fleet; the price is the same downtime the
+           node-local archive backend already accepts, and it is only paid by
+           deployments that asked for a deployment-wide cap. Leave
+           maxConcurrentRuns unset to keep zero-downtime rolling upgrades. */}}
+    type: Recreate
     {{- else }}
-    {{- /* archiveStore "s3": no shared RWO volume, so a rolling upgrade is safe
-           and avoids the full downtime Recreate would impose. maxSurge /
+    {{- /* archiveStore "s3" with no run admission: no shared RWO volume and no
+           fleet-wide cap to keep consistent, so a rolling upgrade is safe and
+           avoids the full downtime Recreate would impose. maxSurge /
            maxUnavailable are left at the Kubernetes defaults (25% each). */}}
     type: RollingUpdate
     {{- end }}
@@ -281,20 +309,27 @@ spec:
             # redesigned rather than reconfigured.
             - { name: FLUIDBOX_WORKLOAD_IDENTITY, value: {{ . | quote }} }
             {{- end }}
-            {{- with .Values.server.maxConcurrentRuns }}
-            # Run admission: the app-level cap that turns over-capacity runs into
-            # a FIFO queue instead of a failure. Keep it at or below
-            # sandbox.quota.pods — see the comment on both values.
-            - { name: FLUIDBOX_MAX_CONCURRENT_RUNS, value: {{ . | quote }} }
+            {{- /* Run admission: the app-level cap that turns over-capacity runs
+                   into a FIFO queue instead of a failure. Keep it at or below
+                   sandbox.quota.pods — see the comment on both values.
+
+                   Rendered through an explicit is-it-set test rather than
+                   `with`, because `with` treats a numeric 0 as empty and would
+                   drop the variable: the server REFUSES to boot on a 0 for any
+                   of these four (a zero cap admits nothing, a zero depth sheds
+                   everything, a zero wait expires everything), and silently
+                   omitting the value turns each of those refusals into a
+                   silent default. */}}
+            {{- range $name, $value := dict
+                  "FLUIDBOX_MAX_CONCURRENT_RUNS" .Values.server.maxConcurrentRuns
+                  "FLUIDBOX_QUEUE_MAX_DEPTH"     .Values.server.queueMaxDepth
+                  "FLUIDBOX_QUEUE_MAX_WAIT_SECS" .Values.server.queueMaxWaitSecs
+                  "FLUIDBOX_QUEUE_REQUEUE_MAX"   .Values.server.queueRequeueMax }}
+            {{- if not (kindIs "invalid" $value) }}
+            {{- if ne (toString $value) "" }}
+            - { name: {{ $name }}, value: {{ $value | quote }} }
             {{- end }}
-            {{- with .Values.server.queueMaxDepth }}
-            - { name: FLUIDBOX_QUEUE_MAX_DEPTH, value: {{ . | quote }} }
             {{- end }}
-            {{- with .Values.server.queueMaxWaitSecs }}
-            - { name: FLUIDBOX_QUEUE_MAX_WAIT_SECS, value: {{ . | quote }} }
-            {{- end }}
-            {{- with .Values.server.queueRequeueMax }}
-            - { name: FLUIDBOX_QUEUE_REQUEUE_MAX, value: {{ . | quote }} }
             {{- end }}
             {{- if .Values.server.allowRlsBypass }}
             # Review M2 escape hatch: accept a pool role that bypasses RLS even in

@@ -15823,6 +15823,92 @@ mod tests {
         pool.close().await;
     }
 
+    /// The cap counts SANDBOXES, not statuses — the property a status-only
+    /// occupancy query silently breaks.
+    ///
+    /// A finalizer commits the terminal status BEFORE `finish_terminal_cleanup`
+    /// reaches `reap()`, and provider deletion can fail and be retried. With the
+    /// count keyed on `status` alone, the run left occupancy the instant it went
+    /// terminal while its pod was still running, so the next tick admitted
+    /// another one OVER the cap — and repeated reap failures made the divergence
+    /// grow without bound.
+    ///
+    /// The marker for "may still own a sandbox" is the finalization intent,
+    /// which `finish_terminal_cleanup` deletes ONLY after a successful reap.
+    /// This test walks that exact sequence: intent recorded, status terminal,
+    /// sandbox NOT yet reaped ⇒ the slot stays held; intent deleted (the reap
+    /// succeeded) ⇒ the slot is released. Drop the `unreaped` term from the
+    /// occupancy query and the middle assertion fails.
+    #[tokio::test]
+    async fn an_unreaped_sandbox_holds_its_slot_after_the_terminal_status() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let _serial = DISPATCH_SERIAL.lock().await;
+        let pool = &test_connect(&dispatch_db_url(&url).await)
+            .await
+            .expect("connect to the dedicated dispatch database");
+        let seeded = seed_queued(pool, 2).await;
+        let (tenant_a, _) = seeded[0];
+        let scope_a = TenantScope::assume(tenant_a);
+
+        let owner = Uuid::now_v7();
+        let first = system_worker::dispatch_claim(pool, 1, 200, owner, 30)
+            .await
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(first.claimed.len(), 1, "cap 1 admits exactly one");
+        let admitted = first.claimed[0].id;
+
+        // The finalizer's ordering, reproduced: durable intent first, terminal
+        // status second, reap LAST. Between the second and third steps the
+        // sandbox is still running.
+        begin_finalization(pool, scope_a, admitted, "completed", None, None, false, 30)
+            .await
+            .expect("intent persists");
+        sqlx::query("update sessions set status = 'completed' where id = $1")
+            .bind(admitted)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let mid = system_worker::dispatch_claim(pool, 1, 200, owner, 30)
+            .await
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(mid.active, 0, "the run is terminal by status");
+        assert_eq!(
+            mid.unreaped, 1,
+            "…but its sandbox has not been verifiably released"
+        );
+        assert_eq!(
+            mid.claimed.len(),
+            0,
+            "a terminal-but-unreaped run must keep its slot, or the cap counts \
+             statuses instead of sandboxes"
+        );
+
+        // The reap succeeded, so cleanup drops the intent — and only now is the
+        // slot free.
+        delete_finalization(pool, scope_a, admitted).await.unwrap();
+        let after = system_worker::dispatch_claim(pool, 1, 200, owner, 30)
+            .await
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(after.unreaped, 0);
+        assert_eq!(
+            after.claimed.len(),
+            1,
+            "a verifiably reaped sandbox releases its slot"
+        );
+
+        for (tenant, _) in seeded {
+            cleanup_sw_tenant(pool, tenant).await;
+        }
+        pool.close().await;
+    }
+
     /// The two observability reads (design §13). `queue_gauges` answers the
     /// deployment-wide operator question ("how deep, and how long has the head
     /// been waiting"); `queued_position` answers the per-run user question
@@ -16035,7 +16121,8 @@ mod tests {
 
     /// The queue-age sweep measures from `queued_at`, NOT `created_at` — a run
     /// that spent days parked for a human authorization must not be expired the
-    /// moment it becomes dispatchable. Adoption refuses a row a live driver
+    /// moment it becomes dispatchable. It CLAIMS what it returns, so exactly one
+    /// replica sheds each expired run. Adoption refuses a row a live driver
     /// owns.
     #[tokio::test]
     async fn queue_scans_use_queued_at_and_skip_live_leases() {
@@ -16050,7 +16137,37 @@ mod tests {
 
         let seeded = seed_queued(pool, 1).await;
         let (tenant, session) = seeded[0];
-        assert_eq!(system_worker::count_queued_sessions(pool).await.unwrap(), 1);
+        assert_eq!(
+            system_worker::count_admission_pending_sessions(pool)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // The depth bound RESERVES for the other pre-provisioning park: a run
+        // waiting on a human authorization is accepted work that will take a
+        // queue slot the moment it is approved, so it counts. Without this the
+        // bound is escapable — pile up `awaiting_authorization`, approve them
+        // all, and the queue exceeds its documented depth by however many were
+        // waiting.
+        let (t_auth, auth) = seed_tenant_session(pool).await;
+        transition_session(
+            pool,
+            TenantScope::assume(t_auth),
+            auth,
+            fluidbox_core::state::SessionStatus::AwaitingAuthorization,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            system_worker::count_admission_pending_sessions(pool)
+                .await
+                .unwrap(),
+            2,
+            "an authorization-paused run reserves a queue slot"
+        );
 
         // Ancient created_at, fresh queued_at: it has waited seconds, not days.
         sqlx::query("update sessions set created_at = now() - interval '2 hours' where id = $1")
@@ -16058,9 +16175,10 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        let expired = system_worker::expired_queued_sessions(pool, 60, 100)
-            .await
-            .unwrap();
+        let expired =
+            system_worker::claim_expired_queued_sessions(pool, 60, 100, Uuid::now_v7(), 30)
+                .await
+                .unwrap();
         assert!(
             !expired.iter().any(|s| s.id == session),
             "the age bound measures from queued_at, not created_at"
@@ -16071,10 +16189,44 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        let expired = system_worker::expired_queued_sessions(pool, 60, 100)
-            .await
-            .unwrap();
+        let expired =
+            system_worker::claim_expired_queued_sessions(pool, 60, 100, Uuid::now_v7(), 30)
+                .await
+                .unwrap();
         assert!(expired.iter().any(|s| s.id == session));
+
+        // …and it is CLAIMED, so a second replica sweeping the same instant
+        // gets nothing. Without this the shed counter and the `RunError` ledger
+        // append — both of which happen before the finalization intent picks a
+        // winner — would fire once per replica for one expiration.
+        let second =
+            system_worker::claim_expired_queued_sessions(pool, 60, 100, Uuid::now_v7(), 30)
+                .await
+                .unwrap();
+        assert!(
+            !second.iter().any(|s| s.id == session),
+            "an expired row is claimed, not handed to every replica"
+        );
+
+        // A claimant that dies leaves a lease that lapses; the row then returns
+        // to the predicate and the next sweep retries it.
+        sqlx::query(
+            "update sessions set orchestrator_lease_until = now() - interval '1 second'
+             where id = $1",
+        )
+        .bind(session)
+        .execute(pool)
+        .await
+        .unwrap();
+        let reclaimed =
+            system_worker::claim_expired_queued_sessions(pool, 60, 100, Uuid::now_v7(), 30)
+                .await
+                .unwrap();
+        assert!(
+            reclaimed.iter().any(|s| s.id == session),
+            "a lapsed claim returns the row for retry"
+        );
+        cleanup_sw_tenant(pool, t_auth).await;
 
         // Adoption: a `created` row orphaned before its park is adopted, but a
         // row a live driver is holding is left alone.
