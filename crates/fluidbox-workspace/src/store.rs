@@ -564,7 +564,7 @@ fn stale_local_files(dir: &Path, ttl: Duration) -> Vec<ArchiveKey> {
         // No archives ever stored (e.g. the Docker provider): quiet no-op.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
-            tracing::warn!("archive TTL sweep cannot read {}: {e}", dir.display());
+            tracing::warn!(dir = %dir.display(), error = %e, "archive TTL sweep cannot read a directory");
             return Vec::new();
         }
     };
@@ -575,7 +575,7 @@ fn stale_local_files(dir: &Path, ttl: Duration) -> Vec<ArchiveKey> {
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("archive TTL sweep cannot stat {}: {e}", path.display());
+                tracing::warn!(path = %path.display(), error = %e, "archive TTL sweep cannot stat a file");
                 continue;
             }
         };
@@ -585,7 +585,7 @@ fn stale_local_files(dir: &Path, ttl: Duration) -> Vec<ArchiveKey> {
         let mtime = match meta.modified() {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("archive TTL sweep: no mtime for {}: {e}", path.display());
+                tracing::warn!(path = %path.display(), error = %e, "archive TTL sweep found no mtime");
                 continue;
             }
         };
@@ -974,10 +974,12 @@ impl S3ArchiveStore {
                 // caller deletes these, so the bucket shrinks and the next sweep
                 // re-lists the remainder. Never a SILENT drop — name it.
                 tracing::warn!(
-                    "archive TTL sweep hit the {MAX_LISTED_KEYS}-key ceiling on prefix '{}'; \
-                     reclaiming {} stale archive(s) this pass and re-listing the rest next sweep",
-                    self.cfg.prefix,
-                    out.len()
+                    prefix = %self.cfg.prefix,
+                    ceiling = MAX_LISTED_KEYS,
+                    reclaimed = out.len(),
+                    retrying = true,
+                    "archive TTL sweep hit its listing ceiling; reclaiming what it saw and \
+                     re-listing the rest next sweep"
                 );
                 break;
             }
@@ -1043,7 +1045,7 @@ fn collect_stale_keys(
         let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&last_modified) else {
             // Unparseable timestamp reads as FRESH — the same conservative
             // direction the fs sweep takes on clock skew.
-            tracing::warn!("archive TTL sweep: unparseable LastModified on {key}");
+            tracing::warn!(archive = %key, "archive TTL sweep found an unparseable LastModified");
             continue;
         };
         if ts.with_timezone(&chrono::Utc) <= cutoff {

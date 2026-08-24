@@ -82,6 +82,19 @@ fn map_err(e: impl std::fmt::Display) -> ProviderError {
 #[async_trait]
 impl ExecutionProvider for DockerProvider {
     async fn provision(&self, spec: &SandboxSpec) -> Result<SandboxHandle, ProviderError> {
+        // Provisioning is the step a stuck run is usually stuck IN, and until now
+        // it was silent: a run sitting in `provisioning` gave an operator no way
+        // to tell "pulling a 1.4 GB image", "the daemon is unreachable" and "the
+        // network could not be created" apart without attaching to Docker by
+        // hand. One record at entry, one at each outcome.
+        let sw = fluidbox_obs::Stopwatch::start();
+        tracing::debug!(
+            session_id = %spec.session_id,
+            provider = "docker",
+            image = %spec.image,
+            network_mode = ?spec.network,
+            "provisioning a sandbox"
+        );
         // Docker enforces `offline` ONLY, and only under `Hardened` (a
         // per-session internal bridge with no route out). It has no L3/L4
         // target enforcement, so a grant above offline is REFUSED here rather
@@ -193,6 +206,13 @@ impl ExecutionProvider for DockerProvider {
         // Consequence, stated plainly: a Docker-provider run is UNBINDABLE. The
         // control plane counts it as such and admits it (`auth.rs::workload_verdict`),
         // which is exactly today's posture — no worse, and now visible.
+        tracing::info!(
+            session_id = %spec.session_id,
+            provider = "docker",
+            sandbox = %created.id,
+            duration_ms = sw.ms_f64(),
+            "sandbox provisioned"
+        );
         Ok(SandboxHandle {
             runtime: "docker".to_string(),
             external_id: created.id,
@@ -269,8 +289,23 @@ impl ExecutionProvider for DockerProvider {
             Err(e) => return Err(map_err(e)),
         }
         if let Some(net) = handle.attrs.get("network").and_then(|v| v.as_str()) {
-            let _ = self.docker.remove_network(net).await;
+            // Best-effort by design (a network with another attachment refuses
+            // removal), but silently best-effort meant a leaked per-session
+            // bridge left no trace at all.
+            if let Err(e) = self.docker.remove_network(net).await {
+                tracing::debug!(
+                    provider = "docker",
+                    network = %net,
+                    error = %e,
+                    "removing the sandbox network failed (best-effort)"
+                );
+            }
         }
+        tracing::info!(
+            provider = "docker",
+            sandbox = %handle.external_id,
+            "sandbox terminated"
+        );
         Ok(())
     }
 

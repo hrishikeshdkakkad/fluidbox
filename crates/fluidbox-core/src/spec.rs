@@ -251,6 +251,22 @@ pub enum WorkspaceSpec {
 }
 
 impl WorkspaceSpec {
+    /// A stable, low-cardinality name for this workspace's KIND.
+    ///
+    /// For logs and diagnostics, where the variant matters and its contents do
+    /// not: a clone URL can carry userinfo and a local path is a host filesystem
+    /// detail, but "was this run a scratch, a copy, or a fetch" is the first
+    /// question asked when materialization is slow or fails. Deliberately a
+    /// closed set, like every other classification the observability vocabulary
+    /// groups on.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            WorkspaceSpec::Scratch => "scratch",
+            WorkspaceSpec::LocalCopy { .. } => "local_copy",
+            WorkspaceSpec::GitRepository { .. } => "git",
+        }
+    }
+
     /// Resolution precedence (design §3.3): explicit invocation workspace,
     /// then agent revision default, then scratch. (Event-derived workspaces
     /// slot in above `explicit` when triggers arrive in a later phase.)
