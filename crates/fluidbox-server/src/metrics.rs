@@ -325,6 +325,10 @@ pub struct Metrics {
     pub queue_shed: Family,
     /// Time from first enqueue to admission, observed at the claim.
     pub queue_wait_seconds: Histogram,
+    /// Runs re-parked after a provider refused them. `reason` = capacity today;
+    /// the `_other` slot exists so a future classification cannot silently
+    /// widen the label set (the registry's fixed-cardinality doctrine).
+    pub queue_requeues: Family,
     // ── Durability (design: database event and ledger write rates).
     pub ledger_events: Counter,
     /// Metrics-scrape failures (a live read — pool count etc. — that errored).
@@ -436,6 +440,11 @@ impl Default for Metrics {
                 &["depth", "age", "requeue_exhausted"],
             ),
             queue_wait_seconds: Histogram::new("fluidbox_queue_wait_seconds", QUEUE_WAIT_SECS),
+            queue_requeues: Family::new(
+                "fluidbox_queue_requeues_total",
+                "reason",
+                &["capacity", "_other"],
+            ),
             ledger_events: Counter::default(),
             scrape_errors: Counter::default(),
         }
@@ -455,6 +464,13 @@ pub struct Live {
     pub mcp_sessions: u64,
     /// Governor durable-tier degrade count (a DB-outage fell back to local-only).
     pub governor_degraded: u64,
+    /// Run-queue depth and head-of-queue wait, read from the sessions table at
+    /// render time. Deployment-wide (unlike [`Metrics::active_runs`], which is
+    /// replica-local), because the queue is. Both render `0` when the feature
+    /// is off — there is nothing to count, and a missing series is harder to
+    /// alert on than a flat zero.
+    pub queue_depth: i64,
+    pub queue_oldest_wait_secs: i64,
 }
 
 /// Render the full Prometheus text exposition. Deterministic: families and
@@ -548,6 +564,25 @@ pub fn render(m: &Metrics, live: &Live) -> String {
         .render(&mut out, "Work refused rather than queued, by reason.");
     m.queue_wait_seconds
         .render(&mut out, "Time from first enqueue to admission, seconds.");
+    m.queue_requeues.render(
+        &mut out,
+        "Runs re-parked after a provider refused them, by reason.",
+    );
+
+    gauge_i64(
+        &mut out,
+        "fluidbox_runs_queued_depth",
+        "gauge",
+        "Runs waiting for a capacity slot, deployment-wide.",
+        live.queue_depth,
+    );
+    gauge_i64(
+        &mut out,
+        "fluidbox_queue_oldest_wait_seconds",
+        "gauge",
+        "How long the run at the head of the queue has been waiting, seconds.",
+        live.queue_oldest_wait_secs,
+    );
 
     counter(
         &mut out,
@@ -615,12 +650,31 @@ const EXPOSITION_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 /// scrape, including on the unauthenticated bind, cannot be turned into DB load.
 async fn snapshot(state: &AppState) -> Live {
     let mcp_sessions = state.mcp_sessions.lock().await.len() as u64;
+    // Only queried when the feature is on: an unconfigured deployment has no
+    // queued rows, so this would be a guaranteed-zero round trip on every
+    // scrape. A read error renders zeros and counts a scrape error — the
+    // existing Live convention — because a metrics endpoint that 500s takes the
+    // whole exposition down with it.
+    let (queue_depth, queue_oldest_wait_secs) = if state.cfg.queueing_enabled() {
+        match fluidbox_db::system_worker::queue_gauges(&state.pool).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("queue gauge read failed: {e}");
+                state.metrics.scrape_errors.inc();
+                (0, 0)
+            }
+        }
+    } else {
+        (0, 0)
+    };
     Live {
         pool_size: state.pool.size(),
         pool_idle: state.pool.num_idle() as u32,
         pool_max: state.cfg.db_pool.max_connections,
         mcp_sessions,
         governor_degraded: state.governor.degraded_count(),
+        queue_depth,
+        queue_oldest_wait_secs,
     }
 }
 
@@ -793,12 +847,18 @@ mod tests {
         m.brokered_outcomes.inc("ambiguous");
         m.broker_latency_ms.observe(42.0);
         m.active_runs.inc();
+        m.queue_dispatched.inc();
+        m.queue_shed.inc("depth");
+        m.queue_requeues.inc("capacity");
+        m.queue_wait_seconds.observe(12.5);
         let live = Live {
             pool_size: 8,
             pool_idle: 6,
             pool_max: 10,
             mcp_sessions: 3,
             governor_degraded: 0,
+            queue_depth: 7,
+            queue_oldest_wait_secs: 91,
         };
         let a = render(&m, &live);
         let b = render(&m, &live);
@@ -812,6 +872,14 @@ mod tests {
             "fluidbox_db_pool_idle 6",
             "fluidbox_db_pool_max 10",
             "fluidbox_mcp_sessions_active 3",
+            // Run admission (design 2026-08-23 §13): the four an operator
+            // alerts on, plus the histogram a dashboard plots.
+            "fluidbox_runs_dispatched_total 1",
+            "fluidbox_queue_shed_total{reason=\"depth\"} 1",
+            "fluidbox_queue_requeues_total{reason=\"capacity\"} 1",
+            "fluidbox_runs_queued_depth 7",
+            "fluidbox_queue_oldest_wait_seconds 91",
+            "fluidbox_queue_wait_seconds_count 1",
             "# TYPE fluidbox_gate_decisions_total counter",
             "# TYPE fluidbox_broker_call_latency_ms histogram",
         ] {
@@ -839,6 +907,8 @@ mod exposition_guard {
             pool_max: 1,
             mcp_sessions: 0,
             governor_degraded: 0,
+            queue_depth: 0,
+            queue_oldest_wait_secs: 0,
         };
         let text = render(&m, &live);
         let mut names = std::collections::HashSet::new();
