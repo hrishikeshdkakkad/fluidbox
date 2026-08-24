@@ -4682,6 +4682,38 @@ pub async fn session_lease(
     Ok(row)
 }
 
+/// How many queued runs are ahead of one — the per-run answer to "why is my run
+/// not running yet" (design 2026-08-23 §13). `0` = next up.
+///
+/// TENANT-SCOPED ON PURPOSE, and the choice is worth stating because the number
+/// is therefore NOT the run's position in the deployment-wide FIFO the
+/// dispatcher actually walks. A deployment-wide position would need a bypass
+/// and would leak another tenant's load through an ordinary run API — a caller
+/// could watch the number move and infer a competitor's traffic. Within one
+/// tenant it is exact; across tenants it is a lower bound, which is the honest
+/// thing to show a user who may not be able to see the rest of the deployment.
+///
+/// Anchored on `created_at` (the dispatcher's own ordering key), not
+/// `queued_at`, so the answer matches the order runs will actually be admitted
+/// in — a capacity-bounced run keeps its place rather than going to the back.
+pub async fn queued_position(
+    pool: &PgPool,
+    scope: TenantScope,
+    created_at: DateTime<Utc>,
+) -> sqlx::Result<i64> {
+    let mut tx = scoped_tx(pool, scope).await?;
+    let (n,): (i64,) = sqlx::query_as(
+        "select count(*) from sessions
+          where tenant_id = $1 and status = 'queued' and created_at < $2",
+    )
+    .bind(scope.tenant_id())
+    .bind(created_at)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(n)
+}
+
 /// Gate a capacity-bounced run behind a not-before instant and RELEASE its
 /// driver lease (run admission, design 2026-08-23 §7.4).
 ///
@@ -15787,6 +15819,118 @@ mod tests {
 
         for (tenant, _) in seeded {
             cleanup_sw_tenant(pool, tenant).await;
+        }
+        pool.close().await;
+    }
+
+    /// The two observability reads (design §13). `queue_gauges` answers the
+    /// deployment-wide operator question ("how deep, and how long has the head
+    /// been waiting"); `queued_position` answers the per-run user question
+    /// ("where am I") and is TENANT-SCOPED on purpose — a deployment-wide
+    /// number would leak cross-tenant load through a normal run API.
+    #[tokio::test]
+    async fn queue_gauges_and_position_answer_their_two_questions() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let _serial = DISPATCH_SERIAL.lock().await;
+        let pool = &test_connect(&dispatch_db_url(&url).await)
+            .await
+            .expect("connect to the dedicated dispatch database");
+
+        // Empty queue: zero depth, and zero — not an error, not a null —
+        // oldest wait, so the gauge renders a real number on a quiet
+        // deployment.
+        assert_eq!(system_worker::queue_gauges(pool).await.unwrap(), (0, 0));
+
+        let seeded = seed_queued(pool, 3).await;
+        let (depth, oldest) = system_worker::queue_gauges(pool).await.unwrap();
+        assert_eq!(depth, 3);
+        assert!(oldest >= 0);
+
+        // Age the head so the oldest-wait gauge has something to report.
+        sqlx::query("update sessions set queued_at = now() - interval '90 seconds' where id = $1")
+            .bind(seeded[0].1)
+            .execute(pool)
+            .await
+            .unwrap();
+        let (_, oldest) = system_worker::queue_gauges(pool).await.unwrap();
+        assert!(oldest >= 90, "oldest wait tracks the head, got {oldest}");
+
+        // Position counts only OLDER queued rows IN THE SAME TENANT.
+        for (i, (tenant, session)) in seeded.iter().enumerate() {
+            let scope = TenantScope::assume(*tenant);
+            let row = get_session(pool, scope, *session).await.unwrap().unwrap();
+            assert_eq!(
+                queued_position(pool, scope, row.created_at).await.unwrap(),
+                0,
+                "each seeded run is alone in its own tenant, so it is at the head"
+            );
+            assert_eq!(i, i); // keep the index meaningful to the reader
+        }
+
+        // Three runs in ONE tenant: 0, 1, 2 — and a fourth tenant's run is
+        // invisible to them.
+        let (tenant, first) = seed_tenant_session(pool).await;
+        let scope = TenantScope::assume(tenant);
+        let mut ids = vec![first];
+        for _ in 0..2 {
+            let row = create_session(
+                pool,
+                scope,
+                get_session(pool, scope, first)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .agent_id,
+                get_session(pool, scope, first)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .agent_revision_id,
+                "supervised",
+                "trusted",
+                "queued position",
+                &serde_json::json!({"kind":"none"}),
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+            ids.push(row.id);
+        }
+        for id in &ids {
+            transition_session(
+                pool,
+                scope,
+                *id,
+                fluidbox_core::state::SessionStatus::Queued,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        for (want, id) in ids.iter().enumerate() {
+            let row = get_session(pool, scope, *id).await.unwrap().unwrap();
+            assert_eq!(
+                queued_position(pool, scope, row.created_at).await.unwrap(),
+                want as i64,
+                "position is the count of older queued runs in this tenant"
+            );
+        }
+
+        cleanup_sw_tenant(pool, tenant).await;
+        for (t, _) in seeded {
+            cleanup_sw_tenant(pool, t).await;
         }
         pool.close().await;
     }
