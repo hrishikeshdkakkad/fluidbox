@@ -764,6 +764,20 @@ pub struct SessionRow {
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// First entry into `queued` (coalesce-stamped, like `started_at`). The
+    /// queue-age bound measures from here, never `created_at`, so a run that
+    /// spent days parked for a human authorization is not expired the moment
+    /// it becomes dispatchable (design 2026-08-23 §5).
+    pub queued_at: Option<DateTime<Utc>>,
+    /// First entry into `provisioning` — the stale-launch watchdog's age
+    /// anchor. `created_at` is refreshed by nothing, which is why the watchdog
+    /// used it; but a run may lawfully sit parked for days before launching,
+    /// so launch age needs its own timestamp (design §3.10).
+    pub launched_at: Option<DateTime<Utc>>,
+    /// Not-before gate for redispatch after a provider capacity bounce.
+    pub dispatch_after: Option<DateTime<Utc>>,
+    /// Dispatch attempts (the claim increments it); bounded by config.
+    pub dispatch_attempts: i32,
     /// Who invoked this run (design "tenant/user audit fields"): the invocation
     /// class, and the authenticated user id when one exists (None for
     /// operator-token / trigger / schedule / webhook). Drives run visibility.
@@ -4507,6 +4521,10 @@ pub async fn transition_session(
             updated_at = now(),
             started_at = case when $2 = 'running'
                               then coalesce(started_at, now()) else started_at end,
+            queued_at = case when $2 = 'queued'
+                             then coalesce(queued_at, now()) else queued_at end,
+            launched_at = case when $2 = 'provisioning'
+                               then coalesce(launched_at, now()) else launched_at end,
             finished_at = case when $2 in ('completed','failed','cancelled','budget_exceeded')
                                then now() else finished_at end
          where id = $1 and tenant_id = $4 returning *",
@@ -4570,6 +4588,10 @@ pub async fn transition_session_fenced(
             updated_at = now(),
             started_at = case when $2 = 'running'
                               then coalesce(started_at, now()) else started_at end,
+            queued_at = case when $2 = 'queued'
+                             then coalesce(queued_at, now()) else queued_at end,
+            launched_at = case when $2 = 'provisioning'
+                               then coalesce(launched_at, now()) else launched_at end,
             finished_at = case when $2 in ('completed','failed','cancelled','budget_exceeded')
                                then now() else finished_at end
          where id = $1 and tenant_id = $4 and orchestrator_epoch = $5 returning *",
@@ -15489,6 +15511,162 @@ mod tests {
             sqlx::query(stmt).bind(tenant).execute(&mut *tx).await.ok();
         }
         tx.commit().await.unwrap();
+    }
+
+    /// Migration 0034's queue timestamps ride the two transition functions the
+    /// way `started_at` always has. The `coalesce` is load-bearing: a
+    /// capacity-bounced run keeps its ORIGINAL `queued_at`, so the age bound
+    /// measures TOTAL time-in-queue across bounce cycles and the requeue loop
+    /// cannot be infinite even if the attempt cap were misconfigured.
+    #[tokio::test]
+    async fn queue_timestamps_stamp_once_and_survive_a_bounce() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        use fluidbox_core::state::SessionStatus::*;
+
+        // created → queued stamps queued_at, and nothing else.
+        let (_, row) = transition_session(&pool, scope, session, Queued, Some("park"))
+            .await
+            .unwrap()
+            .unwrap();
+        let first_queued_at = row.queued_at.expect("queued_at stamped on first park");
+        assert!(row.launched_at.is_none());
+        assert!(row.started_at.is_none());
+
+        // queued → provisioning stamps launched_at (the watchdog's anchor).
+        let (_, row) = transition_session(&pool, scope, session, Provisioning, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_launched_at = row
+            .launched_at
+            .expect("launched_at stamped on first launch");
+        assert_eq!(
+            row.queued_at,
+            Some(first_queued_at),
+            "queued_at is stamped once"
+        );
+
+        // provisioning → queued (a capacity bounce) keeps the ORIGINAL
+        // queued_at: the age bound is total time-in-queue.
+        let (_, row) = transition_session(&pool, scope, session, Queued, Some("bounce"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.queued_at, Some(first_queued_at));
+        assert_eq!(
+            row.dispatch_attempts, 0,
+            "the CLAIM increments attempts, not the transition"
+        );
+
+        // …and a redispatch keeps the original launched_at too.
+        let (_, row) = transition_session(&pool, scope, session, Provisioning, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.launched_at, Some(first_launched_at));
+
+        // The fenced sibling stamps identically — both transition functions
+        // carry the columns, or a fenced driver silently skips them.
+        let (tenant2, session2) = seed_tenant_session(&pool).await;
+        let scope2 = TenantScope::assume(tenant2);
+        let epoch = acquire_session_lease(&pool, scope2, session2, Uuid::now_v7(), 60)
+            .await
+            .unwrap()
+            .expect("fresh lease");
+        let (_, row) = transition_session_fenced(&pool, scope2, session2, Queued, None, epoch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.queued_at.is_some(), "the fenced transition stamps too");
+        let (_, row) =
+            transition_session_fenced(&pool, scope2, session2, Provisioning, None, epoch)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(row.launched_at.is_some());
+
+        cleanup_sw_tenant(&pool, tenant).await;
+        cleanup_sw_tenant(&pool, tenant2).await;
+    }
+
+    /// Design §3.10 — a LIVE bug in the shipped network-grants feature, not a
+    /// queue-only concern. `stale_nonstarted_sessions` aged every pre-launch
+    /// status from `created_at`, but `awaiting_authorization` can lawfully park
+    /// a run for up to the approval TTL (7 days). A run authorized more than
+    /// FLUIDBOX_STALE_LAUNCH_MINS after creation re-entered `provisioning`
+    /// carrying an ancient `created_at`, and the next watchdog tick failed it as
+    /// "stalled before launch" moments after release. Queued runs inherit the
+    /// identical trap, so both are fixed by anchoring launch age to
+    /// `launched_at`.
+    #[tokio::test]
+    async fn stale_launch_sweep_uses_the_launch_anchor_not_created_at() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        use fluidbox_core::state::SessionStatus::*;
+        transition_session(&pool, scope, session, Queued, None)
+            .await
+            .unwrap()
+            .unwrap();
+        transition_session(&pool, scope, session, Provisioning, None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A run that waited two hours before dispatch: created_at is ancient,
+        // launched_at is fresh. It is launching normally RIGHT NOW.
+        sqlx::query("update sessions set created_at = now() - interval '2 hours' where id = $1")
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale = system_worker::stale_nonstarted_sessions(&pool, 30)
+            .await
+            .unwrap();
+        assert!(
+            !stale.iter().any(|s| s.id == session),
+            "a freshly-launched run must not read as stalled just because it waited"
+        );
+
+        // …but an actually-stalled launch (old launched_at) IS swept.
+        sqlx::query("update sessions set launched_at = now() - interval '2 hours' where id = $1")
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale = system_worker::stale_nonstarted_sessions(&pool, 30)
+            .await
+            .unwrap();
+        assert!(stale.iter().any(|s| s.id == session));
+
+        // And `created` keeps its own anchor: a row that never launched has no
+        // launched_at to measure, so created_at remains the only age it has.
+        let (tenant2, session2) = seed_tenant_session(&pool).await;
+        sqlx::query("update sessions set created_at = now() - interval '2 hours' where id = $1")
+            .bind(session2)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale = system_worker::stale_nonstarted_sessions(&pool, 30)
+            .await
+            .unwrap();
+        assert!(
+            stale.iter().any(|s| s.id == session2),
+            "an orphaned `created` row is still aged from created_at"
+        );
+
+        cleanup_sw_tenant(&pool, tenant).await;
+        cleanup_sw_tenant(&pool, tenant2).await;
     }
 
     /// Phase D (#32, #75) — RLS wave B, system_worker bypass. Proves (b) the
