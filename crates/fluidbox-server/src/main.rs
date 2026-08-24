@@ -133,6 +133,27 @@ fn bounded(router: Router, max_request_body_bytes: usize) -> Router {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // A boot failure is one of the most important things this process ever has
+    // to say, and until this wrapper existed it was the ONE thing that never
+    // became a record: `main` returning `Err` makes the runtime print
+    // `Error: …` to stderr as bare text. In a JSON deployment that line is the
+    // only unparsable one in the file, it carries no `instance`, and it is
+    // invisible to every query an operator would run to find out why a replica
+    // never came up. So `run()` holds the real body and this logs its failure
+    // through the same path as everything else — then still returns `Err`, so
+    // the exit status and the human-readable line are unchanged.
+    let r = run().await;
+    if let Err(e) = &r {
+        tracing::error!(
+            error = %e,
+            error_kind = fluidbox_obs::field::error_kind::INTERNAL,
+            "BOOT FAILED — the control plane did not start"
+        );
+    }
+    r
+}
+
+async fn run() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     // kube-rs (rustls 0.23) needs a process-level CryptoProvider; the workspace
     // has multiple rustls backends in-tree, so pick ring explicitly or the
@@ -149,14 +170,15 @@ async fn main() -> anyhow::Result<()> {
     // The logging subsystem's own settings, in the log it governs. An operator
     // debugging "why can I not see X" should not have to reconstruct the
     // effective configuration from a deployment manifest.
+    // `instance` and `version` are deliberately absent: the ENVELOPE already
+    // carries both on this and every other record, and repeating them here only
+    // produced `instance_`/`version_` (the collision rename) plus noise.
     tracing::info!(
-        format = ?log_cfg.format,
+        format = log_cfg.format.as_str(),
         filter = %log_cfg.filter,
-        instance = %log_cfg.instance,
         throttle_per_sec = log_cfg.throttle_per_sec,
         max_field_bytes = log_cfg.limits.max_field_bytes,
         max_line_bytes = log_cfg.limits.max_line_bytes,
-        version = %log_cfg.version,
         "logging initialised (values are redacted by shape and by field name; \
          there is no switch to disable that)"
     );

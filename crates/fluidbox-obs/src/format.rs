@@ -101,6 +101,21 @@ pub struct Limits {
     pub max_line_bytes: usize,
 }
 
+impl Format {
+    /// The value an operator types into `FLUIDBOX_LOG_FORMAT`.
+    ///
+    /// Not `Debug`: that renders `Json`, and a boot banner reporting `Json` for
+    /// a setting spelled `json` is a small, real papercut — it is the difference
+    /// between an operator grepping their manifest for the value they see and
+    /// finding it, or not.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Format::Json => "json",
+            Format::Text => "text",
+        }
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -320,11 +335,31 @@ pub struct ObsLayer<W> {
 }
 
 impl<W> ObsLayer<W> {
-    pub fn new(format: Format, writer: W, statics: Statics) -> Self {
+    pub fn new(format: Format, writer: W, mut statics: Statics) -> Self {
+        let redactor = Redactor::new();
+        // The envelope statics are written directly by the formatter, bypassing
+        // the field visitor — so scrub them HERE, once at construction, rather
+        // than per record.
+        //
+        // They are operator-set (a service name, a pod name, a build version),
+        // not attacker input, so this is defence in depth rather than a live
+        // hole being plugged. It costs one scan per process and it closes the
+        // last path by which a byte reaches the sink without passing through
+        // redaction — which is the claim this module makes, and a claim with one
+        // exception is not the claim.
+        for f in [
+            &mut statics.service,
+            &mut statics.instance,
+            &mut statics.version,
+        ] {
+            if let std::borrow::Cow::Owned(clean) = redactor.scrub(f) {
+                *f = clean;
+            }
+        }
         Self {
             format,
             writer,
-            redactor: Redactor::new(),
+            redactor,
             limits: Limits::default(),
             statics,
             throttle: Arc::new(Throttle::new(0)),
