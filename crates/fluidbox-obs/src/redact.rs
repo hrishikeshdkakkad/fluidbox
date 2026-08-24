@@ -123,8 +123,27 @@ const PATTERNS: &[(&str, &str)] = &[
     // (b) Anywhere, for names that are unambiguous wherever they appear. Accepts
     // `=` or `:` with optional quoting so it catches both a form body and a
     // `Debug` rendering of a struct or a JSON blob.
+    //
+    // The `Debug` case is why the `[a-z0-9]+_token` / `_secret` / `_sealed`
+    // wildcards are here. [`sensitive_field`] blanks a value by the name it was
+    // RECORDED under, which covers `warn!(client_secret = …)` and covers nothing
+    // nested: a struct logged as `?resp` renders to one string, and a credential
+    // two levels down inside it — `Headers { authorization: "…" }` — is invisible
+    // to a field-name check and, if it has no recognisable shape (a stripped
+    // session token, a random password), invisible to every value pattern too.
+    // Matching the name INSIDE the rendering closes that.
+    //
+    // The optional `"` after the name is what makes this work on a JSON-ish
+    // rendering (`{"cookie": "sid=…"}`) as well as a Rust `Debug` one
+    // (`Headers { cookie: "sid=…" }`) — both shapes turn up in an error string,
+    // and a rule that only handles one is a rule with a hole in it.
+    //
+    // The wildcards deliberately stop short of `[a-z0-9]+_key`: that would eat
+    // `cache_key`, `idempotency_key` and `partition_key`, which are join keys an
+    // operator needs. The specific `_key` names worth catching are listed above
+    // by hand instead.
     (
-        r#"(?i)\b(access_token|id_token|refresh_token|client_secret|code_verifier|private_key|api_key|apikey|password|passwd|passphrase|webhook_secret|secret_key|master_key|client_assertion)\b\s*[:=]\s*"?([^\s,;}"'&]{4,})"#,
+        r#"(?i)\b(authorization|cookie|access_token|id_token|refresh_token|session_token|client_secret|code_verifier|private_key|api_key|apikey|password|passwd|passphrase|webhook_secret|secret_key|master_key|client_assertion|[a-z0-9]+_token|[a-z0-9]+_secret|[a-z0-9]+_sealed)\b"?\s*[:=]\s*"?([^\s,;}"'&]{4,})"#,
         "${1}=‹redacted›",
     ),
     // ── asymmetric key material ─────────────────────────────────────────────
@@ -506,6 +525,54 @@ mod tests {
         ] {
             assert_eq!(r.scrub(line), line, "false positive on: {line}");
         }
+    }
+
+    /// The nested case, which field-name blanking alone cannot reach: a struct
+    /// logged as `?resp` renders to ONE string, and a credential two levels down
+    /// inside it is invisible both to the field-name rule (the field is named
+    /// `resp`) and — when the value has no recognisable shape — to every value
+    /// pattern. This is the realistic leak: a failing HTTP client logged whole.
+    #[test]
+    fn a_credential_nested_inside_a_debug_rendering_is_still_caught() {
+        let r = Redactor::new();
+        for rendering in [
+            r#"Response { status: 401, headers: Headers { authorization: "abcdefghijklmnop" } }"#,
+            r#"Request { url: "https://x/y", headers: {"cookie": "sid=9f2c4a7e11b3d865"} }"#,
+            r#"Conn { id: 4, credential_sealed: "AAAAAAAAAAAAAAAAAAAA", status: "active" }"#,
+            r#"Flow { session_token: "9f2c4a7e11b3d8650fa2", stage: "callback" }"#,
+            r#"Bag { refresh_token: "0102030405060708090a", expires_in: 3600 }"#,
+        ] {
+            let out = r.scrub(rendering);
+            for leaked in [
+                "abcdefghijklmnop",
+                "9f2c4a7e11b3d865",
+                "AAAAAAAAAAAAAAAAAAAA",
+                "9f2c4a7e11b3d8650fa2",
+                "0102030405060708090a",
+            ] {
+                assert!(!out.contains(leaked), "a nested credential survived: {out}");
+            }
+            // …and the diagnostic around it survives, which is the whole point
+            // of logging the rendering in the first place.
+            assert!(
+                out.contains("status")
+                    || out.contains("url")
+                    || out.contains("stage")
+                    || out.contains("expires_in"),
+                "the rendering was over-redacted: {out}"
+            );
+        }
+    }
+
+    /// The wildcards must stop short of `_key`, or every join key an operator
+    /// needs disappears from `Debug` renderings.
+    #[test]
+    fn structural_keys_survive_a_debug_rendering() {
+        let r = Redactor::new();
+        let out = r.scrub(r#"Claim { idempotency_key: "sched:2026-08-24T09:00", cache_key: "abc123", key_version: 2 }"#);
+        assert!(out.contains("sched:2026-08-24T09:00"), "{out}");
+        assert!(out.contains("abc123"), "{out}");
+        assert!(out.contains("key_version: 2"), "{out}");
     }
 
     #[test]
