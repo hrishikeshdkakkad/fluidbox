@@ -158,8 +158,9 @@ retry loop is precisely the flood this exists to stop, and "this error fired
 
 Field and record ceilings exist for the same reason: one `Debug` of a large
 structure can produce megabytes, and a pipeline that must buffer it drops
-everything around it. An over-long record is cut **so the JSON still closes** — a
-truncated line no parser accepts loses the fields that did fit.
+everything around it. An over-long text record is cut at a UTF-8 boundary; an
+over-long JSON record becomes a compact, structurally valid fallback. An
+arbitrary serialized prefix cannot be repaired reliably.
 
 ## 3. Decisions worth defending
 
@@ -176,15 +177,14 @@ string-parsing problem. Keeping typed field vectors in the span extension makes
 
 It also costs **zero new dependencies** — no `tracing-serde`, no `json` feature.
 
-### 3.2 The ledger is the funnel
+### 3.2 The database commit is the funnel
 
-`ledger::record` is already documented as "the ONE funnel every ledger write
-passes through, so a decision/outcome cannot be counted twice or missed at a
-forgotten return path", and `observe_event` already derives metrics from it.
-Deriving log records there too covers the permission gate's dozen return paths,
-the orchestrator's transitions, approvals, brokered calls, budget stops, network
-denials and delivery outcomes **from one hook** — and a new event type is logged
-the day it is added.
+Canonical events have more than one append path: ordinary writes call
+`append_event`, while approval decisions, expiries, and terminal-deny claims
+append inside their owning transaction. `fluidbox-db::commit_and_mirror_events`
+is the common boundary: it commits first, then mirrors exactly the events and
+sequences made durable. A failed commit produces no phantom log record, and the
+transactional approval paths cannot disappear from the mirror.
 
 The alternative — sprinkling `info!` through those paths — would have been more
 code, worse coverage, and would silently stop working when someone moved a
@@ -200,8 +200,9 @@ undo a property this system calls a signature requirement.
 
 Logs record the SHAPE — `tool`, `verdict`, `source`, `digest`, `bytes`,
 `duration_ms` — and `session_id` + `tool_call_id` join back to the ledger. The
-test `event_content_never_reaches_the_log` is what stops someone helpfully adding
-`summary = %summary` to an arm later.
+test `event_log::tests::event_content_never_reaches_the_shared_log` is what stops
+someone helpfully adding `summary = %summary` or a free-form runner/upstream
+error to an arm later.
 
 ### 3.4 One wide event per request, not two
 
@@ -288,20 +289,20 @@ default rather than silencing the sandbox.
 
 ## 7. Verification
 
-- `fluidbox-obs`: 54 tests. The headline is
+- `fluidbox-obs`: 62 tests. The headline is
   `no_credential_family_reaches_the_sink_by_any_route` — every credential family
   driven through every callsite shape (interpolated message, structured field,
   `Debug` value, inherited span field, sensitively-named field) with nothing
   reaching the sink. Plus
   `correlation_survives_a_filter_that_only_admits_errors`, which is the
   regression this whole design turns on.
-- `request_log`: 13, including four that drive a real axum router and assert on
-  emitted bytes — whether `MatchedPath` is populated where the layer sits,
-  whether the span reaches the handler, whether the header is echoed. A unit test
-  cannot see any of those.
-- `ledger`: `event_content_never_reaches_the_log`, plus level-policy tests.
+- `request_log`: 18, including real axum-router coverage of matched paths,
+  late-bound identity, body completion/error/drop, byte counts, and 503
+  classification.
+- `fluidbox-db::event_log`: content-boundary, join-key, URL-host, and level-policy
+  tests for the post-commit canonical mirror.
 - `error`: every variant classifies into the closed vocabulary; internal detail
   reaches the log and never the caller.
-- `images/runner-lib/log.test.mjs`: 13, including the nested-shapeless-credential
-  case that found the hole in §2.3.
+- `images/runner-lib/log.test.mjs`: 14, including nested shapeless credentials and
+  text-mode control-character injection.
 - `fluidbox-core`: the cross-crate redaction parity tripwire.

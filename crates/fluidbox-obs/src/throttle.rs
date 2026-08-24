@@ -82,6 +82,10 @@ pub struct Throttle {
     /// Total suppressions, mirrored here so [`report`] can decide cheaply
     /// whether there is anything to say without locking every shard.
     total_dropped: AtomicU64,
+    /// Serialises drains. More importantly, the drain subtracts exactly what it
+    /// removed instead of storing zero, so a drop that arrives after its shard
+    /// was visited remains pending for the next report.
+    report_lock: Mutex<()>,
 }
 
 impl Throttle {
@@ -90,6 +94,7 @@ impl Throttle {
             limit: limit_per_sec,
             shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             total_dropped: AtomicU64::new(0),
+            report_lock: Mutex::new(()),
         }
     }
 
@@ -131,20 +136,26 @@ impl Throttle {
     /// first. Empty when nothing was dropped — the caller then says nothing,
     /// which is the point: a healthy deployment never sees this line.
     pub fn report(&self) -> Vec<(CallsiteKey, u64)> {
+        let _report = self.report_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.total_dropped.load(Ordering::Relaxed) == 0 {
             return Vec::new();
         }
         let mut out = Vec::new();
+        let mut drained = 0_u64;
         for shard in &self.shards {
             let mut map = shard.lock().unwrap_or_else(|e| e.into_inner());
             for (k, b) in map.iter_mut() {
                 if b.dropped_since_report > 0 {
                     out.push((*k, b.dropped_since_report));
+                    drained = drained.saturating_add(b.dropped_since_report);
                     b.dropped_since_report = 0;
                 }
             }
         }
-        self.total_dropped.store(0, Ordering::Relaxed);
+        // Do NOT store zero here. A concurrent `admit` may have added a drop to
+        // an already-visited shard; subtracting only what this drain observed
+        // leaves that newer suppression pending and visible to the next report.
+        self.total_dropped.fetch_sub(drained, Ordering::AcqRel);
         out.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         out
     }
@@ -244,5 +255,54 @@ mod tests {
             assert!(t.admit(k));
         }
         assert!(t.report().is_empty());
+    }
+
+    #[test]
+    fn concurrent_reports_never_erase_suppressions() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Arc;
+
+        let throttle = Arc::new(Throttle::new(1));
+        let produced = Arc::new(AtomicU64::new(0));
+        let reported = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let reporter = {
+            let throttle = Arc::clone(&throttle);
+            let reported = Arc::clone(&reported);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    for (_, n) in throttle.report() {
+                        reported.fetch_add(n, Ordering::Relaxed);
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let mut producers = Vec::new();
+        for _ in 0..4 {
+            let throttle = Arc::clone(&throttle);
+            let produced = Arc::clone(&produced);
+            producers.push(std::thread::spawn(move || {
+                for _ in 0..10_000 {
+                    if !throttle.admit(key(99)) {
+                        produced.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        reporter.join().unwrap();
+        for (_, n) in throttle.report() {
+            reported.fetch_add(n, Ordering::Relaxed);
+        }
+        assert_eq!(
+            reported.load(Ordering::Relaxed),
+            produced.load(Ordering::Relaxed),
+            "every suppression is reported exactly once"
+        );
     }
 }

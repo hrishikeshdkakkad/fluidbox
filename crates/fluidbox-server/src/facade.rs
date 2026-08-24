@@ -556,6 +556,15 @@ pub async fn messages(
     let sess_auth = fluidbox_db::session_for_token(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    // Token resolution has established the runner identity. Stamp it before
+    // workload/audience refusals so those attack/version-skew records and the
+    // eventual request completion remain attributable.
+    fluidbox_obs::span::record_caller(
+        fluidbox_obs::field::principal::RUNNER,
+        &sess_auth.tenant_id.to_string(),
+        None,
+    );
+    fluidbox_obs::span::record_subject_run(&sess_auth.session_id.to_string());
     // Gap 6 (Phase F): the facade resolves the session token by hand rather than
     // through the `SessionAuth` extractor, so the workload binding has to be
     // asserted here too — and this is the route where it matters most, because the
@@ -584,17 +593,6 @@ pub async fn messages(
         );
         return Err(ApiError::Forbidden("wrong_audience".into()));
     }
-    // Stamp the run onto the request span. The facade resolves its token by
-    // hand rather than through the `SessionAuth` extractor, so without this the
-    // one record covering the most expensive route in the system — the request
-    // completion record, carrying its latency and status — would not say which
-    // run spent the money.
-    fluidbox_obs::span::record_caller(
-        fluidbox_obs::field::principal::RUNNER,
-        &sess_auth.tenant_id.to_string(),
-        None,
-    );
-    fluidbox_obs::span::record_subject_run(&sess_auth.session_id.to_string());
     let session_id = sess_auth.session_id;
     let scope = TenantScope::assume(sess_auth.tenant_id);
 

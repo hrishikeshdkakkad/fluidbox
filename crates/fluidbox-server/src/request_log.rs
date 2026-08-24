@@ -2,10 +2,10 @@
 //!
 //! # One wide event, not two narrow ones
 //!
-//! Every HTTP request produces exactly one log record, emitted when the response
-//! is ready and carrying everything known about the exchange: who asked, what
-//! they asked for, what they got, how long it took, and — when it went wrong —
-//! a stable classification of why.
+//! Every HTTP request produces exactly one log record, emitted when its response
+//! body ends, errors, or is dropped and carrying everything known about the
+//! exchange: who asked, what they asked for, what they got, how long it took,
+//! and — when it went wrong — a stable classification of why.
 //!
 //! The instinct is two records ("handling GET /x" then "GET /x → 200"). That is
 //! twice the volume for strictly less information: the pair has to be correlated
@@ -40,11 +40,15 @@
 //! too, as `session_id`, recorded by the handler once it knows — so both
 //! questions are answerable and neither costs a high-cardinality route label.
 
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::MatchedPath;
 use axum::http::{header, HeaderName, HeaderValue, Request, Response, StatusCode};
 use axum::middleware::Next;
 use fluidbox_obs::field;
 use fluidbox_obs::timing::Stopwatch;
+use sha2::{Digest, Sha256};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tracing::Instrument;
 
 /// The header this service reads an inbound id from and echoes an id back in.
@@ -92,6 +96,28 @@ fn resolve_request_id<B>(req: &Request<B>) -> String {
     }
 }
 
+/// Derive a valid W3C trace id from an adopted request id. UUID request ids keep
+/// the existing one-id/two-encodings relationship; arbitrary printable ids are
+/// deterministically hashed to 16 bytes. Filtering "hex-looking" characters is
+/// not enough: it produces short or empty ids and permits the forbidden all-zero
+/// value.
+fn trace_id_from_request_id(request_id: &str) -> String {
+    if let Ok(id) = uuid::Uuid::parse_str(request_id) {
+        if id.as_bytes().iter().any(|b| *b != 0) {
+            return id.simple().to_string();
+        }
+    }
+    let digest = Sha256::digest(request_id.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // Cryptographically negligible but protocol-significant: W3C forbids an
+    // all-zero trace id, so enforce the invariant rather than relying on odds.
+    if bytes.iter().all(|b| *b == 0) {
+        bytes[15] = 1;
+    }
+    hex::encode(bytes)
+}
+
 /// Map an HTTP status onto the closed `error_kind` vocabulary.
 ///
 /// `None` for a success: `error_kind` is what alerts group on, and stamping a
@@ -124,8 +150,8 @@ fn error_kind_for(status: StatusCode) -> Option<&'static str> {
 macro_rules! emit_at_level {
     ($status:expr, $($arg:tt)*) => {
         match $status {
-            s if s >= 500 => tracing::error!($($arg)*),
             429 | 503 => tracing::warn!($($arg)*),
+            s if s >= 500 => tracing::error!($($arg)*),
             _ => tracing::info!($($arg)*),
         }
     };
@@ -141,6 +167,186 @@ macro_rules! emit_at_level {
 /// by the level policy below), just not at the level a human reads.
 fn is_routine_probe(route: &str) -> bool {
     matches!(route, "/v1/health" | "/v1/health/ready" | "/metrics")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponseState {
+    Complete,
+    BodyError,
+    BodyDropped,
+}
+
+impl ResponseState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::BodyError => "body_error",
+            Self::BodyDropped => "body_dropped",
+        }
+    }
+}
+
+/// Everything needed to emit the single wide request record once the response
+/// body establishes the real terminal state. Owning the span here keeps its
+/// late-bound caller/run fields available for the whole stream.
+struct RequestCompletion {
+    span: tracing::Span,
+    stopwatch: Stopwatch,
+    status: StatusCode,
+    routine: bool,
+    path: String,
+    req_bytes: Option<u64>,
+    user_agent: Option<String>,
+}
+
+impl RequestCompletion {
+    fn finish(self, state: ResponseState, resp_bytes: u64) {
+        self.span.in_scope(|| {
+            let status_kind = error_kind_for(self.status);
+            let kind = match state {
+                ResponseState::BodyError => status_kind.or(Some(field::error_kind::INTERNAL)),
+                ResponseState::Complete | ResponseState::BodyDropped => status_kind,
+            };
+            let duration_ms = self.stopwatch.ms_f64();
+            let success = state == ResponseState::Complete
+                && (self.status.is_success() || self.status.is_redirection());
+            if self.routine && success {
+                tracing::debug!(
+                    status = self.status.as_u16(),
+                    duration_ms,
+                    path = %self.path,
+                    resp_bytes,
+                    response_state = state.as_str(),
+                    "request"
+                );
+            } else {
+                let status = self.status.as_u16();
+                match state {
+                    ResponseState::BodyError => tracing::error!(
+                        status,
+                        duration_ms,
+                        path = %self.path,
+                        req_bytes = self.req_bytes,
+                        resp_bytes,
+                        user_agent = self.user_agent.as_deref(),
+                        error_kind = kind,
+                        response_state = state.as_str(),
+                        outcome = field::outcome::ERROR,
+                        "request"
+                    ),
+                    ResponseState::BodyDropped => tracing::warn!(
+                        status,
+                        duration_ms,
+                        path = %self.path,
+                        req_bytes = self.req_bytes,
+                        resp_bytes,
+                        user_agent = self.user_agent.as_deref(),
+                        error_kind = kind,
+                        response_state = state.as_str(),
+                        outcome = field::outcome::ERROR,
+                        "request"
+                    ),
+                    ResponseState::Complete => emit_at_level!(
+                        status,
+                        status,
+                        duration_ms,
+                        path = %self.path,
+                        req_bytes = self.req_bytes,
+                        resp_bytes,
+                        user_agent = self.user_agent.as_deref(),
+                        error_kind = kind,
+                        response_state = state.as_str(),
+                        outcome = if success {
+                            field::outcome::OK
+                        } else {
+                            field::outcome::ERROR
+                        },
+                        "request"
+                    ),
+                }
+            }
+        });
+    }
+}
+
+/// Response-body adapter that keeps the request span alive and owns completion.
+/// `poll_frame` runs the inner stream inside the span so diagnostics emitted by
+/// an SSE/archive body retain request correlation too.
+struct ObservedBody {
+    inner: Body,
+    completion: Option<RequestCompletion>,
+    bytes: u64,
+}
+
+impl ObservedBody {
+    fn new(inner: Body, completion: RequestCompletion) -> Self {
+        let mut observed = Self {
+            inner,
+            completion: Some(completion),
+            bytes: 0,
+        };
+        // Empty/HEAD-style bodies are already terminal. A server is allowed to
+        // trust `is_end_stream` and never call `poll_frame`, so waiting for a
+        // poll would misclassify an ordinary empty response as dropped.
+        if observed.inner.is_end_stream() {
+            observed.finish(ResponseState::Complete);
+        }
+        observed
+    }
+
+    fn finish(&mut self, state: ResponseState) {
+        if let Some(completion) = self.completion.take() {
+            completion.finish(state, self.bytes);
+        }
+    }
+}
+
+impl HttpBody for ObservedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        let span = this.completion.as_ref().map(|c| c.span.clone());
+        let polled = match span {
+            Some(span) => span.in_scope(|| Pin::new(&mut this.inner).poll_frame(cx)),
+            None => Pin::new(&mut this.inner).poll_frame(cx),
+        };
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes = this.bytes.saturating_add(data.len() as u64);
+                }
+                // Consumers need not poll once the body reports end-of-stream.
+                // Finalise on the last yielded frame as well as on a subsequent
+                // `None`, covering both legal consumption styles.
+                if this.inner.is_end_stream() {
+                    this.finish(ResponseState::Complete);
+                }
+            }
+            Poll::Ready(Some(Err(_))) => this.finish(ResponseState::BodyError),
+            Poll::Ready(None) => this.finish(ResponseState::Complete),
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for ObservedBody {
+    fn drop(&mut self) {
+        self.finish(ResponseState::BodyDropped);
+    }
 }
 
 /// The middleware.
@@ -160,15 +366,7 @@ pub async fn layer(
         .get(&TRACEPARENT)
         .and_then(|v| v.to_str().ok())
         .and_then(fluidbox_obs::span::trace_id_from_traceparent)
-        .unwrap_or_else(|| {
-            // No inbound trace: this request starts one, and its id is the
-            // request id in W3C shape so the two are never out of step.
-            request_id
-                .chars()
-                .filter(|c| c.is_ascii_hexdigit())
-                .take(32)
-                .collect::<String>()
-        });
+        .unwrap_or_else(|| trace_id_from_request_id(&request_id));
 
     let method = req.method().clone();
     // The route PATTERN when axum matched one. When it did not — a 404, a
@@ -205,11 +403,6 @@ pub async fn layer(
     let mut resp = next.run(req).instrument(span.clone()).await;
 
     let status = resp.status();
-    let resp_bytes = resp
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
 
     // Echo the id so a caller can quote it in a bug report and an operator can
     // find the request without a timestamp and a guess. Infallible in practice
@@ -219,39 +412,17 @@ pub async fn layer(
         resp.headers_mut().insert(&REQUEST_ID_HEADER, v);
     }
 
-    // Emitted INSIDE the request span so it inherits `request_id`, `route`, and
-    // anything the handler recorded on the way through (`tenant_id`,
-    // `session_id`, `principal`).
-    let _g = span.enter();
-    let kind = error_kind_for(status);
-    let duration_ms = sw.ms_f64();
-    if routine && status.is_success() {
-        tracing::debug!(
-            status = status.as_u16(),
-            duration_ms,
-            path = %path,
-            "request"
-        );
-    } else {
-        emit_at_level!(
-            status.as_u16(),
-            status = status.as_u16(),
-            duration_ms,
-            path = %path,
-            req_bytes,
-            resp_bytes,
-            user_agent = user_agent.as_deref(),
-            error_kind = kind,
-            outcome = if status.is_success() || status.is_redirection() {
-                field::outcome::OK
-            } else {
-                field::outcome::ERROR
-            },
-            "request"
-        );
-    }
-    drop(_g);
-    resp
+    let completion = RequestCompletion {
+        span,
+        stopwatch: sw,
+        status,
+        routine,
+        path,
+        req_bytes,
+        user_agent,
+    };
+    let (parts, body) = resp.into_parts();
+    Response::from_parts(parts, Body::new(ObservedBody::new(body, completion)))
 }
 
 #[cfg(test)]
@@ -343,6 +514,36 @@ mod tests {
         assert!(ua <= ub, "ids from later requests sort later");
     }
 
+    #[test]
+    fn every_request_id_shape_derives_a_valid_trace_id() {
+        for request_id in [
+            "request-123",
+            "no-hex-characters-here",
+            "00000000000000000000000000000000",
+            "018f2c3d-0000-7000-8000-000000000001",
+        ] {
+            let trace_id = trace_id_from_request_id(request_id);
+            assert_eq!(trace_id.len(), 32, "{request_id} -> {trace_id}");
+            assert!(
+                trace_id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "not lowercase hex: {trace_id}"
+            );
+            assert_ne!(trace_id, "00000000000000000000000000000000");
+        }
+        assert_eq!(
+            trace_id_from_request_id("018f2c3d-0000-7000-8000-000000000001"),
+            "018f2c3d000070008000000000000001",
+            "UUID request ids retain the one-id/two-encodings relationship"
+        );
+        assert_eq!(
+            trace_id_from_request_id("request-123"),
+            trace_id_from_request_id("request-123"),
+            "adopted non-UUID ids map deterministically"
+        );
+    }
+
     /// Backpressure must not be classified as a fault: a 429 and a 500 need
     /// different operator responses, and merging them makes both panels useless.
     #[test]
@@ -428,6 +629,38 @@ mod tests {
                 "/v1/boom",
                 get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "no") }),
             )
+            .route(
+                "/v1/unavailable",
+                get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "later") }),
+            )
+            .route(
+                "/v1/stream",
+                get(|| async {
+                    let chunks = futures::stream::iter([
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
+                        Ok(Bytes::from_static(b"de")),
+                    ]);
+                    Response::new(Body::from_stream(chunks))
+                }),
+            )
+            .route(
+                "/v1/body-error",
+                get(|| async {
+                    let chunks = futures::stream::iter([
+                        Ok(Bytes::from_static(b"abc")),
+                        Err(std::io::Error::other("stream failed")),
+                    ]);
+                    Response::new(Body::from_stream(chunks))
+                }),
+            )
+            .route(
+                "/v1/never",
+                get(|| async {
+                    let chunks = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+                    Response::new(Body::from_stream(chunks))
+                }),
+            )
+            .route("/v1/empty", get(|| async { StatusCode::NO_CONTENT }))
             .route("/v1/health", get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(move |req, next| {
                 layer(field::plane::PUBLIC, req, next)
@@ -449,6 +682,11 @@ mod tests {
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
+        // A request is not complete when only its headers exist. Drain the body
+        // so the observer sees end-of-stream and emits the one completion record.
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let resp = Response::from_parts(parts, Body::from(bytes));
         drop(guard);
         let recs = w.json();
         (resp, recs)
@@ -516,6 +754,115 @@ mod tests {
         assert_eq!(done["level"], "error");
         assert_eq!(done["error_kind"], "internal");
         assert_eq!(done["outcome"], "error");
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_is_warning_level_backpressure() {
+        let (resp, recs) = drive("/v1/unavailable").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let done = recs.iter().find(|r| r["msg"] == "request").unwrap();
+        assert_eq!(done["level"], "warn");
+        assert_eq!(done["error_kind"], "capacity");
+    }
+
+    #[tokio::test]
+    async fn completion_waits_for_the_stream_and_counts_actual_bytes() {
+        use tower::ServiceExt;
+        let w = fluidbox_obs::capture::CaptureWriter::new();
+        let cfg = fluidbox_obs::LogConfig {
+            format: fluidbox_obs::Format::Json,
+            filter: "debug".into(),
+            throttle_per_sec: 0,
+            ..Default::default()
+        };
+        let (sub, _h) = fluidbox_obs::subscriber_with_writer(&cfg, w.clone()).unwrap();
+        let guard = tracing::subscriber::set_default(sub);
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !w.json().iter().any(|r| r["msg"] == "request"),
+            "headers alone must not complete a streaming request"
+        );
+        let (_parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"abcde");
+        let recs = w.json();
+        let done = recs.iter().find(|r| r["msg"] == "request").unwrap();
+        assert_eq!(done["resp_bytes"], 5);
+        assert_eq!(done["response_state"], "complete");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn already_terminal_empty_body_completes_without_a_poll() {
+        let (response, records) = drive("/v1/empty").await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let completions: Vec<_> = records
+            .iter()
+            .filter(|record| record["msg"] == "request")
+            .collect();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0]["response_state"], "complete");
+        assert_eq!(completions[0]["resp_bytes"], 0);
+    }
+
+    #[tokio::test]
+    async fn body_error_and_drop_each_finalize_once() {
+        use tower::ServiceExt;
+        let w = fluidbox_obs::capture::CaptureWriter::new();
+        let cfg = fluidbox_obs::LogConfig {
+            format: fluidbox_obs::Format::Json,
+            filter: "debug".into(),
+            throttle_per_sec: 0,
+            ..Default::default()
+        };
+        let (sub, _h) = fluidbox_obs::subscriber_with_writer(&cfg, w.clone()).unwrap();
+        let guard = tracing::subscriber::set_default(sub);
+
+        let errored = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/body-error")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let err = axum::body::to_bytes(errored.into_body(), usize::MAX).await;
+        assert!(err.is_err());
+
+        let dropped = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/never")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        drop(dropped);
+
+        let recs = w.json();
+        let request_records: Vec<_> = recs.iter().filter(|r| r["msg"] == "request").collect();
+        assert_eq!(request_records.len(), 2, "one terminal record per request");
+        let by_state = |state: &str| {
+            request_records
+                .iter()
+                .find(|r| r["response_state"] == state)
+                .unwrap_or_else(|| panic!("missing {state}: {request_records:?}"))
+        };
+        assert_eq!(by_state("body_error")["resp_bytes"], 3);
+        assert_eq!(by_state("body_error")["level"], "error");
+        assert_eq!(by_state("body_dropped")["resp_bytes"], 0);
+        assert_eq!(by_state("body_dropped")["level"], "warn");
+        drop(guard);
     }
 
     /// The id is echoed so a caller can quote it and an operator can find the

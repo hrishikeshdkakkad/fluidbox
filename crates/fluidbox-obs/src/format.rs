@@ -72,8 +72,21 @@ use tracing_subscriber::registry::LookupSpan;
 /// Envelope keys this module writes itself. A field with one of these names is
 /// emitted with a trailing underscore instead of shadowing the envelope.
 pub const RESERVED: &[&str] = &[
-    "ts", "level", "target", "msg", "service", "version", "instance", "pid", "thread", "file",
-    "line", "span", "spans", "span_id",
+    "ts",
+    "level",
+    "target",
+    "msg",
+    "service",
+    "version",
+    "instance",
+    "pid",
+    "thread",
+    "file",
+    "line",
+    "span",
+    "spans",
+    "span_id",
+    "truncated",
 ];
 
 /// Output shape.
@@ -95,9 +108,9 @@ pub struct Limits {
     /// Longest rendered value for one field, in bytes. Overlong values are cut
     /// at a UTF-8 boundary and marked.
     pub max_field_bytes: usize,
-    /// Longest complete record, in bytes. A record over the ceiling is cut and
-    /// marked; for JSON the cut is made so the object still closes, because a
-    /// truncated line that no longer parses loses the fields that DID fit.
+    /// Longest complete record, in bytes. Oversized text is cut and marked;
+    /// oversized JSON becomes a compact valid fallback record because an
+    /// arbitrary serialized prefix cannot be repaired reliably.
     pub max_line_bytes: usize,
 }
 
@@ -489,26 +502,38 @@ where
                 &span_names,
                 innermost_id,
             ),
-            Format::Text => {
-                self.write_text(&mut line, meta, &message, &inherited, &own, &span_names)
-            }
+            Format::Text => self.write_text(
+                &mut line,
+                meta,
+                &message,
+                &inherited,
+                &own,
+                &span_names,
+                innermost_id,
+            ),
         }
 
         if line.len() > self.limits.max_line_bytes {
             STATS.inc_truncations();
-            let mut end = self.limits.max_line_bytes.saturating_sub(
-                LINE_TRUNCATION_MARK.len() + if self.format == Format::Json { 2 } else { 0 },
-            );
-            while end > 0 && !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            line.truncate(end);
-            line.push_str(LINE_TRUNCATION_MARK);
-            // Close the object so the fields that DID fit are still parsable —
-            // a truncated JSON line that no parser accepts loses everything,
-            // not just the tail.
-            if self.format == Format::Json {
-                line.push_str("\"}");
+            match self.format {
+                // An arbitrary byte prefix of JSON cannot be repaired by
+                // appending a quote and a brace: the cut may be inside an
+                // escape, number, key, or delimiter. Replace the whole record
+                // with a compact, independently valid record instead.
+                Format::Json => {
+                    line = json_truncation_fallback(meta.level(), self.limits.max_line_bytes);
+                }
+                Format::Text => {
+                    let mut end = self
+                        .limits
+                        .max_line_bytes
+                        .saturating_sub(LINE_TRUNCATION_MARK.len());
+                    while end > 0 && !line.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    line.truncate(end);
+                    line.push_str(LINE_TRUNCATION_MARK);
+                }
             }
         }
         line.push('\n');
@@ -594,6 +619,7 @@ impl<W> ObsLayer<W> {
         out.push('}');
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_text(
         &self,
         out: &mut String,
@@ -602,6 +628,7 @@ impl<W> ObsLayer<W> {
         inherited: &[(&'static str, Val)],
         own: &Fields,
         span_names: &[&'static str],
+        span_id: Option<u64>,
     ) {
         let (lvl, colour) = (level_str(meta.level()), level_colour(meta.level()));
         let _ = write!(out, "{} ", now_rfc3339());
@@ -610,24 +637,45 @@ impl<W> ObsLayer<W> {
         } else {
             let _ = write!(out, "{lvl:>5} ");
         }
+        text_kv_str(out, "service", &self.statics.service);
+        out.push(' ');
+        text_kv_str(out, "version", &self.statics.version);
+        out.push(' ');
+        text_kv_str(out, "instance", &self.statics.instance);
+        let _ = write!(out, " pid={}", self.statics.pid);
         if !span_names.is_empty() {
-            let _ = write!(out, "[{}] ", span_names.join(">"));
+            out.push_str(" [");
+            for (i, name) in span_names.iter().enumerate() {
+                if i > 0 {
+                    out.push('>');
+                }
+                text_fragment(out, name);
+            }
+            out.push_str("] span=");
+            text_token(out, span_names.last().expect("non-empty"));
+            out.push_str(" spans=");
+            text_token(out, &span_names.join(">"));
         }
-        let _ = write!(out, "{}: {message}", meta.target());
+        if let Some(id) = span_id {
+            let _ = write!(out, " span_id={id:016x}");
+        }
+        if self.thread_names {
+            if let Some(t) = std::thread::current().name() {
+                out.push_str(" thread=");
+                text_token(out, t);
+            }
+        }
+        out.push(' ');
+        text_fragment(out, meta.target());
+        out.push_str(": ");
+        text_fragment(out, message);
         for (k, v) in inherited.iter().chain(own.0.iter()) {
             out.push(' ');
             out.push_str(&safe_key(k));
             out.push('=');
             match v {
                 Val::Str(s) => {
-                    // Quote only when the value would otherwise be ambiguous —
-                    // unquoted is far more readable and most values are single
-                    // tokens (ids, statuses, verdicts).
-                    if s.is_empty() || s.contains(' ') || s.contains('"') {
-                        json_str(out, s);
-                    } else {
-                        out.push_str(s);
-                    }
+                    text_token(out, s);
                 }
                 Val::Num(n) => out.push_str(n),
                 Val::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -635,10 +683,76 @@ impl<W> ObsLayer<W> {
         }
         if self.location {
             if let (Some(f), Some(l)) = (meta.file(), meta.line()) {
-                let _ = write!(out, " at {f}:{l}");
+                out.push_str(" at ");
+                text_fragment(out, f);
+                let _ = write!(out, ":{l}");
             }
         }
     }
+}
+
+/// A bounded replacement for an over-limit JSON record. The configured public
+/// floor is 64 bytes; the first form fits under that floor and keeps the level,
+/// while the second is a defensive fallback for direct `ObsLayer` construction
+/// with an incoherently tiny test limit.
+fn json_truncation_fallback(level: &Level, max: usize) -> String {
+    let full = format!(
+        "{{\"level\":\"{}\",\"msg\":\"record truncated\",\"truncated\":true}}",
+        level_str(level)
+    );
+    if full.len() <= max {
+        return full;
+    }
+    let minimal = "{\"truncated\":true}";
+    if minimal.len() <= max {
+        minimal.to_string()
+    } else {
+        // `LogConfig` refuses limits below 64, so production cannot reach this.
+        // `{}` remains structurally valid even for a caller that constructs an
+        // `ObsLayer` directly with a nonsensical limit.
+        "{}".to_string()
+    }
+}
+
+/// Escape a string for a single-line human-readable record. JSON escaping is a
+/// useful base (quotes, backslashes, LF/CR/TAB, ESC), then the remaining Unicode
+/// control characters are escaped explicitly because JSON permits some of them
+/// literally while terminals do not.
+fn text_fragment(out: &mut String, s: &str) {
+    let quoted = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+    let inner = quoted
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or_default();
+    for ch in inner.chars() {
+        if ch.is_control() {
+            let _ = write!(out, "\\u{{{:x}}}", ch as u32);
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+/// Render one text-mode field value as an unambiguous token. Most ids and
+/// classifications stay unquoted; whitespace/control-bearing values use JSON-
+/// style quotes and escapes so one event can never forge a second line.
+fn text_token(out: &mut String, s: &str) {
+    let quote = s.is_empty()
+        || s.chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\\'));
+    if quote {
+        out.push('"');
+    }
+    text_fragment(out, s);
+    if quote {
+        out.push('"');
+    }
+}
+
+fn text_kv_str(out: &mut String, key: &str, value: &str) {
+    out.push_str(key);
+    out.push('=');
+    text_token(out, value);
 }
 
 /// Rename a field that would shadow an envelope key. Returning `Cow` keeps the
@@ -753,6 +867,36 @@ mod tests {
         let mut s = String::new();
         json_str(&mut s, "018f2c3d-running");
         assert_eq!(s, "\"018f2c3d-running\"");
+    }
+
+    #[test]
+    fn text_escaping_keeps_controls_on_one_physical_line() {
+        let mut out = String::new();
+        text_fragment(&mut out, "first\nsecond\ttab\u{1b}[31m\u{7f}");
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\t'));
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.contains('\u{7f}'));
+        assert!(out.contains("\\n"));
+        assert!(out.contains("\\t"));
+        assert!(out.contains("\\u001b"));
+        assert!(out.contains("\\u{7f}"));
+    }
+
+    #[test]
+    fn json_record_fallback_is_valid_at_the_configured_floor() {
+        for level in [
+            &Level::TRACE,
+            &Level::DEBUG,
+            &Level::INFO,
+            &Level::WARN,
+            &Level::ERROR,
+        ] {
+            let line = json_truncation_fallback(level, 64);
+            assert!(line.len() <= 64, "{} bytes: {line}", line.len());
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(parsed["truncated"], true);
+        }
     }
 
     /// Truncation must never split a multi-byte character — a cut inside a UTF-8

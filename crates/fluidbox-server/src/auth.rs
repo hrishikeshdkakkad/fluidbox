@@ -128,6 +128,11 @@ impl FromRequestParts<AppState> for Admin {
         let expected = fluidbox_db::sha256_hex(&state.cfg.admin_token);
         let got = fluidbox_db::sha256_hex(&token);
         if got == expected {
+            fluidbox_obs::span::record_caller(
+                fluidbox_obs::field::principal::OPERATOR,
+                &state.tenant_id.to_string(),
+                None,
+            );
             Ok(Admin)
         } else {
             Err(ApiError::Unauthorized)
@@ -294,7 +299,7 @@ impl FromRequestParts<AppState> for Principal {
                 // the auth audit log already carry. The per-callsite limiter
                 // caps a scanner's contribution to this line.
                 tracing::info!(
-                    credential = presented,
+                    credential_kind = presented,
                     error = %e,
                     "authentication refused"
                 );
@@ -874,6 +879,15 @@ impl FromRequestParts<AppState> for SessionAuth {
         let auth = fluidbox_db::session_for_token(&state.pool, &token)
             .await?
             .ok_or(ApiError::Unauthorized)?;
+        // Resolution has already established these ids. Stamp them before any
+        // refusal that follows so workload mismatches and wrong-audience probes
+        // remain attributable without exposing credential material.
+        fluidbox_obs::span::record_caller(
+            fluidbox_obs::field::principal::RUNNER,
+            &auth.tenant_id.to_string(),
+            None,
+        );
+        fluidbox_obs::span::record_subject_run(&auth.session_id.to_string());
         // Gap 6 (Phase F): bind the credential to the workload it was issued to.
         // Here rather than per-handler because this extractor is the FIRST thing
         // six of the seven internal routes run — including `/events`, the one route
@@ -888,18 +902,6 @@ impl FromRequestParts<AppState> for SessionAuth {
             peer_addr(parts),
             parts.uri.path(),
         )?;
-        // Stamp the RUN onto the request span. Every internal-plane record from
-        // here on — the gate's verdict, the broker's dispatch, the heartbeat —
-        // is then findable by the session id an operator was actually given,
-        // and the request's completion record says which run it served.
-        // `audience` rides along because a wrong-audience refusal is the whole
-        // point of the four-token split and is otherwise invisible.
-        fluidbox_obs::span::record_caller(
-            fluidbox_obs::field::principal::RUNNER,
-            &auth.tenant_id.to_string(),
-            None,
-        );
-        fluidbox_obs::span::record_subject_run(&auth.session_id.to_string());
         tracing::debug!(
             token_audience = %auth.audience,
             "runner credential accepted"
@@ -1554,6 +1556,41 @@ mod tests {
         let orch = include_str!("orchestrator.rs");
         assert!(orch.contains("crate::auth::workload_addrs_from_handle(&handle)"));
         assert!(orch.contains("fluidbox_db::set_workload_addrs("));
+    }
+
+    #[test]
+    fn resolved_runner_identity_is_stamped_before_refusal_guards() {
+        let auth = production_src();
+        let start = auth
+            .find("impl FromRequestParts<AppState> for SessionAuth")
+            .expect("SessionAuth extractor");
+        let body = &auth[start..];
+        let stamp = body
+            .find("fluidbox_obs::span::record_caller(")
+            .expect("runner caller stamp");
+        let workload = body
+            .find("enforce_workload_identity(")
+            .expect("workload guard");
+        assert!(
+            stamp < workload,
+            "verified runner ids must be recorded before workload/audience refusal paths"
+        );
+
+        let facade = include_str!("facade.rs");
+        let resolved = facade
+            .find("let sess_auth = fluidbox_db::session_for_token")
+            .expect("facade token resolution");
+        let facade = &facade[resolved..];
+        let stamp = facade
+            .find("fluidbox_obs::span::record_caller(")
+            .expect("facade runner stamp");
+        let workload = facade
+            .find("crate::auth::enforce_workload_identity(")
+            .expect("facade workload guard");
+        assert!(
+            stamp < workload,
+            "facade stamp must precede its refusal guards"
+        );
     }
 
     /// THE SILENT-DEATH GUARD. Every credential resolution reads the recorded

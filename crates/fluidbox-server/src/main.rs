@@ -789,6 +789,7 @@ async fn run() -> anyhow::Result<()> {
         let metrics_listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
         let metrics_app = Router::new()
             .route("/metrics", get(metrics::metrics_endpoint))
+            .layer(request_log(fluidbox_obs::field::plane::METRICS))
             .with_state(state.clone());
         tracing::warn!(
             bind = %metrics_addr,
@@ -953,6 +954,10 @@ mod tests {
         assert!(
             src.contains("get(metrics::metrics_endpoint)"),
             "the optional listener must serve the unauth metrics handler"
+        );
+        assert!(
+            src.contains(".layer(request_log(fluidbox_obs::field::plane::METRICS))"),
+            "the optional metrics listener must emit correlated request completions"
         );
     }
 
