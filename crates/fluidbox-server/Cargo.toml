@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Compiles the NullProvider into the binary and adds the `null` arm to
+# `build_provider`. Test-only: without it, `FLUIDBOX_PROVIDER=null` is an
+# unknown-provider boot error, so a release build cannot be talked into
+# running a provider that provisions nothing.
+test-provider = ["fluidbox-provider/test-provider"]
+
 [dependencies]
 fluidbox-core.workspace = true
 fluidbox-db.workspace = true
