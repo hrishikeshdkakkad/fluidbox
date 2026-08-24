@@ -35,6 +35,7 @@ use crate::auth::Admin;
 use crate::state::AppState;
 use axum::extract::State;
 use axum::response::IntoResponse;
+use fluidbox_obs::field::error_kind as EK;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -712,7 +713,7 @@ async fn snapshot(state: &AppState) -> Live {
         match fluidbox_db::system_worker::queue_gauges(&state.pool).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("queue gauge read failed: {e}");
+                tracing::warn!(error = %e, error_kind = EK::DB, "queue gauge read failed; rendering zeros");
                 state.metrics.scrape_errors.inc();
                 (0, 0)
             }

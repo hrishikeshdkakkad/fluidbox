@@ -22,6 +22,7 @@ use fluidbox_core::policy::{EvaluationOutcome, Policy, ToolCallRequest, Verdict}
 use fluidbox_core::spec::RunSpec;
 use fluidbox_core::state::SessionStatus;
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -382,7 +383,9 @@ async fn gate_tool_call(
                         }
                     }
                     tracing::error!(
-                        "tool-call budget finalize for {session_id} did not persist after retries"
+                        session_id = %session_id,
+                        error_kind = EK::DB,
+                        "tool-call budget finalize did not persist after retries"
                     );
                 });
                 return Ok(GateDecision::deny("tool-call budget exceeded"));
@@ -1300,9 +1303,10 @@ async fn execute_with_claim(
                 // read above) and no writes at all.
                 if row.attempt >= MAX_EXECUTION_ATTEMPTS {
                     tracing::debug!(
-                        "session {session_id}: tool call {tool_call_id} re-presented after \
-                         {} pre-send failures — refusing (attempts exhausted)",
-                        row.attempt
+                        session_id = %session_id,
+                        tool_call_id = %tool_call_id,
+                        attempt = row.attempt,
+                        "tool call re-presented after its permitted pre-send failures — refusing"
                     );
                     return Ok(Json(attempts_exhausted_response(row.attempt)));
                 }
@@ -1400,8 +1404,13 @@ async fn finish_won_claim(
         settle.settled() && comp.state == "failed_before_send" && attempt >= MAX_EXECUTION_ATTEMPTS;
     if exhausted {
         tracing::warn!(
-            "session {session_id}: brokered call {tool_call_id} ({tool}) failed before \
-             send on all {attempt} permitted attempts — not retrying"
+            session_id = %session_id,
+            tool_call_id = %tool_call_id,
+            tool = %tool,
+            attempt = attempt,
+            retrying = false,
+            error_kind = EK::UPSTREAM,
+            "brokered call failed before send on every permitted attempt"
         );
     }
     // Ledger ONLY when this dispatcher actually settled the claim. When the CAS
@@ -1949,7 +1958,7 @@ pub async fn workspace_archive(
         // rather than mistaken for "this run has no archive".
         Err(fluidbox_workspace::StoreError::NotFound) => return Err(ApiError::NotFound),
         Err(e) => {
-            tracing::warn!("workspace archive for {} unavailable: {e}", auth.session_id);
+            tracing::warn!(session_id = %auth.session_id, error = %e, "workspace archive unavailable");
             return Err(ApiError::Upstream("workspace archive unavailable".into()));
         }
     };

@@ -26,6 +26,7 @@
 
 use crate::state::{AppState, McpPeer, McpUpstreamSession};
 use fluidbox_core::capability::{CapabilityServer, ToolSnapshot};
+use fluidbox_obs::field::error_kind as EK;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -724,8 +725,15 @@ fn refuse_dial(host: &str, t: crate::governor::Throttled) -> DispatchOutcome {
     let digest = msg_digest(host);
     tracing::info!(
         target: "broker",
-        "outbound dial refused by the egress governor (scope {}, upstream {}, retry {}s)",
-        t.scope, digest, t.retry_after_secs
+        scope = %t.scope,
+        // A DIGEST of the upstream, not the host. This line fires on
+        // attacker-influenced destinations, and the digest is enough to tell
+        // "the same upstream, repeatedly" from "many upstreams" without naming
+        // any of them in a shared log stream.
+        upstream = %digest,
+        retry_after_secs = t.retry_after_secs,
+        error_kind = EK::CAPACITY,
+        "outbound dial refused by the egress governor"
     );
     DispatchOutcome::NeverSent(t.message(&digest))
 }
@@ -879,7 +887,7 @@ async fn dial_rpc(
         // the Location target — log a digest of the request URL at debug only.
         // A redirect happens AFTER connect ⇒ the request was sent ⇒ Ambiguous.
         Err(e) if e.is_redirect() => {
-            tracing::debug!(target: "broker", "mcp upstream redirect refused (req {})", msg_digest(url));
+            tracing::debug!(target: "broker", request = %msg_digest(url), "mcp upstream redirect refused");
             return Err(CallErr::Ambiguous(
                 "upstream attempted redirect (refused)".into(),
             ));
@@ -901,7 +909,7 @@ async fn dial_rpc(
     // The request WAS sent (we got a response) ⇒ Ambiguous.
     if status.is_redirection() {
         if let Some(loc) = res.headers().get("location").and_then(|v| v.to_str().ok()) {
-            tracing::debug!(target: "broker", "mcp upstream redirect refused (loc {})", msg_digest(loc));
+            tracing::debug!(target: "broker", location = %msg_digest(loc), "mcp upstream redirect refused");
         }
         return Err(CallErr::Ambiguous(
             "upstream attempted redirect (refused)".into(),
@@ -1085,9 +1093,9 @@ async fn select_response(
             // specially but never acted on (the frozen snapshot is the surface).
             let method = m.get("method").and_then(Value::as_str).unwrap_or("");
             if method.contains("list_changed") {
-                tracing::debug!(target: "broker", "mcp server sent {method} (ignored — snapshot is frozen)");
+                tracing::debug!(target: "broker", method = %method, "mcp server sent a request; ignored — the tool snapshot is frozen");
             } else {
-                tracing::debug!(target: "broker", "mcp server notification {method} (ignored)");
+                tracing::debug!(target: "broker", method = %method, "mcp server notification ignored");
             }
             continue;
         }
@@ -1409,7 +1417,9 @@ impl SessionRecorder {
         {
             tracing::warn!(
                 target: "broker",
-                "durable mcp session record failed (teardown degrades to replica-local): {e}"
+                error = %e,
+                error_kind = EK::DB,
+                "durable mcp session record failed — teardown degrades to replica-local"
             );
         }
     }
@@ -1652,7 +1662,7 @@ pub async fn run_terminal_mcp_cleanup(state: &AppState, session_id: uuid::Uuid) 
         Ok(Some(s)) => Some(fluidbox_db::TenantScope::assume(s.tenant_id)),
         Ok(None) => None,
         Err(e) => {
-            tracing::debug!(target: "broker", "mcp cleanup tenant resolve failed (best-effort): {e}");
+            tracing::debug!(target: "broker", error = %e, "mcp cleanup tenant resolve failed (best-effort)");
             None
         }
     };
@@ -1665,7 +1675,7 @@ pub async fn run_terminal_mcp_cleanup(state: &AppState, session_id: uuid::Uuid) 
                 Err(e) => {
                     // Degrade to the local map rather than skipping teardown: the
                     // rows stay live and either a re-drive or the sweeper gets them.
-                    tracing::warn!(target: "broker", "durable mcp session read failed (teardown degrades to replica-local): {e}");
+                    tracing::warn!(target: "broker", error = %e, error_kind = EK::DB, "durable mcp session read failed — teardown degrades to replica-local");
                     Vec::new()
                 }
             }
@@ -1700,7 +1710,7 @@ pub async fn run_terminal_mcp_cleanup(state: &AppState, session_id: uuid::Uuid) 
             )
             .await
             {
-                tracing::warn!(target: "broker", "durable mcp session mark failed (the sweeper will retire it): {e}");
+                tracing::warn!(target: "broker", error = %e, error_kind = EK::DB, "durable mcp session mark failed — the sweeper will retire it");
             }
         }
     }
@@ -1749,9 +1759,9 @@ fn union_teardown(
         let Some(peer) = McpPeer::from_parts(&row.peer_kind, row.peer_id) else {
             tracing::warn!(
                 target: "broker",
-                "durable mcp session row {} has unknown peer_kind '{}' — cannot tear it down",
-                row.id,
-                row.peer_kind
+                row_id = %row.id,
+                peer_kind = %row.peer_kind,
+                "durable mcp session row has an unknown peer kind — cannot tear it down"
             );
             continue;
         };
@@ -1870,7 +1880,7 @@ where
         let auth = match resolve_auth(t.peer, url.to_string()).await {
             Ok(a) => a,
             Err(e) => {
-                tracing::debug!(target: "broker", "mcp session DELETE skipped (credential unavailable): {e}");
+                tracing::debug!(target: "broker", error = %e, "mcp session DELETE skipped: the credential could not be re-resolved");
                 continue;
             }
         };
@@ -1888,7 +1898,7 @@ where
         // we cannot know whether the upstream saw it, and re-sending it forever
         // from a background sweep is exactly the retry loop this design refuses.
         if let Err(e) = req.send().await {
-            tracing::debug!(target: "broker", "mcp session DELETE failed (best-effort): {e}");
+            tracing::debug!(target: "broker", error = %e, "mcp session DELETE failed (best-effort)");
         }
         if let Some(row_id) = t.row_id {
             attempted.push(row_id);
