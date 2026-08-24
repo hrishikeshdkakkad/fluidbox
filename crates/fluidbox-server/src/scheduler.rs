@@ -14,6 +14,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use fluidbox_core::schedule::{CronSchedule, MissedRunPolicy};
 use fluidbox_core::spec::{InvocationContext, InvocationKind};
 use fluidbox_db::{ScheduleRow, TenantScope};
+use fluidbox_obs::field::error_kind as EK;
 use std::time::Duration;
 
 const TICK: Duration = Duration::from_secs(1);
@@ -38,7 +39,7 @@ pub fn spawn_worker(state: AppState) {
             let due = match fluidbox_db::system_worker::due_schedules(&state.pool, 20).await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("schedule poll failed: {e}");
+                    tracing::warn!(error = %e, error_kind = EK::DB, worker = "scheduler", "schedule poll failed");
                     continue;
                 }
             };
@@ -65,7 +66,7 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
         Ok(Some(s)) => s,
         Ok(None) => return, // subscription deleted mid-tick; cascade wins
         Err(e) => {
-            tracing::warn!("schedule {}: subscription lookup failed: {e}", sched.id);
+            tracing::warn!(schedule_id = %sched.id, error = %e, error_kind = EK::DB, "subscription lookup failed");
             return;
         }
     };
@@ -75,7 +76,7 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
     let cron = match CronSchedule::parse(&sched.cron, &sched.timezone) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("schedule {} has unparseable cron/timezone: {e}", sched.id);
+            tracing::error!(schedule_id = %sched.id, error = %e, error_kind = EK::INVALID, "schedule has an unparseable cron expression or timezone — it will never fire");
             return;
         }
     };
@@ -97,7 +98,7 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
             fluidbox_db::mark_invocation_skipped(&state.pool, scope, invocation_id, "missed")
                 .await
                 .ok();
-            tracing::info!("schedule {}: missed {} → skipped", sched.id, key);
+            tracing::info!(schedule_id = %sched.id, fire_key = %key, reason = "missed", "schedule firing skipped");
         }
         advance(state, scope, sched, fire_time, next, None).await;
         return;
@@ -110,7 +111,7 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                 build_and_create(state, scope, &sub, sched, fire_time, missed, invocation_id).await;
             match created {
                 Ok(RunCreation::Created(session)) => {
-                    tracing::info!("schedule {}: fired {} → run {}", sched.id, key, session.id);
+                    tracing::info!(schedule_id = %sched.id, fire_key = %key, session_id = %session.id, "schedule fired a run");
                     advance(state, scope, sched, fire_time, next, Some(fire_time)).await;
                 }
                 Ok(RunCreation::SkippedOverlap { running_session_id }) => {
@@ -123,10 +124,11 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                     .await
                     .ok();
                     tracing::info!(
-                        "schedule {}: {} skipped (run {} still active)",
-                        sched.id,
-                        key,
-                        running_session_id
+                        schedule_id = %sched.id,
+                        fire_key = %key,
+                        session_id = %running_session_id,
+                        reason = "already_running",
+                        "schedule firing skipped"
                     );
                     advance(state, scope, sched, fire_time, next, None).await;
                 }
@@ -143,10 +145,12 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                     .await
                     .ok();
                     tracing::warn!(
-                        "schedule {}: {} skipped (cancel of {} not persisted; next tick retries)",
-                        sched.id,
-                        key,
-                        running_session_id
+                        schedule_id = %sched.id,
+                        fire_key = %key,
+                        session_id = %running_session_id,
+                        reason = "replace_cancel_not_persisted",
+                        retrying = true,
+                        "schedule firing skipped"
                     );
                     advance(state, scope, sched, fire_time, next, None).await;
                 }
@@ -165,9 +169,10 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                     .await
                     .ok();
                     tracing::warn!(
-                        "schedule {}: firing {} shed at the queue depth bound",
-                        sched.id,
-                        key
+                        schedule_id = %sched.id,
+                        fire_key = %key,
+                        error_kind = EK::CAPACITY,
+                        "schedule firing shed at the queue depth bound"
                     );
                     advance(state, scope, sched, fire_time, next, None).await;
                 }
@@ -182,7 +187,7 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                     )
                     .await
                     .ok();
-                    tracing::warn!("schedule {}: firing {} failed: {e}", sched.id, key);
+                    tracing::warn!(schedule_id = %sched.id, fire_key = %key, error = %e, "schedule firing failed");
                     advance(state, scope, sched, fire_time, next, None).await;
                 }
             }
@@ -196,7 +201,9 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
         // Another worker holds this fire mid-creation: leave next_fire_at
         // alone; the next tick resolves to Replay/Skipped.
         Ok(fluidbox_db::InvocationClaim::InFlight) => {}
-        Err(e) => tracing::warn!("schedule {}: claim failed: {e}", sched.id),
+        Err(e) => {
+            tracing::warn!(schedule_id = %sched.id, error = %e, error_kind = EK::DB, "schedule fire-claim failed")
+        }
     }
 }
 
@@ -280,8 +287,12 @@ async fn advance(
 ) {
     match fluidbox_db::advance_schedule(&state.pool, scope, sched.id, from, to, fired_at).await {
         Ok(true) => {}
-        Ok(false) => tracing::debug!("schedule {}: advance lost CAS (benign)", sched.id),
-        Err(e) => tracing::warn!("schedule {}: advance failed: {e}", sched.id),
+        Ok(false) => {
+            tracing::debug!(schedule_id = %sched.id, "schedule advance lost the compare-and-set (another replica advanced it — benign)")
+        }
+        Err(e) => {
+            tracing::warn!(schedule_id = %sched.id, error = %e, error_kind = EK::DB, "schedule advance failed")
+        }
     }
 }
 
