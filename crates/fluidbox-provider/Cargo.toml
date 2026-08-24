@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The NullProvider (design 2026-08-23 §12): a provider that provisions nothing,
+# for exercising admission and lifecycle without containers or model spend. OFF
+# by default so a release build physically lacks it.
+test-provider = []
+
 [dependencies]
 fluidbox-core.workspace = true
 fluidbox-workspace.workspace = true
