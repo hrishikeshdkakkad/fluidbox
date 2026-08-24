@@ -150,6 +150,27 @@ async fn fire_one(state: &AppState, sched: &ScheduleRow) {
                     );
                     advance(state, scope, sched, fire_time, next, None).await;
                 }
+                // A deliberate capacity shed, recorded as such rather than as
+                // an "error: …" string. The distinction is operator-facing:
+                // `capacity` says the deployment was full at this fire time and
+                // the NEXT cron fire retries naturally, where an error string
+                // reads as a broken schedule needing attention.
+                Err(crate::error::ApiError::AtCapacity { .. }) => {
+                    fluidbox_db::mark_invocation_skipped(
+                        &state.pool,
+                        scope,
+                        invocation_id,
+                        "capacity",
+                    )
+                    .await
+                    .ok();
+                    tracing::warn!(
+                        "schedule {}: firing {} shed at the queue depth bound",
+                        sched.id,
+                        key
+                    );
+                    advance(state, scope, sched, fire_time, next, None).await;
+                }
                 Err(e) => {
                     // A failed firing is recorded, not retried — retrying a
                     // config error every tick would loop forever.
