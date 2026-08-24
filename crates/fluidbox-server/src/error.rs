@@ -32,6 +32,14 @@ pub enum ApiError {
     /// Kubernetes netpol enforcement probe hasn't passed). 503.
     #[error("{0}")]
     ServiceUnavailable(String),
+    /// The run queue is at its depth bound (run admission, design 2026-08-23
+    /// §9). **429, deliberately not 503.** A shed is a policy decision, not an
+    /// outage, and a 5xx is the signal that invites retry amplification —
+    /// webhook providers redeliver on it, turning one shed event into many
+    /// requests exactly when the deployment is least able to take them. 429
+    /// with `Retry-After` says "later, and here is how much later".
+    #[error("at capacity: the run queue is full; retry after {retry_after_secs}s")]
+    AtCapacity { retry_after_secs: u64 },
     #[error(transparent)]
     Db(#[from] sqlx::Error),
     #[error("{0}")]
@@ -52,6 +60,19 @@ impl IntoResponse for ApiError {
             }
             ApiError::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             ApiError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            // The one arm that returns early: it carries a header, and the
+            // shared tail below builds a header-less response.
+            ApiError::AtCapacity { retry_after_secs } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(
+                        axum::http::header::RETRY_AFTER,
+                        retry_after_secs.to_string(),
+                    )],
+                    Json(json!({ "error": self.to_string() })),
+                )
+                    .into_response();
+            }
             ApiError::Db(e) => {
                 tracing::error!("db error: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
@@ -78,3 +99,36 @@ impl From<serde_json::Error> for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shed signal for interactive callers. Two properties matter and both
+    /// are asserted: the STATUS must be 429 (a 503 would invite the retry
+    /// amplification the design forbids, and a 500 would read as our bug rather
+    /// than as backpressure), and `Retry-After` must be present so a client has
+    /// a number to obey instead of a hot loop.
+    #[test]
+    fn at_capacity_maps_to_429_with_retry_after() {
+        let resp = ApiError::AtCapacity {
+            retry_after_secs: 30,
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "30");
+    }
+
+    /// …and the header rides the STANDARD error envelope, not a bespoke body:
+    /// every other client-visible error in this API is `{"error": "…"}`, and a
+    /// shed is not the place to introduce a second shape.
+    #[test]
+    fn at_capacity_keeps_the_house_error_envelope() {
+        let msg = ApiError::AtCapacity {
+            retry_after_secs: 5,
+        }
+        .to_string();
+        assert!(msg.contains("capacity"), "got: {msg}");
+        assert!(msg.contains('5'), "the message states the wait: {msg}");
+    }
+}

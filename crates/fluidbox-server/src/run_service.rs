@@ -22,6 +22,12 @@ use fluidbox_core::spec::{
     WorkspaceSpec,
 };
 use fluidbox_core::state::SessionStatus;
+
+/// What a shed 429 tells the caller to wait. One dispatcher tick is 1 s, so any
+/// value large enough to be worth obeying is arbitrary; 30 s is the same scale
+/// as the capacity-bounce backoff floor and is short enough that a human
+/// retrying by hand is not misled about the deployment being wedged.
+const QUEUE_SHED_RETRY_AFTER_SECS: u64 = 30;
 use fluidbox_db::TenantScope;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -133,6 +139,31 @@ pub async fn create_run(
              runs are blocked until the NetworkPolicy enforcement probe passes"
                 .into(),
         ));
+    }
+
+    // Queue depth backstop (design 2026-08-23 §7.1). Deliberately BEFORE the
+    // create transaction and deliberately racy by a bounded amount: two
+    // concurrent creates can both pass at depth `bound - 1`. The bound is a
+    // protective backstop against a runaway webhook loop or CI storm, not an
+    // invariant, and overshoot is limited to the number of in-flight creates.
+    // Checking INSIDE the create transaction would put a cross-tenant count
+    // into the byte-for-byte-load-bearing tx, which invariant 3 forbids.
+    //
+    // Placed ahead of agent resolution so a full queue costs one count rather
+    // than the whole resolution path — and so the shed answer does not depend
+    // on whether the caller's agent name happened to be valid.
+    if let Some(q) = &state.cfg.queue {
+        let depth = fluidbox_db::system_worker::count_queued_sessions(&state.pool).await?;
+        if depth >= q.max_depth {
+            tracing::warn!(
+                "run queue at depth {depth} (bound {}) — shedding",
+                q.max_depth
+            );
+            state.metrics.queue_shed.inc("depth");
+            return Err(ApiError::AtCapacity {
+                retry_after_secs: QUEUE_SHED_RETRY_AFTER_SECS,
+            });
+        }
     }
 
     // Resolve agent by id or name — SQL-scoped to the caller's tenant.
