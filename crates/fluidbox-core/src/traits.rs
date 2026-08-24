@@ -374,6 +374,23 @@ pub trait ExecutionProvider: Send + Sync {
 pub enum ProviderError {
     #[error("provider error: {0}")]
     Other(String),
+    /// The substrate refused for CAPACITY reasons (a namespace quota, an
+    /// apiserver throttle): the run is healthy, the world is full. Every
+    /// reference controller treats this as retryable pressure rather than a
+    /// workload failure, so the orchestrator re-parks the run with backoff
+    /// instead of failing it (run admission design 2026-08-23, section 7.4).
+    ///
+    /// Carries the VERBATIM substrate message: it rides `status_reason` into
+    /// the ledger's `StatusChanged` event, so an operator reading the timeline
+    /// sees the exact blocker ("exceeded quota: fluidbox-sandboxes, limited:
+    /// pods=20") rather than a paraphrase.
+    ///
+    /// Classification is deliberately NARROW — an RBAC 403 and an
+    /// admission-webhook 403 look similar and are NOT capacity; bouncing on
+    /// them would retry against a wall until the attempt cap. Everything a
+    /// provider does not positively recognize stays `Other`, i.e. terminal.
+    #[error("provider capacity denied: {0}")]
+    CapacityDenied(String),
 }
 
 // NOTE: there is deliberately no `Harness` trait. A harness is a runner
