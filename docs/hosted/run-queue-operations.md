@@ -108,7 +108,8 @@ tier below it if the namespace is shared with anything else.
 | `fluidbox_runs_dispatched_total` | Admissions. A redispatched bounce counts again. |
 | `fluidbox_queue_wait_seconds` | Wait distribution, observed at admission. |
 | `fluidbox_queue_shed_total{reason}` | `depth` = refused at create; `age` = expired while waiting; `requeue_exhausted` = bounced past the retry cap. |
-| `fluidbox_queue_requeues_total{reason="capacity"}` | The substrate refused a pod. **Non-zero means the quota is firing** — either the cap is above `quota.pods`, or something outside fluidbox is consuming the namespace. |
+| `fluidbox_queue_requeues_total{reason="quota"}` | Kubernetes rejected a pod against `ResourceQuota`. Sustained non-zero means the cap is above `quota.pods`, or something outside fluidbox is consuming the namespace. |
+| `fluidbox_queue_requeues_total{reason="throttle"}` | The Kubernetes API server returned 429 throttling. This is normally transient; investigate API-server load or client request pressure if it persists. |
 
 Per-run, the answer to "why is my run not running" is on the run itself: the
 timeline carries a `StatusChanged` event with the reason (`parked at admission`,

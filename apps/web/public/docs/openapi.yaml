@@ -331,8 +331,9 @@ paths:
       operationId: createRun
       summary: Start a run
       description: |
-        Freezes an immutable `RunSpec` and begins provisioning. The response
-        returns immediately with the new run in `created`; watch
+        Freezes an immutable `RunSpec` and accepts the run. Depending on the
+        deployment and the run's policy, the returned run may be `created`,
+        `awaiting_authorization`, or `queued` before provisioning begins; watch
         `/v1/sessions/{id}/events/stream` for progress.
 
         What gets frozen: the agent revision's model and system prompt, a full
@@ -376,7 +377,7 @@ paths:
                   capabilities: [github-readonly]
       responses:
         '200':
-          description: The run was created and is provisioning.
+          description: The run was accepted. Its status says whether it is paused, queued, or provisioning.
           content:
             application/json:
               schema:
@@ -399,6 +400,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RunQueueFull'
 
   /v1/sessions/{id}:
     parameters:
@@ -420,6 +423,14 @@ paths:
                     $ref: '#/components/schemas/Session'
                   usage:
                     $ref: '#/components/schemas/UsageTotals'
+                  queue_position:
+                    type: integer
+                    format: int64
+                    minimum: 0
+                    description: |
+                      Number of older queued runs in the same organization.
+                      Present only while this run is `queued`; it is a lower
+                      bound on deployment-wide position.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -1117,7 +1128,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-
   /v1/policies/{name}/revert:
     parameters:
       - $ref: '#/components/parameters/PolicyName'
@@ -1494,6 +1504,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RunQueueFull'
 
   /v1/triggers/{id}/runs/{sid}:
     parameters:
@@ -3962,6 +3974,20 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    RunQueueFull:
+      description: The deployment-wide run queue is full. Retry after the indicated delay.
+      headers:
+        Retry-After:
+          required: true
+          description: Seconds the caller should wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+            examples: [30]
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     Unavailable:
       description: The control plane cannot serve this request right now.
       content:
@@ -4471,6 +4497,13 @@ components:
         created_at:
           type: string
           format: date-time
+        queued_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Time this run first became dispatchable. Set when the run enters
+            `queued` and preserved across capacity requeues.
         ended_at:
           type: string
           format: date-time

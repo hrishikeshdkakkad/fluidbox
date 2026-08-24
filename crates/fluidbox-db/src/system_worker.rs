@@ -28,8 +28,10 @@
 //!     capacity dispatcher's four ([`dispatch_claim`] — the SERIALIZED
 //!     admission decision: advisory try-lock, deployment-wide occupancy count,
 //!     and a lease-stamping `for update skip locked` claim in ONE transaction;
-//!     [`count_queued_sessions`] — the depth backstop the create path checks;
-//!     [`expired_queued_sessions`] — runs past the configured maximum wait;
+//!     [`count_admission_pending_sessions`] — the depth backstop the create
+//!     path checks;
+//!     [`claim_expired_queued_sessions`] — runs past the configured maximum
+//!     wait, claimed so exactly one replica sheds each;
 //!     [`orphaned_created_sessions`] — `created` rows nothing is driving, which
 //!     heals both the park crash window and the pre-existing orphan class;
 //!     [`queue_gauges`] — the deployment-wide depth and oldest-wait the metrics
@@ -777,13 +779,16 @@ pub struct ClaimedRun {
     pub dispatch_attempts: i32,
 }
 
-/// What one dispatch tick decided. `active` and `leased_queued` are the
-/// occupancy the headroom was computed from — returned so the caller can log or
-/// gauge the decision it actually made rather than re-deriving it.
+/// What one dispatch tick decided. `active`, `leased_queued` and `unreaped` are
+/// the three occupancy terms the headroom was computed from — returned so the
+/// caller can log or gauge the decision it actually made rather than
+/// re-deriving it.
 #[derive(Debug, Clone)]
 pub struct DispatchOutcome {
     pub active: i64,
     pub leased_queued: i64,
+    /// Terminal sessions whose sandbox has NOT been verifiably reaped yet.
+    pub unreaped: i64,
     pub claimed: Vec<ClaimedRun>,
 }
 
@@ -807,10 +812,37 @@ pub struct DispatchOutcome {
 /// taken from the very rows that hold the state cannot drift: there is no
 /// release bookkeeping to miss on any terminal path and no reconciliation
 /// sweeper to write. Occupancy only GROWS through this serialized section and
-/// only SHRINKS through terminal transitions, so a stale-high count
+/// only SHRINKS through a VERIFIED sandbox release, so a stale-high count
 /// under-admits for one tick (self-correcting) and a stale-low count is
 /// impossible. Overshoot past the cap is therefore structurally impossible; the
 /// cost is at most ~1 s of transient under-admission.
+///
+/// **What the cap actually counts is SANDBOXES, which is why status alone is
+/// not the predicate.** A finalizer commits the terminal status BEFORE
+/// `finish_terminal_cleanup` reaches `reap()`, and provider deletion can fail
+/// and be retried for as long as the substrate misbehaves — so a status-only
+/// count drops the run from occupancy while its pod or container is still
+/// running, and the next tick admits another one over the cap. Repeated reap
+/// failures would make that divergence unbounded.
+///
+/// The marker for "this run may still own a sandbox" already exists and needs
+/// no new bookkeeping: `session_finalizations` holds a row from the moment a
+/// finalization intent is recorded until `finish_terminal_cleanup` deletes it,
+/// which it does ONLY after `reap()` returned success (i.e. terminate
+/// succeeded, or the provider itself reported the sandbox gone). So a terminal
+/// session that still has an intent row is exactly a slot that is still
+/// occupied, and the slot is released when the sandbox is verifiably gone —
+/// never before. The join is cheap because `session_finalizations` holds only
+/// in-flight finalizations: it is empty on a quiet deployment and bounded by
+/// concurrency, not by history.
+///
+/// A run that never provisioned (shed at the depth bound, expired in the
+/// queue, cancelled while `queued`) also carries an intent row for the short
+/// time its cleanup takes. Counting it is a deliberate over-count on the safe
+/// side and clears within a sweep; the alternative — trusting
+/// `sandbox_handle IS NULL` — would silently release the slot of a run that
+/// died between `provision()` returning and the handle being persisted, which
+/// is the one orphan class `reap`'s own `discover_handle` fallback exists for.
 ///
 /// **The `leased_queued` filter is load-bearing.** A claimed row is still
 /// `status = 'queued'` — `run()` remains the single writer of
@@ -843,15 +875,25 @@ pub async fn dispatch_claim(
 
     // `awaiting_authorization` holds no sandbox and is excluded; `cancelling`
     // and `finalizing` still hold one until reaped and are conservatively
-    // included.
-    let (active, leased_queued): (i64, i64) = sqlx::query_as(
+    // included. The third term is the one status cannot express: a session that
+    // is ALREADY terminal but whose sandbox has not been verifiably released
+    // (see the doc-comment above). It is read from `session_finalizations`
+    // rather than from `sessions` so the scan stays on the small table and the
+    // occupancy query keeps using the status index.
+    let (active, leased_queued, unreaped): (i64, i64, i64) = sqlx::query_as(
         "select
            count(*) filter (where status in
                ('created','provisioning','initializing','running',
                 'awaiting_approval','cancelling','finalizing'))                as active,
            count(*) filter (where status = 'queued'
                 and orchestrator_lease_until is not null
-                and orchestrator_lease_until >= now())                          as leased_queued
+                and orchestrator_lease_until >= now())                          as leased_queued,
+           (select count(*)
+              from session_finalizations f
+              join sessions t on t.id = f.session_id
+             where t.status not in
+                   ('created','provisioning','initializing','running',
+                    'awaiting_approval','cancelling','finalizing','queued'))    as unreaped
          from sessions
          where status in ('created','provisioning','initializing','running',
                           'awaiting_approval','cancelling','finalizing','queued')",
@@ -859,12 +901,13 @@ pub async fn dispatch_claim(
     .fetch_one(&mut *tx)
     .await?;
 
-    let headroom = cap - active - leased_queued;
+    let headroom = cap - active - leased_queued - unreaped;
     if headroom <= 0 {
         tx.commit().await?;
         return Ok(Some(DispatchOutcome {
             active,
             leased_queued,
+            unreaped,
             claimed: Vec::new(),
         }));
     }
@@ -905,43 +948,109 @@ pub async fn dispatch_claim(
     Ok(Some(DispatchOutcome {
         active,
         leased_queued,
+        unreaped,
         claimed,
     }))
 }
 
-/// Deployment-wide queue depth — the backstop the create path checks before
-/// accepting more work. Deliberately cross-tenant: the depth bound protects the
-/// deployment, not a tenant.
-pub async fn count_queued_sessions(pool: &PgPool) -> sqlx::Result<i64> {
+/// Deployment-wide ADMISSION-PENDING count — the backstop the create path
+/// checks before accepting more work. Deliberately cross-tenant: the depth
+/// bound protects the deployment, not a tenant.
+///
+/// **Why `awaiting_authorization` counts too.** That state is the OTHER
+/// pre-provisioning park, and every run sitting in it is work the deployment
+/// has already accepted and will owe a queue slot to the moment a human
+/// approves its network grant. Counting only `queued` made the bound trivially
+/// escapable: authorization-gated runs accumulated without limit, and
+/// `netgrant::release_authorized_grant` then moved each one to `queued` with no
+/// bound to check — a batch of approvals could overshoot the documented depth
+/// by an unbounded amount instead of by the in-flight creates the bound
+/// knowingly races. Reserving the slot at CREATE time is what makes the
+/// approval path safe without a second check that would have to kill a run a
+/// human had just approved.
+///
+/// The consequence is deliberate and worth stating: a backlog of undecided
+/// authorizations consumes queue depth, so new creates shed until those grants
+/// are decided. That is the honest reading of a bounded queue — pending work is
+/// pending work — and `FLUIDBOX_QUEUE_MAX_DEPTH` is the knob for deployments
+/// that want more headroom for long human pauses.
+///
+/// This is distinct from [`queue_gauges`]'s depth, which counts only `queued`:
+/// that one answers "how deep is the queue right now", which an
+/// authorization-paused run is not part of.
+pub async fn count_admission_pending_sessions(pool: &PgPool) -> sqlx::Result<i64> {
     let mut tx = crate::worker_tx(pool).await?;
-    let (n,): (i64,) = sqlx::query_as("select count(*) from sessions where status = 'queued'")
-        .fetch_one(&mut *tx)
-        .await?;
+    let (n,): (i64,) = sqlx::query_as(
+        "select count(*) from sessions
+          where status in ('queued', 'awaiting_authorization')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(n)
 }
 
-/// Runs that have waited longer than the configured maximum. The anchor is
-/// `queued_at`, never `created_at`: a run may lawfully have spent days in
-/// `awaiting_authorization` first, and the wait clock starts when it becomes
+/// CLAIM the runs that have waited longer than the configured maximum. The
+/// anchor is `queued_at`, never `created_at`: a run may lawfully have spent days
+/// in `awaiting_authorization` first, and the wait clock starts when it becomes
 /// dispatchable. Because `queued_at` is coalesce-stamped, the bound measures
 /// TOTAL time in queue across capacity bounces.
-pub async fn expired_queued_sessions(
+///
+/// **Why this claims rather than scans.** The expiry sweep runs on EVERY
+/// replica with no leader election, so an unlocked `select` hands the same rows
+/// to all of them at once. The terminal ACTION is deduplicated downstream (the
+/// finalization intent's `on conflict do nothing` picks one winner), but the
+/// SIDE EFFECTS that precede it are not: each replica would increment the shed
+/// counter and append its own `RunError` to the ledger, turning one expiration
+/// into replica-multiplied metrics and duplicate audit events. Claiming makes
+/// the caller's side effects single by construction, which is the same
+/// discipline `dispatch_claim` already applies to admission.
+///
+/// The claim IS the existing driver lease — no new column, no new migration.
+/// Stamping it also takes the row out of [`dispatch_claim`]'s pool, which is
+/// exactly right: a run past its wait bound must not be dispatched. A claimant
+/// that dies mid-sweep leaves a lease that expires in `lease_ttl_secs`, at
+/// which point the row re-enters this predicate and the next sweep retries it —
+/// reclaim by machinery that already exists.
+///
+/// The epoch follows `dispatch_claim`'s rule (bump only on owner CHANGE); it is
+/// not load-bearing here, because `orchestrator::fail` is deliberately an
+/// UNFENCED request-side intent.
+pub async fn claim_expired_queued_sessions(
     pool: &PgPool,
     max_wait_secs: i64,
     limit: i64,
+    owner: Uuid,
+    lease_ttl_secs: i64,
 ) -> sqlx::Result<Vec<SessionRow>> {
     let mut tx = crate::worker_tx(pool).await?;
     let out = sqlx::query_as(
-        "select * from sessions
-          where status = 'queued'
-            and queued_at is not null
-            and queued_at < now() - make_interval(secs => $1)
-          order by queued_at
-          limit $2",
+        "with picks as (
+             select id from sessions
+              where status = 'queued'
+                and queued_at is not null
+                and queued_at < now() - make_interval(secs => $1)
+                and (orchestrator_owner_id is null
+                     or orchestrator_lease_until is null
+                     or orchestrator_lease_until < now())
+              order by queued_at
+              limit $2
+              for update skip locked
+         )
+         update sessions s set
+            orchestrator_owner_id    = $3,
+            orchestrator_lease_until = now() + make_interval(secs => $4),
+            orchestrator_epoch       = s.orchestrator_epoch
+                + case when s.orchestrator_owner_id is distinct from $3 then 1 else 0 end,
+            updated_at               = now()
+          from picks
+         where s.id = picks.id
+         returning s.*",
     )
     .bind(max_wait_secs.max(0) as f64)
     .bind(limit)
+    .bind(owner)
+    .bind(lease_ttl_secs.max(1) as f64)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

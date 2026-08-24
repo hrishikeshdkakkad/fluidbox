@@ -149,11 +149,20 @@ pub async fn create_run(
     // Checking INSIDE the create transaction would put a cross-tenant count
     // into the byte-for-byte-load-bearing tx, which invariant 3 forbids.
     //
+    // The count RESERVES: it includes `awaiting_authorization` as well as
+    // `queued`, because an authorization-paused run is accepted work that will
+    // take a queue slot the moment a human approves it. Counting only `queued`
+    // let that state accumulate without limit and then flip to `queued` in a
+    // batch, overshooting the bound by an unbounded amount — see
+    // `count_admission_pending_sessions` for why the reservation belongs here
+    // rather than as a second check on the approval path.
+    //
     // Placed ahead of agent resolution so a full queue costs one count rather
     // than the whole resolution path — and so the shed answer does not depend
     // on whether the caller's agent name happened to be valid.
     if let Some(q) = &state.cfg.queue {
-        let depth = fluidbox_db::system_worker::count_queued_sessions(&state.pool).await?;
+        let depth =
+            fluidbox_db::system_worker::count_admission_pending_sessions(&state.pool).await?;
         if depth >= q.max_depth {
             tracing::warn!(
                 "run queue at depth {depth} (bound {}) — shedding",

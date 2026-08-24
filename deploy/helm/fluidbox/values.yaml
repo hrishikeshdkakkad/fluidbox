@@ -185,20 +185,44 @@ server:
   # new image to EVERY replica, and only then set this. A binary that predates
   # the `queued` status reads a parked run as terminal. See
   # docs/hosted/run-queue-operations.md.
+  #
+  # SETTING THIS SWITCHES THE SERVER DEPLOYMENT TO strategy: Recreate, which
+  # means a brief full outage on every upgrade. That is not incidental: the cap
+  # is a per-pod environment variable, so a RollingUpdate necessarily runs two
+  # generations at once and the "deployment-wide cap" stops being one cap —
+  # old replicas either spawn runs with no queue at all (during activation) or
+  # dispatch to the old ceiling (during a cap change), and whichever replica
+  # wins the dispatch lock decides. Recreate makes activation and every later
+  # cap change atomic. archiveStore "" | "fs" already forces Recreate for its
+  # own reason, so this only changes upgrade behaviour for archiveStore "s3".
+  # Leave this unset to keep zero-downtime rolling upgrades.
+  #
+  # A numeric 0 is rendered, not dropped: the server refuses to boot on it (a
+  # zero cap would admit nothing), and a silently omitted variable would turn
+  # that refusal into a silently unqueued deployment.
   maxConcurrentRuns: ""
   # Depth backstop before new work is SHED rather than queued ("" = 4 × the cap,
   # floor 50). Interactive callers get 429 + Retry-After; webhook and schedule
   # firings get a recorded skip and a 2xx, deliberately never a 5xx that would
   # invite redelivery amplification.
+  #
+  # The bound covers BOTH pre-provisioning parks — `queued` and
+  # `awaiting_authorization` — because a run waiting on a human to approve its
+  # network grant is accepted work that will take a queue slot the moment it is
+  # approved. Counting only `queued` would let approvals arrive in a batch and
+  # blow straight through the bound. Practical consequence: a backlog of
+  # undecided network-grant approvals consumes depth, so raise this on
+  # deployments where authorization pauses are long or numerous.
   queueMaxDepth: ""
   # How long a run may wait before it fails with an explained reason ("" = 3600).
   # Measured from FIRST enqueue, so it bounds total time in queue across capacity
   # bounces — and a run that sat in `awaiting_authorization` waiting on a human
   # is not charged for that wait.
   queueMaxWaitSecs: ""
-  # Provider capacity refusals (a quota 403) tolerated before a run fails with an
-  # explained reason ("" = 5). With the 30→300s backoff, five spans ~13 minutes
-  # of sustained external quota pressure.
+  # Provider capacity refusals (a quota 403, or an apiserver 429) tolerated
+  # before a run fails with an explained reason ("" = 5). The count is REQUEUES:
+  # with the default, refusals 1–5 all re-park and the sixth fails, so the
+  # 30→300s backoff series spans ~12.5 minutes of sustained capacity pressure.
   queueRequeueMax: ""
   # NOTE: the three knobs above are DEAD CONFIG without maxConcurrentRuns, and
   # the server REFUSES TO BOOT rather than ignore them.
