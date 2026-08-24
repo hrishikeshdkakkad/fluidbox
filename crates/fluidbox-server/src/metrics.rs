@@ -508,6 +508,54 @@ pub fn render(m: &Metrics, live: &Live) -> String {
         m.tool_result_truncations.get(),
     );
 
+    // ── The logging subsystem, observed ────────────────────────────────────
+    //
+    // Read live from `fluidbox-obs`'s process-wide counters rather than
+    // shadowed here, for the same reason the pool gauges are: the durable
+    // source already holds the value and a second copy would drift.
+    //
+    // `suppressed` is the one that matters. A non-zero rate means the LOG IS
+    // INCOMPLETE — the per-callsite limiter dropped records — and an operator
+    // reading a suddenly quiet log needs to be able to tell "nothing is
+    // happening" from "we stopped telling you what is happening". Alert on it.
+    {
+        let s = fluidbox_obs::stats::snapshot();
+        counter(
+            &mut out,
+            "fluidbox_log_records_total",
+            "Log records written to the sink.",
+            s.emitted,
+        );
+        counter(
+            &mut out,
+            "fluidbox_log_suppressed_total",
+            "Log records DROPPED by the per-callsite rate limiter (the log is incomplete \
+             for those callsites; the server names them in a periodic warning).",
+            s.suppressed,
+        );
+        counter(
+            &mut out,
+            "fluidbox_log_redactions_total",
+            "Field values blanked or rewritten by the log redactor. A steady rate is \
+             normal; a spike means something newly started carrying credential-shaped \
+             text into logs.",
+            s.redactions,
+        );
+        counter(
+            &mut out,
+            "fluidbox_log_truncations_total",
+            "Log values or records cut at the configured size ceiling.",
+            s.truncations,
+        );
+        counter(
+            &mut out,
+            "fluidbox_log_write_errors_total",
+            "Failed writes to the log sink (a full disk, a closed pipe). Logging never \
+             propagates these, so this counter is the only evidence they happened.",
+            s.write_errors,
+        );
+    }
+
     m.egress_rejections
         .render(&mut out, "Outbound egress admission refusals by reason.");
     // Rate-limit and breaker-open refusals live on the governor's own tallies

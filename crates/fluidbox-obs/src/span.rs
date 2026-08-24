@@ -96,6 +96,13 @@ pub fn trace_id_from_traceparent(header: &str) -> Option<String> {
 /// id is on the record as `session_id`, which is more useful anyway. `path` is
 /// carried separately and is already query-stripped by the caller — query
 /// strings hold OAuth codes and GitHub flow tokens.
+///
+/// `principal`, `tenant_id`, `user_id` and `session_id` are declared EMPTY and
+/// filled in later by [`record_caller`] / [`record_subject`]. They have to be:
+/// authentication happens inside the handler, well after the span opens, and a
+/// field that was not declared at creation can never be recorded. Declaring
+/// them here is what lets every record produced by the rest of the request —
+/// including the completion record — carry the caller's identity.
 pub fn request(
     plane: &'static str,
     method: &str,
@@ -110,7 +117,40 @@ pub fn request(
         route = route,
         request_id = request_id,
         trace_id = trace_id,
+        principal = tracing::field::Empty,
+        tenant_id = tracing::field::Empty,
+        user_id = tracing::field::Empty,
+        session_id = tracing::field::Empty,
     )
+}
+
+/// Stamp the resolved caller onto the enclosing request span.
+///
+/// Called once, by the authentication layer, the moment a principal is known.
+/// Everything the request logs afterwards — and the completion record itself —
+/// then carries who asked, which is the difference between "a 403 happened" and
+/// "this tenant's PAT is failing authorization on this route".
+///
+/// A no-op outside a span that declared the fields, which is the correct
+/// behaviour for the CLI and for tests rather than something to guard against.
+pub fn record_caller(kind: &str, tenant_id: &str, user_id: Option<&str>) {
+    let span = Span::current();
+    span.record("principal", kind);
+    span.record("tenant_id", tenant_id);
+    if let Some(u) = user_id {
+        span.record("user_id", u);
+    }
+}
+
+/// Stamp the run a request is ABOUT onto the enclosing span.
+///
+/// Distinct from the run span: this is for a control-plane request that acts on
+/// a run (`POST /v1/sessions/{id}/cancel`), where the work is the request and
+/// the run is its subject. It is what makes every record of that request — the
+/// authorization check, the state transition, the completion record — findable
+/// by the run id an operator was actually given.
+pub fn record_subject_run(session_id: &str) {
+    Span::current().record("session_id", session_id);
 }
 
 /// The span for work belonging to one run. Opened by the orchestrator, the

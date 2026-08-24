@@ -30,6 +30,7 @@ mod oauth;
 mod orchestrator;
 mod rbac;
 mod recipes;
+mod request_log;
 mod reseal;
 mod run_service;
 mod scheduler;
@@ -41,13 +42,16 @@ mod tokens;
 mod triggers;
 mod workers;
 
+/// This binary's identity in every log record's `service` field. A constant on
+/// purpose — see `fluidbox_obs::LogConfig::from_env`.
+const SERVICE_NAME: &str = "fluidbox-server";
+
 use axum::routing::{delete, get, patch, post};
 use axum::Router;
 use fluidbox_core::traits::ExecutionProvider;
 use state::{AppStateInner, ApprovalRegistry};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
 
 /// Select the execution backend from `FLUIDBOX_PROVIDER` (default `docker`).
 /// Dual-provider permanence (settled Q17): Docker and Kubernetes are co-equal
@@ -134,12 +138,29 @@ async fn main() -> anyhow::Result<()> {
     // has multiple rustls backends in-tree, so pick ring explicitly or the
     // Kubernetes client panics on first TLS use. No-op for the Docker path.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,fluidbox_server=debug,sqlx=warn".into()),
-        )
-        .init();
+    // Logging is the FIRST thing built, before configuration is even read: a
+    // config error is one of the things most worth logging, and until this line
+    // runs every diagnostic is lost. `LogConfig` reads its own environment
+    // (RUST_LOG stays authoritative when set) and refuses boot on a malformed
+    // value, like every other configuration surface here.
+    let log_cfg =
+        fluidbox_obs::LogConfig::from_env(SERVICE_NAME).map_err(|e| anyhow::anyhow!(e))?;
+    let log = fluidbox_obs::init(&log_cfg).map_err(|e| anyhow::anyhow!(e))?;
+    // The logging subsystem's own settings, in the log it governs. An operator
+    // debugging "why can I not see X" should not have to reconstruct the
+    // effective configuration from a deployment manifest.
+    tracing::info!(
+        format = ?log_cfg.format,
+        filter = %log_cfg.filter,
+        instance = %log_cfg.instance,
+        throttle_per_sec = log_cfg.throttle_per_sec,
+        max_field_bytes = log_cfg.limits.max_field_bytes,
+        max_line_bytes = log_cfg.limits.max_line_bytes,
+        version = %log_cfg.version,
+        "logging initialised (values are redacted by shape and by field name; \
+         there is no switch to disable that)"
+    );
+    workers::spawn_log_throttle_reporter(log.clone());
 
     let cfg = config::Config::from_env()?;
     std::fs::create_dir_all(&cfg.data_dir).ok();
@@ -648,12 +669,15 @@ async fn main() -> anyhow::Result<()> {
         // ANTHROPIC_BASE_URL=<control>/internal/llm.
         .route("/llm/{*rest}", post(facade::messages));
 
-    let trace_layer = || {
-        TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<axum::body::Body>| {
-            // Method + PATH only — never the query string: OAuth
-            // `code`/`state` and GitHub flow tokens ride queries.
-            tracing::debug_span!("http", method = %req.method(), path = %req.uri().path())
-        })
+    // One canonical record per request, on both planes (`request_log`). This
+    // replaces a `TraceLayer` whose `debug_span!` was disabled at the default
+    // filter — so it attached no fields to anything — and which emitted no
+    // completion record at all: there was no access log, no latency signal, and
+    // no way to attribute a slow endpoint. `plane` is baked in per listener
+    // because the two have different trust models and different expected
+    // traffic, and one filter should separate them.
+    let request_log = |plane: &'static str| {
+        axum::middleware::from_fn(move |req, next| request_log::layer(plane, req, next))
     };
 
     // Public listener (:8787) — /v1 + oauth + well-known. /internal rides it
@@ -670,7 +694,7 @@ async fn main() -> anyhow::Result<()> {
             // CIMD (spec 2025-11-25): this document's URL IS our OAuth
             // client_id; authorization servers fetch it — public by nature.
             .route("/.well-known/fluidbox-client.json", get(oauth::cimd_doc))
-            .layer(trace_layer())
+            .layer(request_log(fluidbox_obs::field::plane::PUBLIC))
             // NO CORS layer (Phase B): the dashboard is a same-origin proxy
             // (`/` → web, `/v1` → API, one origin), so cross-origin requests to
             // `/v1` are never legitimate and no `Access-Control-*` grant should
@@ -687,7 +711,7 @@ async fn main() -> anyhow::Result<()> {
     let internal_app = bounded(
         Router::new()
             .nest("/internal", internal)
-            .layer(trace_layer())
+            .layer(request_log(fluidbox_obs::field::plane::INTERNAL))
             .with_state(state.clone()),
         state.cfg.max_request_body_bytes,
     );
