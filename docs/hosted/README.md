@@ -15,6 +15,8 @@ These documents define the supported product boundary for the hosted, multi-user
 
 **Capacity.** [Run queue operations](run-queue-operations.md) — enabling capacity admission (`FLUIDBOX_MAX_CONCURRENT_RUNS`): the migrate → roll-every-replica → enable order and why it is not advisory, sizing the app cap against the namespace `ResourceQuota`, what each metric means, what callers see when the queue is full, and the drain-first rollback.
 
+**Observability.** [Logging and observability](observability.md) — the record schema and the fields that make it queryable, how to read one incident end to end (including the sandbox half), what logs will NEVER contain and why that is a tenancy decision rather than caution, every `FLUIDBOX_LOG_*` knob, and the `fluidbox_log_*` metrics that say whether the log you are reading is complete.
+
 **Authority.** These documents *state* settled decisions; they make none. The normative sources are:
 
 - [`../plans/2026-07-14-multi-user-mcp-control-plane-design.md`](../plans/2026-07-14-multi-user-mcp-control-plane-design.md) (v4) — the multi-user architecture, security invariants 1–22, Gaps 1–14, Phases A–F
