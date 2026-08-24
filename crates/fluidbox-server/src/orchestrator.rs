@@ -2033,6 +2033,7 @@ async fn requeue_capacity_denied(
     epoch: i64,
     detail: &str,
 ) -> anyhow::Result<()> {
+    state.metrics.queue_requeues.inc("capacity");
     if let Err(e) = fluidbox_db::revoke_session_tokens(&state.pool, scope, session_id).await {
         tracing::warn!("revoking tokens for bounced run {session_id} failed: {e}");
     }

@@ -1519,6 +1519,22 @@ pub async fn get_session(
         .ok_or(ApiError::NotFound)?;
     rbac::ensure_run_visible(&principal, &session)?;
     let totals = fluidbox_db::usage_totals(&state.pool, scope, id).await?;
+    // "Why is my run not running yet" — the per-run half of the queue's
+    // observability story (design 2026-08-23 §13). Attached ONLY while the run
+    // is actually queued: on any other status the number would be stale the
+    // instant it was read, and a field that is sometimes meaningful and
+    // sometimes not is worse than an absent one.
+    //
+    // `queued_at` needs nothing here — it is a `SessionRow` column and already
+    // serializes with the row.
+    if session.status == fluidbox_core::state::SessionStatus::Queued.as_str() {
+        let position = fluidbox_db::queued_position(&state.pool, scope, session.created_at).await?;
+        return Ok(Json(json!({
+            "session": session,
+            "usage": totals,
+            "queue_position": position,
+        })));
+    }
     Ok(Json(json!({ "session": session, "usage": totals })))
 }
 
