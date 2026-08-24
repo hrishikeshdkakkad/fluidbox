@@ -401,7 +401,29 @@ pub async fn release_authorized_grant(state: &AppState, scope: TenantScope, sess
         // active.
         Ok(Some(_)) => {
             state.metrics.network_grants.inc("active");
-            crate::orchestrator::spawn_run(state.clone(), session_id);
+            if state.cfg.queueing_enabled() {
+                // Authorization first, capacity second (design 2026-08-23
+                // §4.3): the released run takes a queue slot like any other.
+                // The alternative — letting an authorized run jump the queue —
+                // would make the cap waivable by grant type and produce real
+                // overshoot. The human latency has already been absorbed, and
+                // the wait clock (`queued_at`) only starts here, so nothing
+                // that waited on a person is charged for that wait.
+                //
+                // `run()`'s own grant gate still re-verifies authority at
+                // provision time however long the queue wait was — that check
+                // is deliberately independent of how the session got there.
+                crate::orchestrator::transition(
+                    state,
+                    scope,
+                    session_id,
+                    fluidbox_core::state::SessionStatus::Queued,
+                    Some("network grant authorized; waiting for a capacity slot"),
+                )
+                .await;
+            } else {
+                crate::orchestrator::spawn_run(state.clone(), session_id);
+            }
         }
         // Another replica won, or the grant is no longer pending.
         Ok(None) => {}

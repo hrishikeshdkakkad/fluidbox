@@ -10,6 +10,7 @@ mod config;
 mod connections;
 mod connectors;
 mod deliveries;
+mod dispatcher;
 mod egress;
 mod error;
 mod events;

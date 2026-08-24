@@ -13,7 +13,7 @@ use tokio::time::MissedTickBehavior;
 /// How many rows one tick of a periodic sweep may take. Each swept row costs at
 /// least one SERIAL follow-up write (a ledger append), so the batch — not the
 /// backlog — is what a tick's duration is sized against.
-const SWEEP_BATCH: i64 = 200;
+pub(crate) const SWEEP_BATCH: i64 = 200;
 
 /// How long after a run goes TERMINAL the deployment-wide GC may retire its
 /// leftover `mcp_upstream_sessions` rows (Phase F, Task 3).
@@ -39,7 +39,7 @@ const MCP_SESSION_GRACE_SECS: i64 = 900;
 /// "whatever is due NOW" — never work bound to a wall-clock slot — so nothing is
 /// lost by re-phasing, and `Skip` (which preserves the original phase) can still
 /// leave a fraction-of-a-period gap after a long tick.
-fn periodic(period: Duration) -> tokio::time::Interval {
+pub(crate) fn periodic(period: Duration) -> tokio::time::Interval {
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick
@@ -136,6 +136,10 @@ pub fn spawn_all(state: AppState) {
         tokio::spawn(archive_ttl_sweep(state.clone()));
     }
     tokio::spawn(reconcile_managed(state.clone()));
+    // Capacity admission (design 2026-08-23 §7). A no-op unless
+    // FLUIDBOX_MAX_CONCURRENT_RUNS is set, so an unconfigured deployment gains
+    // no worker and no polling.
+    crate::dispatcher::spawn(state.clone());
     tokio::spawn(finalize_worker(state));
 }
 
@@ -917,7 +921,24 @@ async fn network_grant_gate(state: AppState) {
             // never spawned. Re-spawn; `run()` performs the transition out of
             // the pause itself, and its own grant gate re-checks authority.
             if p.grant_status == "active" {
-                crate::orchestrator::spawn_run(state.clone(), p.session_id);
+                if state.cfg.queueing_enabled() {
+                    // Same enqueue as `release_authorized_grant`'s CAS-winner
+                    // arm. The transition CAS makes re-runs idempotent: a
+                    // session already `queued` has no `Queued → Queued` edge,
+                    // so it is refused and nothing duplicates. The scan
+                    // predicate keys on `awaiting_authorization`, so an
+                    // enqueued session leaves this worklist on its own.
+                    crate::orchestrator::transition(
+                        &state,
+                        scope,
+                        p.session_id,
+                        fluidbox_core::state::SessionStatus::Queued,
+                        Some("network grant authorized; waiting for a capacity slot"),
+                    )
+                    .await;
+                } else {
+                    crate::orchestrator::spawn_run(state.clone(), p.session_id);
+                }
                 continue;
             }
             // The grant was taken away while the run was parked — revoked by
