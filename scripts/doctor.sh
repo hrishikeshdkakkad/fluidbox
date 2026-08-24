@@ -473,6 +473,58 @@ else
   fi
 fi
 
+say "logging"
+# The logging knobs are checked the way the server checks them, for the same
+# reason the queue knobs are: a bad value FAILS BOOT, and learning that here
+# beats learning it from a container that will not start.
+l_format=$(env_get "$ENV" FLUIDBOX_LOG_FORMAT)
+l_level=$(env_get "$ENV" FLUIDBOX_LOG_LEVEL)
+l_throttle=$(env_get "$ENV" FLUIDBOX_LOG_THROTTLE_PER_SEC)
+l_field=$(env_get "$ENV" FLUIDBOX_LOG_MAX_FIELD_BYTES)
+l_line=$(env_get "$ENV" FLUIDBOX_LOG_MAX_LINE_BYTES)
+nonneg_int() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+
+case "$l_format" in
+  ""|auto) ok "log format: auto (text on a terminal, json off one)" ;;
+  json|text) ok "log format: $l_format" ;;
+  *) bad "FLUIDBOX_LOG_FORMAT='$l_format' is invalid" \
+        "known: json, text, auto. The server refuses to boot on anything else." ;;
+esac
+
+# RUST_LOG WINS when set, and an operator who set both and expects
+# FLUIDBOX_LOG_LEVEL to apply has a silently wrong mental model — which is
+# exactly the kind of thing that costs an hour mid-incident.
+if [ -n "${RUST_LOG:-}" ] && [ -n "$l_level" ]; then
+  warn "RUST_LOG is set in this shell AND FLUIDBOX_LOG_LEVEL is set in .env" \
+    "RUST_LOG wins; FLUIDBOX_LOG_LEVEL will have no effect. Unset one."
+fi
+
+for pair in "FLUIDBOX_LOG_THROTTLE_PER_SEC:$l_throttle" \
+            "FLUIDBOX_LOG_MAX_FIELD_BYTES:$l_field" \
+            "FLUIDBOX_LOG_MAX_LINE_BYTES:$l_line"; do
+  name=${pair%%:*}; val=${pair#*:}
+  if [ -n "$val" ] && ! nonneg_int "$val"; then
+    bad "$name='$val' is not a non-negative integer" "the server refuses to boot on it"
+  fi
+done
+
+# The two size ceilings have to be coherent with each other, or every record is
+# truncated — which the server also refuses at boot.
+if [ -n "$l_field" ] && [ -n "$l_line" ] && nonneg_int "$l_field" && nonneg_int "$l_line" \
+   && [ "$l_line" -lt "$l_field" ]; then
+  bad "FLUIDBOX_LOG_MAX_LINE_BYTES=$l_line is below FLUIDBOX_LOG_MAX_FIELD_BYTES=$l_field" \
+    "every record would be truncated; the server refuses to boot on this."
+fi
+if [ -n "$l_field" ] && nonneg_int "$l_field" && [ "$l_field" -lt 64 ]; then
+  bad "FLUIDBOX_LOG_MAX_FIELD_BYTES=$l_field is below the 64-byte floor" \
+    "a value that small truncates every field to its marker; the server refuses to boot."
+fi
+
+if [ "$l_throttle" = "0" ]; then
+  warn "FLUIDBOX_LOG_THROTTLE_PER_SEC=0 disables the per-callsite rate limiter" \
+    "a retry loop pointed at a persistent fault can then fill the disk. Nothing is lost with it ON — suppressions are counted and the callsites are named."
+fi
+
 say "control plane"
 if curl -fsS -m 2 "http://127.0.0.1:8787/v1/health" >/dev/null 2>&1; then
   ok "server responding on :8787 (note: just e2e needs this port free — stop just dev first)"
