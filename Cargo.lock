@@ -1660,6 +1660,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "cron",
+ "fluidbox-obs",
  "futures",
  "globset",
  "hex",
@@ -1708,6 +1709,18 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "fluidbox-obs"
+version = "0.8.0"
+dependencies = [
+ "chrono",
+ "regex",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
