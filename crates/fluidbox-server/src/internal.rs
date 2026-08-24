@@ -25,6 +25,7 @@ use fluidbox_db::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
+use tracing::Instrument as _;
 
 /// Outcome of the shared gate. `message` carries the deny reason (or the
 /// approval note) for the caller's wire shape.
@@ -199,9 +200,41 @@ async fn decide_tool_call(
     tool: &str,
     input: &Value,
 ) -> ApiResult<GateDecision> {
-    let mut decision = gate_tool_call(state, session, run_spec, tool_call_id, tool, input).await?;
-    decision.input_digest = digest_json(input);
-    Ok(decision)
+    // A span, not a record. The VERDICT is already logged — canonically, once,
+    // from the ledger funnel — and duplicating it here would put two statements
+    // of one fact in the stream. What the span adds is context for everything
+    // the gate emits on the way to that verdict: a binding recheck that failed,
+    // a schema compilation error, a database timeout. Without it those records
+    // say "recheck failed" with no way to tell which tool call they belong to.
+    let span = fluidbox_obs::span::gate(tool, tool_call_id);
+    let sw = fluidbox_obs::Stopwatch::start();
+    let result = async {
+        let mut decision =
+            gate_tool_call(state, session, run_spec, tool_call_id, tool, input).await?;
+        decision.input_digest = digest_json(input);
+        Ok(decision)
+    }
+    .instrument(span.clone())
+    .await;
+    // The gate's own LATENCY is the one thing the ledger's decision event does
+    // not carry, and it is a real production question: this path does schema
+    // validation, a binding recheck, and up to three database round-trips
+    // before a model turn can continue. DEBUG because it is a profiling
+    // signal — the verdict itself is at the level its consequence deserves.
+    let _g = span.enter();
+    match &result {
+        Ok(d) => tracing::debug!(
+            duration_ms = sw.ms_f64(),
+            allowed = d.allowed,
+            "gate decided"
+        ),
+        Err(e) => tracing::warn!(
+            duration_ms = sw.ms_f64(),
+            error = %e,
+            "gate could not decide — the call is refused rather than guessed at"
+        ),
+    }
+    result
 }
 
 /// The heart of the system: one decision per tool call, made server-side
