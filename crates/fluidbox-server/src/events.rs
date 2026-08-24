@@ -20,6 +20,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use fluidbox_core::spec::{InvocationContext, InvocationKind};
+use fluidbox_obs::field::error_kind as EK;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -87,7 +88,7 @@ pub async fn ingress(
     let verified = match connectors::verify(connector, &headers, &body, &secret) {
         Ok(v) => v,
         Err(reason) => {
-            tracing::warn!("ingress {connection_id}: rejected delivery: {reason}");
+            tracing::warn!(connection_id = %connection_id, reason = %reason, error_kind = EK::UNAUTHENTICATED, "webhook delivery rejected");
             return Err(ApiError::Unauthorized);
         }
     };
@@ -230,9 +231,10 @@ pub(crate) async fn process_delivery(
                 .await
                 .ok();
                 tracing::warn!(
-                    "dispatch {} for delivery {}: shed at the queue depth bound",
-                    sub.id,
-                    delivery.id
+                    subscription_id = %sub.id,
+                    delivery_id = %delivery.id,
+                    error_kind = EK::CAPACITY,
+                    "event fan-out shed at the queue depth bound"
                 );
                 skipped.push(json!({ "subscription_id": sub.id, "reason": "capacity" }));
             }
@@ -249,7 +251,7 @@ pub(crate) async fn process_delivery(
                 )
                 .await
                 .ok();
-                tracing::warn!("dispatch {} for delivery {}: {msg}", sub.id, delivery.id);
+                tracing::warn!(subscription_id = %sub.id, delivery_id = %delivery.id, error = %msg, "event fan-out dispatch failed");
                 skipped
                     .push(json!({ "subscription_id": sub.id, "reason": format!("error: {msg}") }));
             }

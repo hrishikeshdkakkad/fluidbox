@@ -900,7 +900,10 @@ pub async fn add_custom(
         Err(e) => {
             if let Err(del) = fluidbox_db::delete_catalog_entry(&state.pool, scope, &slug).await {
                 tracing::warn!(
-                    "BYO connect for '{slug}' failed ({e}); entry rollback also failed: {del}"
+                    connector = %slug,
+                    error = %e,
+                    rollback_error = %del,
+                    "catalog connect failed AND its rollback failed — a partial entry may remain"
                 );
             }
             Err(e)

@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::from_env()?;
     std::fs::create_dir_all(&cfg.data_dir).ok();
 
-    tracing::info!("connecting to database…");
+    tracing::info!("connecting to the database");
     // Phase F: the pool is SIZED, not defaulted. The deployment-wide connection
     // count is `replicas × (max_connections + 2)` — the +2 being the two
     // `PgListener` connections below, which live outside the pool — and it is that
@@ -176,19 +176,21 @@ async fn main() -> anyhow::Result<()> {
     {
         let p = cfg.db_pool;
         tracing::info!(
-            "database pool: max {} connections (min {}), acquire timeout {}s, idle {}s, recycle {}s \
-             — deployment total is replicas × (max + 2 listeners)",
-            p.max_connections,
-            p.min_connections,
-            p.acquire_timeout_secs,
-            p.idle_timeout_secs,
-            p.max_lifetime_secs
+            pool_max = p.max_connections,
+            pool_min = p.min_connections,
+            acquire_timeout_secs = p.acquire_timeout_secs,
+            idle_timeout_secs = p.idle_timeout_secs,
+            max_lifetime_secs = p.max_lifetime_secs,
+            "database pool sized — the DEPLOYMENT total is replicas × (pool_max + 2 listeners), \
+             and it is that figure, not this one, that has to fit the database's own ceiling"
         );
     }
     if let Some(role) = &cfg.runtime_role {
         tracing::info!(
-            "app pool runs under non-owner role '{role}' (RLS role split enabled; posture verified: \
-             NOLOGIN, no SUPERUSER/BYPASSRLS, no inherited or foreign memberships)"
+            runtime_role = %role,
+            rls = "role_split",
+            "app pool runs under a non-owner role (posture verified: NOLOGIN, no \
+             SUPERUSER/BYPASSRLS, no inherited or foreign memberships)"
         );
     }
     // Review M2: RLS is defence-in-depth ONLY if PostgreSQL actually evaluates the
@@ -198,7 +200,11 @@ async fn main() -> anyhow::Result<()> {
     // (after any `after_connect SET ROLE`), and in multi-user mode make it fatal:
     // an unnoticed missing `tenant_id` predicate must be contained, not served.
     match fluidbox_db::pool_role_bypasses_rls(&pool).await? {
-        None => tracing::info!("row-level security is ENFORCED for this pool (its role has neither SUPERUSER nor BYPASSRLS)"),
+        None => tracing::info!(
+            rls = "enforced",
+            "row-level security is ENFORCED for this pool (its role has neither SUPERUSER nor \
+             BYPASSRLS)"
+        ),
         Some(user) if cfg.require_sso && !cfg.allow_rls_bypass => anyhow::bail!(
             "REFUSING TO BOOT: FLUIDBOX_REQUIRE_SSO=1 (multi-user) but the database role this pool \
              runs as ('{user}') is SUPERUSER or has BYPASSRLS, so PostgreSQL SKIPS every \
@@ -212,18 +218,22 @@ async fn main() -> anyhow::Result<()> {
              FLUIDBOX_ALLOW_RLS_BYPASS=1 to accept this."
         ),
         Some(user) if cfg.require_sso => tracing::warn!(
-            "FLUIDBOX_ALLOW_RLS_BYPASS=1: pool role '{user}' bypasses RLS, so migration 0018's \
+            db_role = %user,
+            rls = "bypassed_opt_in",
+            "FLUIDBOX_ALLOW_RLS_BYPASS=1: this pool role bypasses RLS, so migration 0018's \
              policies are INERT and tenant isolation rests on the query predicates alone — \
              acceptable for local single-user operation only"
         ),
         Some(user) => tracing::warn!(
-            "pool role '{user}' is SUPERUSER or has BYPASSRLS, so migration 0018's RLS policies \
-             are skipped by PostgreSQL (single-user mode, tolerated). Set FLUIDBOX_RUNTIME_ROLE \
-             before enabling FLUIDBOX_REQUIRE_SSO=1, or boot will refuse."
+            db_role = %user,
+            rls = "skipped",
+            "this pool role is SUPERUSER or has BYPASSRLS, so migration 0018's RLS policies are \
+             skipped by PostgreSQL (single-user mode, tolerated). Set FLUIDBOX_RUNTIME_ROLE \
+             before enabling FLUIDBOX_REQUIRE_SSO=1, or boot will refuse"
         ),
     }
 
-    tracing::info!("seeding…");
+    tracing::info!("seeding the default tenant, agent and policies");
     // The curated seed agent rides the harness registry like any other
     // agent — the harness id and its defaults have exactly one home.
     let seed = fluidbox_db::seed::run(
@@ -254,12 +264,18 @@ async fn main() -> anyhow::Result<()> {
                         .next()
                         .unwrap_or("8788")
                         .to_string();
-                    let host = if ip.contains(':') { format!("[{ip}]") } else { ip };
+                    let host = if ip.contains(':') {
+                        format!("[{ip}]")
+                    } else {
+                        ip
+                    };
                     cfg.public_control_url = format!("http://{host}:{port}");
-                    tracing::info!("resolved internal control URL: {}", cfg.public_control_url);
+                    tracing::info!(control_url = %cfg.public_control_url, "resolved the internal control URL");
                 }
                 _ => tracing::warn!(
-                    "could not resolve internal Service {svc} ClusterIP; runner control URL may need DNS"
+                    service = %svc,
+                    "could not resolve the internal Service ClusterIP; the runner control URL may \
+                     need DNS"
                 ),
             }
         }
@@ -268,11 +284,13 @@ async fn main() -> anyhow::Result<()> {
     let provider = build_provider(&cfg).await?;
     if let Err(e) = provider.healthcheck().await {
         tracing::warn!(
-            "provider '{}' health probe failed ({e}); sandboxes will not launch until it is reachable",
-            provider.runtime_name()
+            provider = %provider.runtime_name(),
+            error = %e,
+            error_kind = fluidbox_obs::field::error_kind::PROVIDER,
+            "provider health probe failed; sandboxes will not launch until it is reachable"
         );
     } else {
-        tracing::info!("execution provider: {}", provider.runtime_name());
+        tracing::info!(provider = %provider.runtime_name(), "execution provider selected");
     }
 
     // Run admission. Saying this at boot matters for the SAME reason the
@@ -283,14 +301,17 @@ async fn main() -> anyhow::Result<()> {
     // byte-identical to before the feature existed.
     match &cfg.queue {
         Some(q) => tracing::info!(
-            "run admission: ENABLED — cap {} concurrent, queue depth {}, max wait {}s,              {} capacity retries. On Kubernetes keep the cap at or below the namespace              quota's `pods` tier so the quota stays a backstop.",
-            q.max_concurrent_runs,
-            q.max_depth,
-            q.max_wait_secs,
-            q.requeue_max
+            queueing = true,
+            max_concurrent_runs = q.max_concurrent_runs,
+            max_depth = q.max_depth,
+            max_wait_secs = q.max_wait_secs,
+            requeue_max = q.requeue_max,
+            "run admission ENABLED. On Kubernetes keep max_concurrent_runs at or below the \
+             namespace quota's `pods` tier so the quota stays a backstop"
         ),
         None => tracing::info!(
-            "run admission: off (FLUIDBOX_MAX_CONCURRENT_RUNS unset) — runs launch on creation"
+            queueing = false,
+            "run admission off (FLUIDBOX_MAX_CONCURRENT_RUNS unset) — runs launch on creation"
         ),
     }
 
@@ -303,15 +324,16 @@ async fn main() -> anyhow::Result<()> {
     let enforcer = provider.network_enforcer();
     if enforcer.supports_egress_grants() {
         tracing::info!(
-            "sandbox network grants: enforcer '{}' (requested: {})",
-            enforcer.enforcer_name(),
-            cfg.network_enforcer.as_str()
+            enforcer = %enforcer.enforcer_name(),
+            requested = %cfg.network_enforcer.as_str(),
+            "sandbox network grants: enforcer resolved"
         );
     } else {
         tracing::info!(
-            "sandbox network grants: NO enforcer resolved (requested: {}) — runs are \
-             offline-only and any wider grant is refused at create time",
-            cfg.network_enforcer.as_str()
+            enforcer = "none",
+            requested = %cfg.network_enforcer.as_str(),
+            "sandbox network grants: NO enforcer resolved — runs are offline-only and any wider \
+             grant is refused at create time"
         );
     }
 
@@ -337,28 +359,41 @@ async fn main() -> anyhow::Result<()> {
     seal::check_retirement_gates(&cfg, &pool, sealer.as_ref(), seed.tenant_id).await?;
     match (&sealer, cfg.kms_mode) {
         (None, _) => tracing::warn!(
-            "credential sealing disabled (no FLUIDBOX_CREDENTIAL_KEY, KMS off) — integration connections are disabled"
+            sealing = "disabled",
+            "credential sealing disabled (no FLUIDBOX_CREDENTIAL_KEY, KMS off) — integration \
+             connections are disabled"
         ),
         (Some(_), config::KmsMode::Off) => {
-            tracing::info!("credential sealing: legacy key (FLUIDBOX_KMS_MODE=off)")
+            tracing::info!(
+                sealing = "legacy_key",
+                "credential sealing: legacy key (FLUIDBOX_KMS_MODE=off)"
+            )
         }
-        (Some(_), mode) => tracing::info!("credential sealing: KMS envelope ({mode:?})"),
+        (Some(_), mode) => {
+            tracing::info!(sealing = "kms_envelope", kms_mode = ?mode, "credential sealing: KMS envelope")
+        }
     }
     // Phase D (#32) LLM upstream-auth mode. In tenant mode the facade selects a
     // per-tenant LiteLLM virtual key and the master key is confined to
     // provisioning; shared mode presents the deployment key on every call.
     match cfg.llm_key_mode {
         config::LlmKeyMode::Shared => tracing::info!(
-            "LLM upstream auth: shared key (FLUIDBOX_LLM_KEY_MODE=shared)"
+            llm_key_mode = "shared",
+            "LLM upstream auth: one shared deployment key"
         ),
         config::LlmKeyMode::Tenant => tracing::info!(
-            "LLM upstream auth: per-tenant virtual keys (FLUIDBOX_LLM_KEY_MODE=tenant); master key confined to provisioning at {}",
-            cfg.llm_admin_url
+            llm_key_mode = "tenant",
+            admin_url = %fluidbox_obs::url_for_log(&cfg.llm_admin_url),
+            "LLM upstream auth: per-tenant virtual keys; the master key is confined to provisioning"
         ),
     }
     if cfg.require_sso && cfg.llm_key_mode == config::LlmKeyMode::Shared {
         tracing::warn!(
-            "FLUIDBOX_REQUIRE_SSO=1 with FLUIDBOX_LLM_KEY_MODE=shared — the facade will refuse every model request (tenant_llm_keys_required); set FLUIDBOX_LLM_KEY_MODE=tenant for hosted deployments"
+            llm_key_mode = "shared",
+            require_sso = true,
+            "FLUIDBOX_REQUIRE_SSO=1 with FLUIDBOX_LLM_KEY_MODE=shared — the facade will refuse \
+             EVERY model request (tenant_llm_keys_required); set FLUIDBOX_LLM_KEY_MODE=tenant for \
+             hosted deployments"
         );
     }
 
@@ -376,9 +411,14 @@ async fn main() -> anyhow::Result<()> {
     {
         let l = governor.limits();
         tracing::info!(
-            "outbound egress governor: {}/min per tenant, {}/min per connection, {}/min per host; breaker {} consecutive transport failures ⇒ open {}s (0 = disabled). Durable cross-replica tier: {} (host_global stays per-replica)",
-            l.tenant_per_min, l.connection_per_min, l.host_per_min, l.breaker_threshold, l.breaker_open_secs,
-            if cfg.egress_durable { "ON" } else { "OFF (per-replica only)" }
+            tenant_per_min = l.tenant_per_min,
+            connection_per_min = l.connection_per_min,
+            host_per_min = l.host_per_min,
+            breaker_threshold = l.breaker_threshold,
+            breaker_open_secs = l.breaker_open_secs,
+            durable_tier = cfg.egress_durable,
+            "outbound egress governor configured (0 disables a dimension; host_global stays \
+             per-replica even with the durable tier on)"
         );
     }
 
@@ -729,30 +769,38 @@ async fn main() -> anyhow::Result<()> {
             .route("/metrics", get(metrics::metrics_endpoint))
             .with_state(state.clone());
         tracing::warn!(
-            "fluidbox metrics listening on http://{metrics_addr}/metrics (UNAUTHENTICATED — \
-             FLUIDBOX_METRICS_BIND must reach a private interface only)"
+            bind = %metrics_addr,
+            plane = fluidbox_obs::field::plane::METRICS,
+            "metrics listener bound UNAUTHENTICATED — FLUIDBOX_METRICS_BIND must reach a private \
+             interface only"
         );
         tokio::spawn(async move {
             if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
-                tracing::error!("metrics listener exited: {e}");
+                tracing::error!(error = %e, plane = fluidbox_obs::field::plane::METRICS, "metrics listener exited");
             }
         });
     }
 
-    tracing::info!("fluidbox public  listening on http://{}", state.cfg.bind);
     tracing::info!(
-        "fluidbox internal listening on http://{} (/internal only)",
-        state.cfg.internal_bind
+        bind = %state.cfg.bind,
+        plane = fluidbox_obs::field::plane::PUBLIC,
+        "listening"
+    );
+    tracing::info!(
+        bind = %state.cfg.internal_bind,
+        plane = fluidbox_obs::field::plane::INTERNAL,
+        "listening (/internal only)"
     );
     // Gap 6 (Phase F): say which mode is live at boot. A security control whose
     // state can only be learned by reading the deployment's env is a control
     // nobody knows the state of; `off` is the default and is announced as loudly
     // as the other two, so "we turned that on months ago" is checkable.
     tracing::info!(
-        "workload identity on the internal gateway: {} (FLUIDBOX_WORKLOAD_IDENTITY)",
-        state.cfg.workload_identity.as_str()
+        workload_identity = %state.cfg.workload_identity.as_str(),
+        "workload identity mode on the internal gateway (a security control whose state is \
+         otherwise only learnable by reading the deployment's environment)"
     );
-    tracing::info!("default agent: {}", seed.default_agent);
+    tracing::info!(agent = %seed.default_agent, "default agent seeded");
 
     // Serve both planes; if either listener falls over, the process exits.
     // `ConnectInfo::<SocketAddr>` is wired on BOTH planes so handlers extract the
