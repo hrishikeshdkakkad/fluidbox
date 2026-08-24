@@ -24,9 +24,21 @@
 //!     restart-recoverable finalize
 //!     driver, the managed-sandbox reconciler, and the delivery worker
 //!     ([`claim_due_deliveries`] — Phase E: the scan now STAMPS a per-row claim
-//!     under `for update skip locked` so replicas take disjoint sets) each act on
-//!     ids/status across ALL tenants by construction (a global scan), then scope
-//!     every mutation to the `tenant_id` of the row they just fetched.
+//!     under `for update skip locked` so replicas take disjoint sets), and the
+//!     capacity dispatcher's four ([`dispatch_claim`] — the SERIALIZED
+//!     admission decision: advisory try-lock, deployment-wide occupancy count,
+//!     and a lease-stamping `for update skip locked` claim in ONE transaction;
+//!     [`count_queued_sessions`] — the depth backstop the create path checks;
+//!     [`expired_queued_sessions`] — runs past the configured maximum wait;
+//!     [`orphaned_created_sessions`] — `created` rows nothing is driving, which
+//!     heals both the park crash window and the pre-existing orphan class) each
+//!     act on ids/status across ALL tenants by construction (a global scan),
+//!     then scope every mutation to the `tenant_id` of the row they just
+//!     fetched. The capacity queue is DEPLOYMENT-WIDE on purpose: a per-tenant
+//!     count could not answer "is the deployment at its cap", which is the only
+//!     question admission asks (design 2026-08-23, run admission section 7.2).
+//!     Per-tenant fairness is stage 2 and slots into the same claim query
+//!     without restructuring it.
 //!
 //! (b) **Credential-verification bootstrap resolvers for UNAUTHENTICATED
 //!     ingress/callbacks.** Webhook ingress (HMAC via [`get_connection`]),
@@ -731,6 +743,230 @@ pub async fn claim_due_deliveries(
     .bind(owner)
     .bind(limit)
     .bind(ttl_secs.max(1) as f64)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+// ─── Run admission & queueing (design 2026-08-23 §7; category (a)) ─────────
+
+/// The single-purpose advisory key the dispatch decision serializes on
+/// ("fluidbxq" in ASCII). Nothing else takes it, and nothing takes it AFTER a
+/// `sessions` row lock — the dispatcher's order is advisory-lock → sessions
+/// rows, and it never touches approvals, execution claims, or LLM reservations
+/// — so it cannot participate in a cycle with the `approvals → sessions` or
+/// `sessions → claims/reservations` orders (invariant 7).
+///
+/// The other two advisory keys in this crate ([`crate::registration_lock_key`],
+/// [`crate::oauth_lock_key`]) are DERIVED from data (a sha256 prefix, a uuid
+/// prefix); this one is a constant, so it can only collide by an astronomically
+/// unlikely coincidence with one of those digests. A collision would cost a
+/// yielded tick, not a correctness failure.
+pub const DISPATCH_ADVISORY_KEY: i64 = 0x666c_7569_6462_7871;
+
+/// One run the dispatcher just claimed. `queued_at` feeds the wait histogram;
+/// `dispatch_attempts` is what the requeue path bounds against.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ClaimedRun {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub queued_at: Option<DateTime<Utc>>,
+    pub dispatch_attempts: i32,
+}
+
+/// What one dispatch tick decided. `active` and `leased_queued` are the
+/// occupancy the headroom was computed from — returned so the caller can log or
+/// gauge the decision it actually made rather than re-deriving it.
+#[derive(Debug, Clone)]
+pub struct DispatchOutcome {
+    pub active: i64,
+    pub leased_queued: i64,
+    pub claimed: Vec<ClaimedRun>,
+}
+
+/// ONE dispatch tick: serialize, count, admit — all inside a single
+/// transaction (design §7.2, §7.3).
+///
+/// `Ok(None)` means another replica holds the dispatch lock at this instant.
+/// The lock is a `try` variant on purpose: replicas never queue behind each
+/// other, a losing tick simply yields and re-polls, and the winner's work
+/// covers the deployment.
+///
+/// **Why an advisory lock here when [`crate::acquire_session_lease`]'s
+/// doc-comment rejects them.** That rejection is about session-LIFETIME leases:
+/// an advisory lock held for a run's life pins a pool connection, dies
+/// invisibly on reconnect or Neon scale-to-zero, and is unobservable. This is
+/// the other category — a transaction-scoped mutex held for single-digit
+/// milliseconds that self-releases at commit, the same category as the DCR
+/// singleflight lock this crate already ships.
+///
+/// **Why the count is derived rather than kept in a counter row.** A count
+/// taken from the very rows that hold the state cannot drift: there is no
+/// release bookkeeping to miss on any terminal path and no reconciliation
+/// sweeper to write. Occupancy only GROWS through this serialized section and
+/// only SHRINKS through terminal transitions, so a stale-high count
+/// under-admits for one tick (self-correcting) and a stale-low count is
+/// impossible. Overshoot past the cap is therefore structurally impossible; the
+/// cost is at most ~1 s of transient under-admission.
+///
+/// **The `leased_queued` filter is load-bearing.** A claimed row is still
+/// `status = 'queued'` — `run()` remains the single writer of
+/// `queued → provisioning` — so without counting live-leased queued rows as
+/// occupied, the very next tick would admit the same run again. A claimant that
+/// crashes leaves a leased row whose lease expires in `lease_ttl_secs`, at which
+/// point it re-enters the claim predicate: reclaim by machinery that already
+/// exists.
+///
+/// FIFO is `order by created_at`, which `for update skip locked` makes NEAR-FIFO
+/// (Postgres may reorder around contended rows). That is accepted and disclosed;
+/// strict FIFO is unobtainable from SKIP LOCKED and is not required.
+pub async fn dispatch_claim(
+    pool: &PgPool,
+    cap: i64,
+    batch: i64,
+    owner: Uuid,
+    lease_ttl_secs: i64,
+) -> sqlx::Result<Option<DispatchOutcome>> {
+    let mut tx = crate::worker_tx(pool).await?;
+
+    let (locked,): (bool,) = sqlx::query_as("select pg_try_advisory_xact_lock($1)")
+        .bind(DISPATCH_ADVISORY_KEY)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !locked {
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    // `awaiting_authorization` holds no sandbox and is excluded; `cancelling`
+    // and `finalizing` still hold one until reaped and are conservatively
+    // included.
+    let (active, leased_queued): (i64, i64) = sqlx::query_as(
+        "select
+           count(*) filter (where status in
+               ('created','provisioning','initializing','running',
+                'awaiting_approval','cancelling','finalizing'))                as active,
+           count(*) filter (where status = 'queued'
+                and orchestrator_lease_until is not null
+                and orchestrator_lease_until >= now())                          as leased_queued
+         from sessions
+         where status in ('created','provisioning','initializing','running',
+                          'awaiting_approval','cancelling','finalizing','queued')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let headroom = cap - active - leased_queued;
+    if headroom <= 0 {
+        tx.commit().await?;
+        return Ok(Some(DispatchOutcome {
+            active,
+            leased_queued,
+            claimed: Vec::new(),
+        }));
+    }
+
+    // No status write: `run()` stays the single writer of queued →
+    // provisioning. It re-acquires this same lease as the same owner (no epoch
+    // bump) and then transitions under the fence.
+    let claimed: Vec<ClaimedRun> = sqlx::query_as(
+        "with picks as (
+             select id from sessions
+              where status = 'queued'
+                and (dispatch_after is null or dispatch_after <= now())
+                and (orchestrator_owner_id is null
+                     or orchestrator_lease_until is null
+                     or orchestrator_lease_until < now())
+              order by created_at
+              limit $1
+              for update skip locked
+         )
+         update sessions s set
+            orchestrator_owner_id    = $2,
+            orchestrator_lease_until = now() + make_interval(secs => $3),
+            orchestrator_epoch       = s.orchestrator_epoch
+                + case when s.orchestrator_owner_id is distinct from $2 then 1 else 0 end,
+            dispatch_attempts        = s.dispatch_attempts + 1,
+            updated_at               = now()
+          from picks
+         where s.id = picks.id
+         returning s.id, s.tenant_id, s.queued_at, s.dispatch_attempts",
+    )
+    .bind(headroom.min(batch))
+    .bind(owner)
+    .bind(lease_ttl_secs.max(1) as f64)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(DispatchOutcome {
+        active,
+        leased_queued,
+        claimed,
+    }))
+}
+
+/// Deployment-wide queue depth — the backstop the create path checks before
+/// accepting more work. Deliberately cross-tenant: the depth bound protects the
+/// deployment, not a tenant.
+pub async fn count_queued_sessions(pool: &PgPool) -> sqlx::Result<i64> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let (n,): (i64,) = sqlx::query_as("select count(*) from sessions where status = 'queued'")
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// Runs that have waited longer than the configured maximum. The anchor is
+/// `queued_at`, never `created_at`: a run may lawfully have spent days in
+/// `awaiting_authorization` first, and the wait clock starts when it becomes
+/// dispatchable. Because `queued_at` is coalesce-stamped, the bound measures
+/// TOTAL time in queue across capacity bounces.
+pub async fn expired_queued_sessions(
+    pool: &PgPool,
+    max_wait_secs: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<SessionRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "select * from sessions
+          where status = 'queued'
+            and queued_at is not null
+            and queued_at < now() - make_interval(secs => $1)
+          order by queued_at
+          limit $2",
+    )
+    .bind(max_wait_secs.max(0) as f64)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// `created` rows nothing is driving — the park crash window (a replica that
+/// died between the create commit and the post-commit park) and the
+/// pre-existing orphan class (a run whose replica died before it launched,
+/// today only swept to `failed` after 30 minutes). The live-lease predicate is
+/// what keeps this off rows a healthy `run()` is currently driving.
+pub async fn orphaned_created_sessions(
+    pool: &PgPool,
+    older_than_secs: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<SessionRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let out = sqlx::query_as(
+        "select * from sessions
+          where status = 'created'
+            and created_at < now() - make_interval(secs => $1)
+            and (orchestrator_lease_until is null or orchestrator_lease_until < now())
+          order by created_at
+          limit $2",
+    )
+    .bind(older_than_secs.max(0) as f64)
+    .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
