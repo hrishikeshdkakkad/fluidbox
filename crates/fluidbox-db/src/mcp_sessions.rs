@@ -287,6 +287,9 @@ mod tests {
             // see it — and it never has an upstream MCP session to retire
             // anyway, because no sandbox and no broker call exist yet.
             AwaitingAuthorization,
+            // The capacity park, same reasoning: pre-provisioning, not
+            // terminal, and no upstream MCP session can exist yet.
+            Queued,
             Provisioning,
             Initializing,
             Running,
@@ -302,6 +305,7 @@ mod tests {
             match s {
                 Created
                 | AwaitingAuthorization
+                | Queued
                 | Provisioning
                 | Initializing
                 | Running
