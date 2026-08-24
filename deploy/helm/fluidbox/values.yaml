@@ -170,6 +170,39 @@ server:
   # distinguish another process in the same pod, a node-level attacker, or a
   # fabric that permits source-address spoofing. mTLS is the stronger follow-up.
   workloadIdentity: ""
+  # ── Run admission & queueing (design docs/plans/2026-08-23-run-queue-
+  # admission-design.md). "" = OFF, and off is byte-identical to before the
+  # feature existed: runs launch on creation and nothing is queued.
+  #
+  # Setting maxConcurrentRuns turns the app cap into the WAITING ROOM and leaves
+  # sandbox.quota below as the BACKSTOP. Keep it at or BELOW quota.pods: the
+  # quota counts pods the app cannot see (other workloads sharing the namespace,
+  # a stuck terminating pod), so a cap above it means the quota fires first and
+  # every over-cap run takes the slower bounce-and-retry path instead of simply
+  # waiting its turn.
+  #
+  # ROLLOUT ORDER MATTERS (the 0028 discipline): apply the migration, roll the
+  # new image to EVERY replica, and only then set this. A binary that predates
+  # the `queued` status reads a parked run as terminal. See
+  # docs/hosted/run-queue-operations.md.
+  maxConcurrentRuns: ""
+  # Depth backstop before new work is SHED rather than queued ("" = 4 × the cap,
+  # floor 50). Interactive callers get 429 + Retry-After; webhook and schedule
+  # firings get a recorded skip and a 2xx, deliberately never a 5xx that would
+  # invite redelivery amplification.
+  queueMaxDepth: ""
+  # How long a run may wait before it fails with an explained reason ("" = 3600).
+  # Measured from FIRST enqueue, so it bounds total time in queue across capacity
+  # bounces — and a run that sat in `awaiting_authorization` waiting on a human
+  # is not charged for that wait.
+  queueMaxWaitSecs: ""
+  # Provider capacity refusals (a quota 403) tolerated before a run fails with an
+  # explained reason ("" = 5). With the 30→300s backoff, five spans ~13 minutes
+  # of sustained external quota pressure.
+  queueRequeueMax: ""
+  # NOTE: the three knobs above are DEAD CONFIG without maxConcurrentRuns, and
+  # the server REFUSES TO BOOT rather than ignore them.
+  #
   # Archive PVC (survives Recreate upgrades so init can still pull). Rendered ONLY
   # for the node-local "" | "fs" archive store; archiveStore "s3" mounts nothing
   # local, so these fields are unused there.
@@ -253,14 +286,28 @@ sandbox:
   # BYTES, default 2Gi) PLUS the unpacked staging tree PLUS the baseline
   # during init — size it for archive + ~2× the unpacked workspace.
   volumeSizeLimit: 10Gi
-  # Namespace ResourceQuota. This is the ONLY admission gate on concurrent runs —
-  # there is deliberately no application-side counter (an earlier revision of this
-  # comment claimed one; it never existed). The quota is enforced by the API server
-  # for every replica at once and cannot be bypassed by any code path, which an
-  # in-process counter could not match; the price is that it counts PODS, not runs,
-  # and it REJECTS rather than queues: once `pods` is reached, pod creation returns
-  # 403 and the run FAILS at provisioning (it is not held and retried). Size the
-  # tier you actually want rather than relying on the quota as a waiting room.
+  # Namespace ResourceQuota — the BACKSTOP, not the waiting room.
+  #
+  # SET BOTH: server.maxConcurrentRuns above is the app-level cap that holds
+  # runs in a queue, and this quota is the substrate limit that catches what the
+  # app cannot see. They answer different questions and neither replaces the
+  # other:
+  #
+  #   * The quota is enforced by the API server for every replica at once and
+  #     cannot be bypassed by any code path — which is exactly why it also
+  #     counts pods fluidbox did not create (another workload in the namespace,
+  #     a pod stuck terminating). It counts PODS, not runs.
+  #   * The app cap counts RUNS and can HOLD them: over the cap, a run waits in
+  #     `queued` and is admitted FIFO. Over the quota, the API server returns
+  #     403 — which the control plane now classifies as capacity pressure and
+  #     re-parks with backoff (it no longer fails the run), but that is the
+  #     slower path and it exists for the pods the app cannot see.
+  #
+  # So keep maxConcurrentRuns <= pods. A cap ABOVE the quota means the quota
+  # fires first and every over-cap run takes the bounce-and-retry path instead
+  # of simply waiting its turn. With maxConcurrentRuns unset, the quota is
+  # again the only gate and a 403 still re-parks nothing — size the tier you
+  # actually want.
   #
   # requestsCpu / requestsMemory must be kept CONSISTENT with pods and with
   # sandbox.resources.requests above — the quota counts REQUESTS, so the three are
