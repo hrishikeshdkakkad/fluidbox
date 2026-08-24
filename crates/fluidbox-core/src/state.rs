@@ -151,11 +151,34 @@ impl SessionStatus {
                 | (Created, Queued)
                 | (AwaitingAuthorization, Queued)
                 | (Queued, Provisioning)
-                // The one backward edge besides `AwaitingApproval → Running`:
-                // the substrate refused for capacity (a namespace quota 403),
-                // which means the run is healthy and the world is full, so it
-                // re-parks with backoff instead of failing (design §7.4).
+                // The capacity-bounce back-edges: the substrate refused for
+                // capacity (a namespace quota 403), which means the run is
+                // healthy and the world is full, so it re-parks with backoff
+                // instead of failing (design §7.4).
+                //
+                // TWO source states, and `Initializing` is the one that
+                // actually fires. The design's state diagram said
+                // `provisioning → queued`, but `run()` transitions to
+                // `initializing` BEFORE it materializes the workspace and
+                // calls `provision()` — so a capacity denial is raised while
+                // the session reads `initializing`. With only the
+                // `Provisioning` edge the re-park was refused and the run
+                // stranded in `initializing` with revoked tokens until the
+                // stale-launch watchdog reaped it (found by the hermetic queue
+                // e2e; unit tests could not see it because every piece was
+                // individually correct).
+                //
+                // `Provisioning` is KEPT even though nothing reaches it today:
+                // `run()` can bail between the two transitions, and a capacity
+                // denial must never strand a run, so a future reordering of the
+                // launch sequence must not silently reintroduce that bug.
+                //
+                // Neither edge can leak a sandbox. Both are reachable ONLY from
+                // the requeue path, which runs when `provision` returned an
+                // ERROR — so no sandbox exists to leave behind. Nothing else
+                // may use them.
                 | (Provisioning, Queued)
+                | (Initializing, Queued)
                 | (Provisioning, Initializing)
                 | (Initializing, Running)
                 | (Running, AwaitingApproval)
@@ -317,9 +340,18 @@ mod tests {
         // The ONE backward edge besides AwaitingApproval->Running: a provider
         // CapacityDenied re-parks the run (design 2026-08-23 section 7.4).
         assert!(Provisioning.can_transition_to(Queued));
-        // No other state may re-enter the queue.
+        // `Initializing` re-parks too, and it is the edge that actually
+        // fires: `run()` enters `initializing` BEFORE it materializes the
+        // workspace and calls `provision()`, so a capacity denial is raised
+        // while the session reads `initializing`, not `provisioning`. The
+        // design's diagram had this wrong and the hermetic queue e2e caught
+        // it — without this edge a bounced run is stranded in `initializing`
+        // with revoked tokens until the stale-launch watchdog reaps it.
+        assert!(Initializing.can_transition_to(Queued));
+        // A run whose agent is live has a sandbox: re-parking it would leak
+        // one, so there is no edge back from here.
         assert!(!Running.can_transition_to(Queued));
-        assert!(!Initializing.can_transition_to(Queued));
+        assert!(!AwaitingApproval.can_transition_to(Queued));
         // Parked = no sandbox, no tokens, no work.
         assert!(!Queued.accepts_work());
         assert!(!Queued.is_terminal());
