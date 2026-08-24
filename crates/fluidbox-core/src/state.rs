@@ -27,6 +27,14 @@ pub enum SessionStatus {
     /// No sandbox, no runner, no tokens — nothing to reap, and nothing that
     /// can spend. The approval TTL is its only reaper.
     AwaitingAuthorization,
+    /// Frozen, parked, and waiting for a capacity slot (run admission, design
+    /// 2026-08-23). No sandbox, no runner, no tokens — nothing to reap, and
+    /// nothing that can spend. The dispatcher admits it; the queue-age sweeper
+    /// is its only reaper. Deliberately its own variant rather than a reuse of
+    /// `awaiting_authorization`: the two parks COMPOSE (a run can need a human
+    /// authorization and *then* a capacity slot), and one variant cannot
+    /// express both.
+    Queued,
     Provisioning,
     Initializing,
     Running,
@@ -44,6 +52,7 @@ impl SessionStatus {
         match self {
             Self::Created => "created",
             Self::AwaitingAuthorization => "awaiting_authorization",
+            Self::Queued => "queued",
             Self::Provisioning => "provisioning",
             Self::Initializing => "initializing",
             Self::Running => "running",
@@ -61,6 +70,7 @@ impl SessionStatus {
         Some(match s {
             "created" => Self::Created,
             "awaiting_authorization" => Self::AwaitingAuthorization,
+            "queued" => Self::Queued,
             "provisioning" => Self::Provisioning,
             "initializing" => Self::Initializing,
             "running" => Self::Running,
@@ -107,6 +117,10 @@ impl SessionStatus {
             // Parked before provisioning: no runner exists to do work, and no
             // token has been minted that could ask for any.
             AwaitingAuthorization => false,
+            // Parked before provisioning for CAPACITY: same posture as the
+            // authorization park — no runner has been launched and no token
+            // minted, so there is nothing that could ask to do work.
+            Queued => false,
             Cancelling | Finalizing => false,
             Completed | Failed | Cancelled | BudgetExceeded => false,
         }
@@ -127,6 +141,21 @@ impl SessionStatus {
                 // never be skipped.
                 | (Created, AwaitingAuthorization)
                 | (AwaitingAuthorization, Provisioning)
+                // The pre-provisioning CAPACITY park (design 2026-08-23 §7).
+                // Authorization comes first and capacity second, so a run that
+                // waited days on a human does not also burn its queue-age
+                // budget while waiting. Like the authorization pause there is
+                // deliberately no `(Queued, Running)` / `(Queued,
+                // Initializing)` edge — a dispatched run provisions like any
+                // other, so init can never be skipped.
+                | (Created, Queued)
+                | (AwaitingAuthorization, Queued)
+                | (Queued, Provisioning)
+                // The one backward edge besides `AwaitingApproval → Running`:
+                // the substrate refused for capacity (a namespace quota 403),
+                // which means the run is healthy and the world is full, so it
+                // re-parks with backoff instead of failing (design §7.4).
+                | (Provisioning, Queued)
                 | (Provisioning, Initializing)
                 | (Initializing, Running)
                 | (Running, AwaitingApproval)
@@ -139,6 +168,7 @@ impl SessionStatus {
                 | (
                     Created
                         | AwaitingAuthorization
+                        | Queued
                         | Provisioning
                         | Initializing
                         | Running
@@ -163,9 +193,10 @@ impl SessionStatus {
 mod tests {
     use super::SessionStatus::{self, *};
 
-    const ACTIVE: [SessionStatus; 6] = [
+    const ACTIVE: [SessionStatus; 7] = [
         Created,
         AwaitingAuthorization,
+        Queued,
         Provisioning,
         Initializing,
         Running,
@@ -241,13 +272,14 @@ mod tests {
             assert!(!s.can_transition_to(AwaitingApproval));
         }
         // "Active" and "accepts work" were once the same set. They are not
-        // any more: `awaiting_authorization` is active (it is neither terminal
-        // nor winding down, so the sweepers and concurrency counters correctly
-        // treat it as a live run) yet accepts NO work, because it is parked
-        // before any sandbox or token exists. Everything else still coincides.
+        // any more: the two PRE-SANDBOX parks — `awaiting_authorization` and
+        // `queued` — are active (neither terminal nor winding down, so the
+        // sweepers and concurrency counters correctly treat them as live runs)
+        // yet accept NO work, because they are parked before any sandbox or
+        // token exists. Everything else still coincides.
         for s in ACTIVE {
-            if s == AwaitingAuthorization {
-                assert!(!s.accepts_work());
+            if matches!(s, AwaitingAuthorization | Queued) {
+                assert!(!s.accepts_work(), "{s:?} is parked pre-sandbox");
                 continue;
             }
             assert!(s.accepts_work());
@@ -270,6 +302,31 @@ mod tests {
         // A released grant provisions like any other run.
         assert!(Created.can_transition_to(AwaitingAuthorization));
         assert!(AwaitingAuthorization.can_transition_to(Provisioning));
+        // The capacity park is the same shape: dispatch provisions, it never
+        // jumps the init phase.
+        assert!(!Queued.can_transition_to(Running));
+        assert!(!Queued.can_transition_to(Initializing));
+    }
+
+    #[test]
+    fn queued_parks_before_provisioning() {
+        // The capacity park mirrors the authorization park: in, through, and out.
+        assert!(Created.can_transition_to(Queued));
+        assert!(AwaitingAuthorization.can_transition_to(Queued)); // authorization-then-capacity
+        assert!(Queued.can_transition_to(Provisioning));
+        // The ONE backward edge besides AwaitingApproval->Running: a provider
+        // CapacityDenied re-parks the run (design 2026-08-23 section 7.4).
+        assert!(Provisioning.can_transition_to(Queued));
+        // No other state may re-enter the queue.
+        assert!(!Running.can_transition_to(Queued));
+        assert!(!Initializing.can_transition_to(Queued));
+        // Parked = no sandbox, no tokens, no work.
+        assert!(!Queued.accepts_work());
+        assert!(!Queued.is_terminal());
+        assert!(!Queued.is_winding_down());
+        // It can always be wound down: cancel or the queue-age sweeper.
+        assert!(Queued.can_transition_to(Cancelling));
+        assert!(Queued.can_transition_to(Finalizing));
     }
 
     #[test]
@@ -290,6 +347,7 @@ mod tests {
         for s in [
             Created,
             AwaitingAuthorization,
+            Queued,
             Provisioning,
             Initializing,
             Running,
