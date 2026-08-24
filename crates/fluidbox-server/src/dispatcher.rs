@@ -96,11 +96,22 @@ async fn dispatch_loop(state: AppState) {
 /// driver lease), and the adoption transition is CAS-guarded by
 /// `can_transition_to`, so a row that left `created` meanwhile is simply
 /// refused.
+///
+/// Idempotent is not the same as SINGLE, though, and the expiry arm needs both.
+/// `fail` appends a `RunError` to the ledger and this loop increments the shed
+/// counter BEFORE the finalization intent picks its winner, so an unclaimed
+/// scan — which hands every replica the same rows — would produce one
+/// expiration with N audit events and N counter increments. The rows are
+/// therefore CLAIMED (`claim_expired_queued_sessions`, which stamps the
+/// existing driver lease), making this replica the only one that sees them
+/// until the lease lapses.
 async fn sweep(state: &AppState, q: &crate::config::QueueCfg) {
-    match fluidbox_db::system_worker::expired_queued_sessions(
+    match fluidbox_db::system_worker::claim_expired_queued_sessions(
         &state.pool,
         q.max_wait_secs,
         crate::workers::SWEEP_BATCH,
+        crate::orchestrator::replica_id(),
+        crate::orchestrator::SESSION_LEASE_TTL_SECS,
     )
     .await
     {
@@ -112,7 +123,8 @@ async fn sweep(state: &AppState, q: &crate::config::QueueCfg) {
                     q.max_wait_secs
                 );
                 state.metrics.queue_shed.inc("age");
-                // A DbError start is retried by the next sweep.
+                // A DbError start leaves the claim to lapse; the next sweep
+                // re-claims the row and retries.
                 let _ = crate::orchestrator::fail(
                     state,
                     s.id,
@@ -202,5 +214,22 @@ mod tests {
         // The expiry arm records an INTENT; it never terminalises a session
         // itself and never touches a sandbox.
         assert!(src.contains(concat!("orchestrator::", "fail(")));
+
+        // …and it must act only on rows it CLAIMED, for the same reason the
+        // dispatch arm must: `fail` appends a ledger event and this loop bumps
+        // a counter before the intent's single-winner CAS runs, so an unclaimed
+        // scan would multiply both by the replica count.
+        let claim_expiry = concat!("claim_expired_", "queued_sessions(");
+        assert!(
+            src.contains(claim_expiry),
+            "the expiry arm must claim its rows, not scan them"
+        );
+        assert!(
+            src.find(claim_expiry).expect("the claim exists")
+                < src
+                    .find(concat!("queue_shed.", "inc(\"age\")"))
+                    .expect("the shed counter"),
+            "the claim must precede the side effects it makes single"
+        );
     }
 }

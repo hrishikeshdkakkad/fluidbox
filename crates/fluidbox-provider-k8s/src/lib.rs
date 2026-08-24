@@ -18,8 +18,8 @@
 
 use async_trait::async_trait;
 use fluidbox_core::traits::{
-    CollectContext, CollectedArtifact, CollectedArtifacts, ExecutionProvider, ProviderError,
-    SandboxHandle, SandboxSpec, SandboxStatus, WorkspaceTransport,
+    CapacityKind, CollectContext, CollectedArtifact, CollectedArtifacts, ExecutionProvider,
+    ProviderError, SandboxHandle, SandboxSpec, SandboxStatus, WorkspaceTransport,
 };
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::api::{Api, AttachParams, DeleteParams, ListParams, Preconditions, PropagationPolicy};
@@ -282,6 +282,13 @@ fn map_err(e: impl std::fmt::Display) -> ProviderError {
 /// as capacity would bounce the run against a permission wall it can never get
 /// past until the attempt cap expires it.
 ///
+/// The two capacity cases are kept APART in the returned [`CapacityKind`], not
+/// merged into one "capacity" fact: a quota rejection is an operator action
+/// item (raise the tier, or lower `FLUIDBOX_MAX_CONCURRENT_RUNS`) and a
+/// throttle is not. This is the only place that can tell them apart — the
+/// distinction exists in a Kubernetes status code and nowhere else — so it is
+/// captured here rather than re-derived from the message downstream.
+///
 /// Only the POD create is classified. The quota counts pods, so a Secret or
 /// NetworkPolicy create failing is a different problem and keeps the generic
 /// mapping.
@@ -289,8 +296,17 @@ fn classify_create_err(e: kube::Error) -> ProviderError {
     if let kube::Error::Api(ref ae) = e {
         let quota =
             ae.code == 403 && ae.reason == "Forbidden" && ae.message.contains("exceeded quota");
-        if quota || ae.code == 429 {
-            return ProviderError::CapacityDenied(ae.message.clone());
+        if quota {
+            return ProviderError::CapacityDenied {
+                kind: CapacityKind::Quota,
+                detail: ae.message.clone(),
+            };
+        }
+        if ae.code == 429 {
+            return ProviderError::CapacityDenied {
+                kind: CapacityKind::Throttle,
+                detail: ae.message.clone(),
+            };
         }
     }
     map_err(e)
@@ -1078,13 +1094,22 @@ mod tests {
         );
         assert!(matches!(
             classify_create_err(quota),
-            ProviderError::CapacityDenied(_)
+            ProviderError::CapacityDenied {
+                kind: CapacityKind::Quota,
+                ..
+            }
         ));
 
+        // …and a throttle is capacity too, but a DIFFERENT kind: the operator
+        // metric keys on it, and telling an operator to raise a quota that is
+        // not firing is the failure this split exists to prevent.
         let throttle = api(429, "TooManyRequests", "too many requests");
         assert!(matches!(
             classify_create_err(throttle),
-            ProviderError::CapacityDenied(_)
+            ProviderError::CapacityDenied {
+                kind: CapacityKind::Throttle,
+                ..
+            }
         ));
 
         // An RBAC 403 is NOT capacity — it must stay terminal, or the run
@@ -1115,7 +1140,7 @@ mod tests {
         // The verbatim substrate message rides the variant — it is what the
         // ledger's status_reason shows the operator (the Kueue practice of
         // preserving the exact blocker).
-        let ProviderError::CapacityDenied(detail) = classify_create_err(api(
+        let ProviderError::CapacityDenied { kind, detail } = classify_create_err(api(
             403,
             "Forbidden",
             "exceeded quota: fluidbox-sandboxes, limited: pods=20",
@@ -1123,6 +1148,7 @@ mod tests {
             panic!("expected CapacityDenied");
         };
         assert!(detail.contains("fluidbox-sandboxes"));
+        assert_eq!(kind.as_str(), "quota", "the metric label rides the kind");
     }
 
     fn pod_with(runner: Option<ContainerState>, inits: Vec<ContainerStatus>) -> Pod {

@@ -70,6 +70,26 @@ trap teardown EXIT
 # ── preflight ──────────────────────────────────────────────────────────────
 say "preflight"
 docker info >/dev/null 2>&1 || { no "docker daemon not running"; exit 1; }
+
+# Make the docker CLI and the control plane talk to the SAME daemon, before the
+# first image operation. They resolve it differently: the CLI honours `docker
+# context` (colima, OrbStack and Docker Desktop each install one), while the
+# server's client is bollard, which reads DOCKER_HOST and otherwise falls back
+# to /var/run/docker.sock — it does not know contexts exist. On a machine whose
+# active context is not the default socket, every check below would pass against
+# one daemon while the server provisioned against another (or against nothing).
+# Resolving once and EXPORTING is what `scripts/demo.sh` does, for the same
+# reason; the launch block passes it through explicitly, because `env -i` there
+# inherits nothing.
+if [ -z "${DOCKER_HOST:-}" ]; then
+  DOCKER_CTX=$(docker context show 2>/dev/null || echo default)
+  DOCKER_EP=$(docker context inspect "$DOCKER_CTX" \
+                --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+  [ -n "$DOCKER_EP" ] && export DOCKER_HOST="$DOCKER_EP"
+fi
+docker info >/dev/null 2>&1 \
+  && ok "docker endpoint: ${DOCKER_HOST:-default socket} (server and CLI agree)" \
+  || { no "the resolved docker endpoint is not reachable: ${DOCKER_HOST:-default socket}"; exit 1; }
 for p in "$PORT" "$INTERNAL_PORT" "$DB_PORT"; do
   if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
     no "port $p is already in use — set FLUIDBOX_QUEUE_LIVE_{PORT,INTERNAL_PORT,DB_PORT}"
@@ -103,32 +123,64 @@ ok "isolated Postgres healthy on 127.0.0.1:$DB_PORT"
 TOKEN=$(python3 -c "import secrets;print(secrets.token_hex(32))")
 H="authorization: Bearer $TOKEN"
 
-# Explicit environment for the same reason demo.sh is explicit: `just e2e` has
-# already loaded .env, so every load-bearing knob is overridden here and the
-# multi-user / KMS / RLS knobs are cleared for a single-admin posture.
+# The server must see EXACTLY the environment below and NOTHING else. The
+# `env -u <list>` this replaced could not deliver that, and failed silently in
+# two ways:
+#
+#   1. The server calls `dotenvy::dotenv()`, which searches its working
+#      directory and then EVERY PARENT for a `.env`. Under the normal `just e2e`
+#      invocation (cwd = the repository root) it therefore found the repository
+#      `.env` and re-populated every variable `env -u` had just removed —
+#      dotenvy skips variables that are already set, so the only ones it filled
+#      in were precisely the ones this phase had cleared on purpose. The
+#      "isolated, zero-key" server could boot with SSO, KMS and real
+#      credentials.
+#   2. Anything not NAMED in the list was inherited outright.
+#      `FLUIDBOX_PROVIDER` is the sharpest case: a maintainer whose `.env` sets
+#      `kubernetes` ran this Docker phase against a cluster.
+#
+# Both halves are needed, so both are here: `env -i` starts from nothing and
+# allowlists what a replay-tier server genuinely uses (PATH and HOME for the git
+# subprocess, TMPDIR, and the resolved docker endpoint), and the server runs
+# from a directory holding an EMPTY `.env`, which terminates dotenvy's parent
+# walk at the first file it finds. Neither alone is sufficient — `env -i` does
+# not stop the file walk, and the empty `.env` does not stop inheritance.
 #
 # FLUIDBOX_BIND is 0.0.0.0, NOT loopback: sandboxes reach the control plane via
 # host.docker.internal, which resolves to the host's gateway IP — a 127.0.0.1
 # bind is unreachable from inside a container. (The hermetic suite CAN use
 # loopback precisely because its null provider starts no container.)
-env -u FLUIDBOX_REQUIRE_SSO -u FLUIDBOX_RUNTIME_ROLE -u FLUIDBOX_KMS_MODE \
-    -u FLUIDBOX_LLM_KEY_MODE -u FLUIDBOX_METRICS_BIND -u FLUIDBOX_ALLOW_RLS_BYPASS \
-    -u FLUIDBOX_CREDENTIAL_KEY -u ANTHROPIC_API_KEY -u FLUIDBOX_GITHUB_API_URL \
-    -u FLUIDBOX_EGRESS_PROXY \
-  DATABASE_URL="postgres://fluidbox:fluidbox@127.0.0.1:$DB_PORT/fluidbox" \
-  FLUIDBOX_ADMIN_TOKEN="$TOKEN" \
-  FLUIDBOX_BIND="0.0.0.0:$PORT" \
-  FLUIDBOX_INTERNAL_BIND="127.0.0.1:$INTERNAL_PORT" \
-  FLUIDBOX_PUBLIC_CONTROL_URL="http://host.docker.internal:$PORT" \
-  FLUIDBOX_DATA_DIR="$WORK/data" \
-  FLUIDBOX_SANDBOX_IMAGE="$REPLAY_IMAGE" \
-  FLUIDBOX_MAX_CONCURRENT_RUNS=1 \
-  FLUIDBOX_QUEUE_MAX_DEPTH=2 \
-  FLUIDBOX_QUEUE_MAX_WAIT_SECS=3600 \
-  LITELLM_MASTER_KEY="queue-live-unused-no-model-calls" \
-  LLM_UPSTREAM_URL="http://127.0.0.1:9" \
-  RUST_LOG="${RUST_LOG:-info}" \
-  "$ROOT/target/debug/fluidbox-server" > "$WORK/server.log" 2>&1 &
+RUNDIR="$WORK/run"
+mkdir -p "$RUNDIR"
+: > "$RUNDIR/.env"
+
+SERVER_ENV=(
+  PATH="$PATH"
+  HOME="$HOME"
+  TMPDIR="${TMPDIR:-/tmp}"
+  DATABASE_URL="postgres://fluidbox:fluidbox@127.0.0.1:$DB_PORT/fluidbox"
+  FLUIDBOX_ADMIN_TOKEN="$TOKEN"
+  FLUIDBOX_BIND="0.0.0.0:$PORT"
+  FLUIDBOX_INTERNAL_BIND="127.0.0.1:$INTERNAL_PORT"
+  FLUIDBOX_PUBLIC_CONTROL_URL="http://host.docker.internal:$PORT"
+  FLUIDBOX_DATA_DIR="$WORK/data"
+  # Named EXPLICITLY rather than left to the default: this phase asserts a real
+  # Docker container appears, so the provider must not be inheritable.
+  FLUIDBOX_PROVIDER=docker
+  FLUIDBOX_SANDBOX_IMAGE="$REPLAY_IMAGE"
+  FLUIDBOX_MAX_CONCURRENT_RUNS=1
+  FLUIDBOX_QUEUE_MAX_DEPTH=2
+  FLUIDBOX_QUEUE_MAX_WAIT_SECS=3600
+  LITELLM_MASTER_KEY="queue-live-unused-no-model-calls"
+  LLM_UPSTREAM_URL="http://127.0.0.1:9"
+  RUST_LOG="${RUST_LOG:-info}"
+)
+[ -n "${DOCKER_HOST:-}" ] && SERVER_ENV+=(DOCKER_HOST="$DOCKER_HOST")
+[ -n "${LANG:-}" ] && SERVER_ENV+=(LANG="$LANG")
+[ -n "${RUST_BACKTRACE:-}" ] && SERVER_ENV+=(RUST_BACKTRACE="$RUST_BACKTRACE")
+
+( cd "$RUNDIR" && exec env -i "${SERVER_ENV[@]}" \
+    "$ROOT/target/debug/fluidbox-server" ) > "$WORK/server.log" 2>&1 &
 echo $! > "$WORK/server.pid"
 
 HEALTHY=""
@@ -141,6 +193,13 @@ done
 grep -q "run admission: ENABLED" "$WORK/server.log" \
   && ok "control plane up with admission enabled (cap 1, depth 2)" \
   || no "boot did not announce admission"
+# Assert the isolation rather than trusting it: the provider is the variable
+# this phase would be silently wrong about if the repository `.env` leaked back
+# in (a kubernetes provider would make every container assertion below fail for
+# an unrelated reason, or pass against a cluster nobody meant to touch).
+grep -qE "execution provider: docker|provider 'docker'" "$WORK/server.log" \
+  && ok "…on the docker provider (the repository .env did not leak in)" \
+  || no "the server did not boot on the docker provider — see $WORK/server.log"
 
 new_run() { # task -> session_id (also recorded, for teardown)
   curl -s -X POST -H "$H" -H 'content-type: application/json' \
@@ -161,6 +220,14 @@ await_status() { # id, regex, seconds
   status_of "$1"; return 1
 }
 sandbox_for() { docker ps -aq --filter "label=fluidbox.session=$1" 2>/dev/null | head -1; }
+await_sandbox() { # id, seconds
+  local deadline=$(( $(date +%s) + $2 )) c
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    c=$(sandbox_for "$1"); [ -n "$c" ] && { echo "$c"; return 0; }
+    sleep 1
+  done
+  sandbox_for "$1"; return 1
+}
 
 # ── L1 ─────────────────────────────────────────────────────────────────────
 say "L1 — cap 1 through REAL provisioning"
@@ -171,13 +238,22 @@ C=$(new_run "live queue C")
   && ok "three runs created" \
   || { no "create failed: $(cat "$WORK/last.json")"; exit 1; }
 
+# What counts as LAUNCHED. `awaiting_approval` belongs in the set: the replay
+# runner's transcript reaches `./deploy.sh`, which the policy gates on a human,
+# and on a warm daemon it can get there before the first poll. That state proves
+# MORE than `running` does — a container started, the runner attached, and a
+# tool call crossed the permission gate — but the old regex excluded it, so the
+# phase waited out the full timeout and reported a false L1/L4 failure whenever
+# Docker happened to be fast.
+LAUNCHED='^(initializing|running|awaiting_approval)$'
+
 # 180s: a real image start on a cold daemon is slow, and this phase is about
 # admission, not about how fast Docker is.
-SA=$(await_status "$A" '^(initializing|running)$' 180)
-[[ "$SA" =~ ^(initializing|running)$ ]] \
+SA=$(await_status "$A" "$LAUNCHED" 180)
+[[ "$SA" =~ $LAUNCHED ]] \
   && ok "A launched through real Docker provisioning (status $SA)" \
   || no "A never launched (status $SA)"
-[ -n "$(sandbox_for "$A")" ] \
+[ -n "$(await_sandbox "$A" 60)" ] \
   && ok "A has a REAL sandbox container" || no "A has no container"
 
 [ "$(status_of "$B")" = queued ] && ok "B is parked in 'queued'" || no "B: $(status_of "$B")"
@@ -214,10 +290,10 @@ SC=$(await_status "$C" '^(cancelled|failed|finalizing|cancelling)$' 60)
 # ── L4 ─────────────────────────────────────────────────────────────────────
 say "L4 — FIFO release through real provisioning"
 curl -s -o /dev/null -X POST -H "$H" "$API/v1/sessions/$A/cancel"
-SB=$(await_status "$B" '^(initializing|running)$' 180)
-[[ "$SB" =~ ^(initializing|running)$ ]] \
+SB=$(await_status "$B" "$LAUNCHED" 180)
+[[ "$SB" =~ $LAUNCHED ]] \
   && ok "freeing the slot dispatched B (status $SB)" || no "B never dispatched (status $SB)"
-[ -n "$(sandbox_for "$B")" ] \
+[ -n "$(await_sandbox "$B" 60)" ] \
   && ok "…with its own real sandbox container" || no "B has no container"
 curl -s -o /dev/null -X POST -H "$H" "$API/v1/sessions/$B/cancel"
 

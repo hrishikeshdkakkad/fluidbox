@@ -380,17 +380,59 @@ pub enum ProviderError {
     /// workload failure, so the orchestrator re-parks the run with backoff
     /// instead of failing it (run admission design 2026-08-23, section 7.4).
     ///
-    /// Carries the VERBATIM substrate message: it rides `status_reason` into
-    /// the ledger's `StatusChanged` event, so an operator reading the timeline
-    /// sees the exact blocker ("exceeded quota: fluidbox-sandboxes, limited:
-    /// pods=20") rather than a paraphrase.
+    /// `detail` is the VERBATIM substrate message: it rides `status_reason`
+    /// into the ledger's `StatusChanged` event, so an operator reading the
+    /// timeline sees the exact blocker ("exceeded quota: fluidbox-sandboxes,
+    /// limited: pods=20") rather than a paraphrase.
+    ///
+    /// `kind` is the same fact made MACHINE-readable — see [`CapacityKind`] for
+    /// why the distinction is carried as a type rather than re-derived from
+    /// `detail` downstream.
     ///
     /// Classification is deliberately NARROW — an RBAC 403 and an
     /// admission-webhook 403 look similar and are NOT capacity; bouncing on
     /// them would retry against a wall until the attempt cap. Everything a
     /// provider does not positively recognize stays `Other`, i.e. terminal.
-    #[error("provider capacity denied: {0}")]
-    CapacityDenied(String),
+    #[error("provider capacity denied ({kind}): {detail}")]
+    CapacityDenied { kind: CapacityKind, detail: String },
+}
+
+/// WHY the substrate refused, for the one consumer that needs to tell the two
+/// apart: the operator metric (`fluidbox_queue_requeues_total{reason}`, design
+/// section 13's `reason=quota|throttle`). The two have OPPOSITE remedies —
+/// a quota rejection means "raise the tier or lower the run cap", a throttle
+/// means "wait, this clears itself" — so a single merged label sends an
+/// operator to adjust a quota that is not firing.
+///
+/// It is a TYPE, not a substring test on `detail`, because the alternative is
+/// the control plane learning to read Kubernetes strings: provider-specific
+/// knowledge stays behind the provider boundary (the same rule that keeps
+/// provider names out of `events.rs` and `run_service.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityKind {
+    /// A configured admission ceiling is full — a namespace `ResourceQuota`.
+    /// Sustained non-zero is an operator action item.
+    Quota,
+    /// The substrate's own control plane is shedding load — an apiserver 429.
+    /// Expected under burst and self-clearing; not a quota signal.
+    Throttle,
+}
+
+impl CapacityKind {
+    /// The metric label. Fixed strings, so the counter's label set stays the
+    /// bounded one the registry's cardinality doctrine requires.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            Self::Throttle => "throttle",
+        }
+    }
+}
+
+impl std::fmt::Display for CapacityKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // NOTE: there is deliberately no `Harness` trait. A harness is a runner
