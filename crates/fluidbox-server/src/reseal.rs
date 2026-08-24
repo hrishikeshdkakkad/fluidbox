@@ -43,6 +43,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use fluidbox_db::identity::{self, AuditEntry};
+use fluidbox_obs::field::error_kind as EK;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -690,7 +691,7 @@ async fn audit(
     )
     .await
     {
-        tracing::warn!("re-seal audit '{action}' insert failed: {e}");
+        tracing::warn!(action = %action, error = %e, error_kind = EK::DB, "re-seal audit insert failed");
     }
 }
 
