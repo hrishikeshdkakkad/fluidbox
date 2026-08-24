@@ -21,6 +21,12 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
+import { createLogger } from "./log.mjs";
+
+// The shims are SEPARATE PROCESSES from the runner, so they log under their own
+// target — otherwise their records are indistinguishable from the harness's in
+// a collector, and "which process refused" is the question being asked.
+const log = createLogger({ target: "gate-shim" });
 import {
   audienceMismatchDiagnostic,
   isWrongAudienceRefusal,
@@ -30,7 +36,7 @@ import {
 function requireEnv(k) {
   const v = process.env[k];
   if (!v) {
-    console.error(`fluidbox-gate-shim: missing required env ${k}`);
+    log.error("missing required env", { env_var: k });
     process.exit(2);
   }
   return v;
@@ -74,7 +80,7 @@ async function gate(toolName, args) {
     if (isWrongAudienceRefusal(res.status, text)) {
       // Gap 10 fatal (same treatment as the runner contract): abort loudly
       // rather than gate-deny every sandbox tool for the rest of the run.
-      console.error(audienceMismatchDiagnostic(`${SERVER_NAME} permission preflight`));
+      log.error(audienceMismatchDiagnostic(`${SERVER_NAME} permission preflight`), { where: "permission preflight" });
       process.exit(EXIT_AUDIENCE_MISMATCH);
     }
     const body = (() => {
