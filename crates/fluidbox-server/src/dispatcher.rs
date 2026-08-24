@@ -19,6 +19,7 @@
 use crate::state::AppState;
 use fluidbox_core::state::SessionStatus;
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use std::time::Duration;
 
 /// Ticks between sweep passes (age expiry + orphan adoption): ~15 s at a 1 s
@@ -66,21 +67,37 @@ async fn dispatch_loop(state: AppState) {
                     // Observed at the CLAIM, which is the moment the wait
                     // actually ends — not at `running`, which would fold
                     // provisioning latency into the queue's number.
-                    if let Some(t) = run.queued_at {
+                    let waited_ms = run.queued_at.map(|t| {
                         let waited = (chrono::Utc::now() - t).num_milliseconds().max(0);
                         state
                             .metrics
                             .queue_wait_seconds
                             .observe(waited as f64 / 1000.0);
-                    }
+                        waited
+                    });
                     state.metrics.queue_dispatched.inc();
+                    // The queue-wait histogram answers "how long are runs
+                    // waiting"; this answers "how long did THIS run wait", which
+                    // is the question a user asks about their own run and which
+                    // a histogram can never answer. It is also the only record
+                    // of an admission — the run's `queued → provisioning`
+                    // transition is logged from the ledger, but the WAIT it ends
+                    // is not on that event.
+                    tracing::info!(
+                        session_id = %run.id,
+                        wait_ms = waited_ms,
+                        worker = "dispatcher",
+                        "run admitted from the queue"
+                    );
                     crate::orchestrator::spawn_run(state.clone(), run.id);
                 }
             }
             // Another replica holds the dispatch lock this instant; its work
             // covers the deployment and this tick has nothing to add.
             Ok(None) => {}
-            Err(e) => tracing::warn!("dispatch tick failed: {e}"),
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "dispatcher", "dispatch tick failed")
+            }
         }
         if n.is_multiple_of(SWEEP_EVERY_TICKS) {
             sweep(&state, &q).await;
@@ -118,9 +135,11 @@ async fn sweep(state: &AppState, q: &crate::config::QueueCfg) {
         Ok(expired) => {
             for s in expired {
                 tracing::warn!(
-                    "queue: {} waited longer than {}s — failing",
-                    s.id,
-                    q.max_wait_secs
+                    session_id = %s.id,
+                    max_wait_secs = q.max_wait_secs,
+                    error_kind = EK::CAPACITY,
+                    worker = "queue_expiry",
+                    "run waited past the queue-age bound — failing it"
                 );
                 state.metrics.queue_shed.inc("age");
                 // A DbError start leaves the claim to lapse; the next sweep
@@ -134,7 +153,9 @@ async fn sweep(state: &AppState, q: &crate::config::QueueCfg) {
                 .await;
             }
         }
-        Err(e) => tracing::warn!("queue expiry scan failed: {e}"),
+        Err(e) => {
+            tracing::warn!(error = %e, error_kind = EK::DB, worker = "queue_expiry", "scan failed")
+        }
     }
 
     match fluidbox_db::system_worker::orphaned_created_sessions(
@@ -157,7 +178,9 @@ async fn sweep(state: &AppState, q: &crate::config::QueueCfg) {
                 .await;
             }
         }
-        Err(e) => tracing::warn!("orphan adoption scan failed: {e}"),
+        Err(e) => {
+            tracing::warn!(error = %e, error_kind = EK::DB, worker = "queue_adoption", "orphan adoption scan failed")
+        }
     }
 }
 

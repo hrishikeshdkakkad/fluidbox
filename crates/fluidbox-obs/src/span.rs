@@ -156,8 +156,26 @@ pub fn record_subject_run(session_id: &str) {
 /// The span for work belonging to one run. Opened by the orchestrator, the
 /// workers, and the internal-plane handlers so that every record about a run —
 /// from any plane, on any task — carries its ids.
-pub fn run(session_id: &str, tenant_id: &str) -> Span {
-    tracing::info_span!(RUN, session_id = session_id, tenant_id = tenant_id)
+///
+/// `tenant_id` is optional because the orchestrator is spawned with a bare
+/// session id and learns the tenant one query later; it is declared Empty and
+/// filled by [`record_tenant`] at that point, so records emitted in between
+/// still carry the run. Callers that already know both pass `Some` and are done.
+pub fn run(session_id: &str, tenant_id: Option<&str>) -> Span {
+    let span = tracing::info_span!(
+        RUN,
+        session_id = session_id,
+        tenant_id = tracing::field::Empty
+    );
+    if let Some(t) = tenant_id {
+        span.record("tenant_id", t);
+    }
+    span
+}
+
+/// Fill in the tenant on an enclosing span that was opened without one.
+pub fn record_tenant(tenant_id: &str) {
+    Span::current().record("tenant_id", tenant_id);
 }
 
 /// The span for one background worker tick, so a sweeper's records are
