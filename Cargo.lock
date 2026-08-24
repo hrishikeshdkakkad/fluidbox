@@ -1794,6 +1794,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hmac 0.13.0",
+ "http-body 1.0.1",
  "jsonwebtoken",
  "openidconnect",
  "reqwest",

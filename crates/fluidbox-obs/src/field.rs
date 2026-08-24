@@ -68,6 +68,9 @@ pub const BINDING_ID: &str = "binding_id";
 pub const APPROVAL_ID: &str = "approval_id";
 pub const TOOL_CALL_ID: &str = "tool_call_id";
 pub const SCHEDULE_ID: &str = "schedule_id";
+/// Deterministic schedule-fire id (safe structural identity, never a secret
+/// key despite the legacy internal name `fire_key`).
+pub const FIRE_ID: &str = "fire_id";
 pub const FLOW_ID: &str = "flow_id";
 
 // ── HTTP ───────────────────────────────────────────────────────────────────
@@ -88,6 +91,8 @@ pub const USER_AGENT: &str = "user_agent";
 /// Which listener served this: `public` | `internal` | `metrics`. The planes
 /// have different trust models, so telling them apart in one query matters.
 pub const PLANE: &str = "plane";
+/// `complete` | `body_error` | `body_dropped` for the response-body lifecycle.
+pub const RESPONSE_STATE: &str = "response_state";
 
 // ── Outcome ────────────────────────────────────────────────────────────────
 /// `ok` | `error` — the coarse split every dashboard starts from.
@@ -100,6 +105,9 @@ pub const ERROR_KIND: &str = "error_kind";
 pub const ERROR: &str = "error";
 pub const RETRYABLE: &str = "retryable";
 pub const ATTEMPT: &str = "attempt";
+/// Safe credential shape (`bearer`, `cookie`, `none`, …), never credential
+/// material.
+pub const CREDENTIAL_KIND: &str = "credential_kind";
 
 // ── Timing ─────────────────────────────────────────────────────────────────
 /// Wall-clock milliseconds for the operation the record describes. ONE name for
@@ -179,6 +187,7 @@ pub const ALL: &[&str] = &[
     APPROVAL_ID,
     TOOL_CALL_ID,
     SCHEDULE_ID,
+    FIRE_ID,
     FLOW_ID,
     METHOD,
     ROUTE,
@@ -189,11 +198,13 @@ pub const ALL: &[&str] = &[
     CLIENT_IP,
     USER_AGENT,
     PLANE,
+    RESPONSE_STATE,
     OUTCOME,
     ERROR_KIND,
     ERROR,
     RETRYABLE,
     ATTEMPT,
+    CREDENTIAL_KIND,
     DURATION_MS,
     WAIT_MS,
     FROM,

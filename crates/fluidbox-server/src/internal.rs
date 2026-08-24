@@ -2023,6 +2023,12 @@ pub async fn result(
     let sess_auth = fluidbox_db::session_for_token_incl_revoked(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    fluidbox_obs::span::record_caller(
+        fluidbox_obs::field::principal::RUNNER,
+        &sess_auth.tenant_id.to_string(),
+        None,
+    );
+    fluidbox_obs::span::record_subject_run(&sess_auth.session_id.to_string());
     // Gap 6 (Phase F), and the SAME ordering argument as the audience check below:
     // this route's revoked-token leniency exists so a lost-response retry can ack
     // idempotently, NOT as a hole for a credential presented from the wrong place.
