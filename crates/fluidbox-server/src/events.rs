@@ -207,6 +207,35 @@ pub(crate) async fn process_delivery(
                     "running_session_id": running_session_id,
                 }));
             }
+            // A deliberate capacity shed is NOT an error, and the difference
+            // is visible to the operator: `skipped/capacity` reads as "the
+            // deployment was full", not "this subscription is misconfigured".
+            //
+            // It stays a 2xx ack, like every other dispatch-level outcome here.
+            // Answering 5xx would ask the provider to redeliver — turning one
+            // shed event into many requests at exactly the moment the
+            // deployment is least able to take them, which is the retry
+            // amplification the overload literature names as the thing that
+            // SUSTAINS an overload after its trigger clears. The disclosed cost
+            // (design §16 Q2) is that a shed PR event does not self-heal: the
+            // review run simply does not happen, and only the skip row says so.
+            Err(crate::error::ApiError::AtCapacity { .. }) => {
+                fluidbox_db::mark_dispatch_outcome(
+                    &state.pool,
+                    scope,
+                    claim.id,
+                    "skipped",
+                    Some("capacity"),
+                )
+                .await
+                .ok();
+                tracing::warn!(
+                    "dispatch {} for delivery {}: shed at the queue depth bound",
+                    sub.id,
+                    delivery.id
+                );
+                skipped.push(json!({ "subscription_id": sub.id, "reason": "capacity" }));
+            }
             Err(e) => {
                 // Recorded, not retried (scheduler precedent): a config
                 // error must not turn provider retries into a run factory.
@@ -393,6 +422,41 @@ pub async fn connection_deliveries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Design §9 / §16 Q2, asserted rather than left to prose: a capacity shed
+    /// during webhook fan-out is recorded as a SKIP and the delivery is still
+    /// ACKed. It must never become a 5xx.
+    ///
+    /// This is the decision most at risk of being "simplified" away later —
+    /// the two `Err` arms look redundant until you know why they differ. A 5xx
+    /// here asks the provider to redeliver, turning one shed event into many
+    /// requests at exactly the moment the deployment is least able to take
+    /// them: the retry amplification that SUSTAINS an overload after its
+    /// trigger has cleared. A source guard, so it needs no database or fake
+    /// GitHub.
+    #[test]
+    fn a_capacity_shed_is_a_recorded_skip_not_an_error() {
+        let src = include_str!("events.rs");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("this file has a test module");
+        let production = &src[..end];
+
+        let at = production
+            .find(concat!("ApiError::", "AtCapacity"))
+            .expect("the fan-out distinguishes a capacity shed");
+        let arm: String = production[at..].chars().take(400).collect();
+        assert!(
+            arm.contains(r#""skipped""#) && arm.contains(r#"Some("capacity")"#),
+            "a capacity shed records skipped/capacity, got: {arm}"
+        );
+        // Nothing in the fan-out may answer 5xx for a shed. The handler's
+        // return type is the ack, so the guard is that the arm does not bail.
+        assert!(
+            !arm.contains("return Err") && !arm.contains('?'),
+            "a shed must keep the 2xx ack, got: {arm}"
+        );
+    }
 
     #[test]
     fn matcher_requires_an_event_filter_and_honors_it() {
