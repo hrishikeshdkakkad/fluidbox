@@ -35,6 +35,7 @@ pub mod netgrant;
 pub mod netpol;
 
 use config::K8sConfig;
+use fluidbox_obs::field::error_kind as EK;
 use manifest::{
     build_pod, build_secret, object_name, COLLECTOR_CONTAINER, LABEL_MANAGED, LABEL_SESSION,
     RUNNER_CONTAINER,
@@ -110,8 +111,9 @@ impl KubernetesProvider {
                 let found =
                     crate::enforcer::CiliumNetworkEnforcer::detect(&client, &me.namespace).await;
                 tracing::info!(
-                    "network enforcer auto-detection: cilium.io/v2 {}",
-                    if found { "present" } else { "absent" }
+                    api_group = "cilium.io/v2",
+                    present = found,
+                    "network enforcer auto-detection"
                 );
                 found
             }
@@ -609,8 +611,9 @@ impl ExecutionProvider for KubernetesProvider {
             // will not cover this run, and an operator deciding whether to move
             // from `observe` to `enforce` needs to see that, not infer it.
             tracing::warn!(
-                "pod {name} reported no podIP at runner start; this run has NO workload \
-                 identity and is exempt from FLUIDBOX_WORKLOAD_IDENTITY enforcement"
+                pod = %name,
+                "pod reported no podIP at runner start; this run has NO workload identity and is \
+                 EXEMPT from FLUIDBOX_WORKLOAD_IDENTITY enforcement"
             );
         }
         Ok(self.handle(&name, &uid, &workload_addrs))
@@ -722,7 +725,7 @@ impl ExecutionProvider for KubernetesProvider {
             .and_then(|s| Uuid::parse_str(s).ok())
         {
             if let Err(e) = self.revoke_run_policy(sid).await {
-                tracing::warn!("revoking network policy for {sid} failed: {e}");
+                tracing::warn!(session_id = %sid, error = %e, error_kind = EK::PROVIDER, "revoking a network policy failed");
             }
         }
         self.delete_pod(&handle.external_id, self.handle_uid(handle))
