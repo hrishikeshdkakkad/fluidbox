@@ -360,6 +360,39 @@ mod tests {
         assert!(line.contains(" warn "), "{line}");
     }
 
+    /// The envelope statics are written by the formatter directly, not through
+    /// the field visitor. They are operator-set rather than attacker input, so
+    /// this is defence in depth — but "every byte reaching the sink passes
+    /// through redaction" is the claim this crate makes, and a claim with one
+    /// exception is not the claim.
+    #[test]
+    fn even_the_envelope_statics_are_scrubbed() {
+        let mut c = cfg(Format::Json, "trace");
+        c.instance = format!("pod-fbx_sess_{}", "a".repeat(32));
+        c.service = format!("svc-ghp_{}", "b".repeat(36));
+        let w = capture(&c, || tracing::info!("hello"));
+        let out = w.contents();
+        assert!(!out.contains(&"a".repeat(32)), "{out}");
+        assert!(!out.contains(&"b".repeat(36)), "{out}");
+        // …and the non-secret part of each is kept, so the replica is still
+        // identifiable.
+        assert!(out.contains("pod-"), "{out}");
+        assert!(out.contains("svc-"), "{out}");
+    }
+
+    /// The filter directive string is echoed in the boot record; an operator who
+    /// pasted something odd into `RUST_LOG` must not have it read back verbatim.
+    #[test]
+    fn a_secret_shaped_filter_directive_is_scrubbed_when_echoed() {
+        let c = cfg(Format::Json, "trace");
+        let filter = format!("info,ghp_{}=debug", "c".repeat(36));
+        let w = capture(
+            &c,
+            || tracing::info!(filter = %filter, "logging initialised"),
+        );
+        assert!(!w.contains(&"c".repeat(36)), "{}", w.contents());
+    }
+
     /// A runaway callsite is cut off and the loss is accounted for, rather than
     /// filling the disk.
     #[test]
