@@ -9,6 +9,13 @@
 //! /workspace. Diff collection runs against the PRISTINE baseline via the
 //! shared `fluidbox-workspace` engine — never against the agent's `.git`.
 
+/// The queue/lifecycle test double (design 2026-08-23 §12). Feature-gated so a
+/// release build cannot select it — see [`null`] for why that matters.
+#[cfg(feature = "test-provider")]
+pub mod null;
+#[cfg(feature = "test-provider")]
+pub use null::NullProvider;
+
 use async_trait::async_trait;
 use bollard::models::{ContainerCreateBody, HostConfig, NetworkCreateRequest};
 use bollard::query_parameters::{

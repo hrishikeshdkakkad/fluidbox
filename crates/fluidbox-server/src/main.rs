@@ -79,6 +79,12 @@ async fn build_provider(cfg: &config::Config) -> anyhow::Result<Arc<dyn Executio
                 .await?,
             ))
         }
+        // Test-only (design 2026-08-23 §12), and gated at COMPILE time rather
+        // than by a runtime flag: on a release build this arm does not exist,
+        // so `FLUIDBOX_PROVIDER=null` falls through to the error below and the
+        // binary cannot be talked into provisioning nothing.
+        #[cfg(feature = "test-provider")]
+        "null" => Ok(Arc::new(fluidbox_provider::NullProvider::from_env())),
         other => anyhow::bail!(
             "FLUIDBOX_PROVIDER='{other}' is not available in this build (known: docker, kubernetes)"
         ),
