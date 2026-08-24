@@ -281,10 +281,28 @@ pub async fn sessions_in_status(pool: &PgPool, statuses: &[&str]) -> sqlx::Resul
 /// for a big repo copy), so a stale row means the control plane died
 /// mid-launch and nothing owns the session anymore.
 ///
-/// Age is measured from `created_at` — a timestamp NOTHING refreshes. It used
-/// to be `updated_at`, which every runner heartbeat bumps: a crash between
-/// runner start and `set_sandbox_handle` left a heartbeating `initializing`
-/// session this sweep could never age out (M5).
+/// **The age anchor is SPLIT, and the split is a bug fix** (design 2026-08-23
+/// §3.10). Both halves measure from a timestamp NOTHING refreshes — never
+/// `updated_at`, which every runner heartbeat bumps, so a crash between runner
+/// start and `set_sandbox_handle` used to leave a heartbeating `initializing`
+/// session this sweep could never age out (M5). But `created_at` is only the
+/// right anchor for a row that never left `created`:
+///
+/// * `created` ages from `created_at` — it has no launch to measure.
+/// * `provisioning`/`initializing` age from `coalesce(launched_at, created_at)`
+///   — the moment the run actually STARTED launching. A session may lawfully
+///   sit parked for a long time first: `awaiting_authorization` holds for up to
+///   the approval TTL (7 days), and `queued` holds for the configured queue
+///   wait. Anchored to `created_at`, any run released more than
+///   `FLUIDBOX_STALE_LAUNCH_MINS` (default 30) after creation re-entered
+///   `provisioning` already "stale" and the very next watchdog tick failed it
+///   as "stalled before launch". That was live for network grants before
+///   migration 0034 added `launched_at`; the `coalesce` keeps pre-0034 rows
+///   behaving exactly as they did.
+///
+/// The parked statuses themselves are deliberately absent from both arms:
+/// `awaiting_authorization` is reaped by the approval TTL and `queued` by the
+/// queue-age sweeper, each of which knows the bound that actually applies.
 pub async fn stale_nonstarted_sessions(
     pool: &PgPool,
     max_age_mins: i32,
@@ -292,13 +310,12 @@ pub async fn stale_nonstarted_sessions(
     let mut tx = crate::worker_tx(pool).await?;
     let out = sqlx::query_as(
         "select * from sessions
-         where status = any($1) and created_at < now() - make_interval(mins => $2)",
+          where (status = 'created'
+                 and created_at < now() - make_interval(mins => $1))
+             or (status in ('provisioning','initializing')
+                 and coalesce(launched_at, created_at)
+                     < now() - make_interval(mins => $1))",
     )
-    .bind(vec![
-        "created".to_string(),
-        "provisioning".to_string(),
-        "initializing".to_string(),
-    ])
     .bind(max_age_mins)
     .fetch_all(&mut *tx)
     .await?;
