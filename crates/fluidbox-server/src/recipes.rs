@@ -1490,6 +1490,7 @@ async fn start_instance_run(
     };
     match run_service::create_run(state, scope, req).await? {
         RunCreation::Created(session) => {
+            fluidbox_obs::span::record_subject_run(&session.id.to_string());
             if let Err(e) =
                 db::record_instance_session(&state.pool, scope, instance.id, session.id, "run")
                     .await

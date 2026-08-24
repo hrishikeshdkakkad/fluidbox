@@ -670,13 +670,11 @@ mod tests {
 pub fn url_host(url: &str) -> Option<&str> {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     // Strip userinfo — `https://user:pass@host/…` puts a credential before the
-    // host, and the whole point of this function is to hand back something safe.
-    let rest = rest.rsplit_once('@').map(|(_, r)| r).unwrap_or(rest);
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim();
+    // host. Split the authority FIRST: an `@` in a path or query is tenant
+    // content, not userinfo, and must never cause that suffix to be returned as
+    // the alleged host.
+    let (authority, _) = split_authority(rest);
+    let host = strip_userinfo(authority).trim();
     if host.is_empty() {
         None
     } else {
@@ -703,12 +701,26 @@ pub fn url_for_log(url: &str) -> String {
         Some((s, r)) => (Some(s), r),
         None => (None, url),
     };
-    let rest = rest.rsplit_once('@').map(|(_, r)| r).unwrap_or(rest);
-    let no_query = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, suffix) = split_authority(rest);
+    let authority = strip_userinfo(authority);
+    let suffix = suffix.split(['?', '#']).next().unwrap_or_default();
+    let no_query = format!("{authority}{suffix}");
     match scheme {
         Some(s) => format!("{s}://{no_query}"),
-        None => no_query.to_string(),
+        None => no_query,
     }
+}
+
+fn split_authority(rest: &str) -> (&str, &str) {
+    let boundary = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    rest.split_at(boundary)
+}
+
+fn strip_userinfo(authority: &str) -> &str {
+    authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
 }
 
 #[cfg(test)]
@@ -759,5 +771,19 @@ mod safe_rendering_tests {
             assert!(!got.contains('?'), "{got}");
             assert!(!got.contains('@'), "{got}");
         }
+    }
+
+    #[test]
+    fn at_signs_outside_the_authority_never_become_userinfo() {
+        for url in [
+            "https://hooks.example/path/user@example.com",
+            "https://hooks.example/callback?email=user@example.com&opaque=tenant-value",
+        ] {
+            assert_eq!(url_host(url), Some("hooks.example"), "input: {url}");
+        }
+        assert_eq!(
+            url_for_log("https://hooks.example/path/user@example.com?opaque=tenant-value"),
+            "https://hooks.example/path/user@example.com"
+        );
     }
 }
