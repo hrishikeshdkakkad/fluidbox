@@ -270,6 +270,32 @@ fn map_err(e: impl std::fmt::Display) -> ProviderError {
     ProviderError::Other(e.to_string())
 }
 
+/// POD-CREATE-ONLY classification (design 2026-08-23 §7.4): tell capacity
+/// pressure apart from a real failure, so the orchestrator can re-park the run
+/// instead of failing it terminally.
+///
+/// A `ResourceQuota` rejection is a 403 whose `reason` is `Forbidden` and whose
+/// message contains "exceeded quota" — the same 403 shape RBAC and admission
+/// webhooks use, which is why the MESSAGE and not the code is what decides. An
+/// apiserver 429 is throttling and is retryable by definition. Everything else
+/// falls through to [`map_err`] and stays terminal: misreading an RBAC denial
+/// as capacity would bounce the run against a permission wall it can never get
+/// past until the attempt cap expires it.
+///
+/// Only the POD create is classified. The quota counts pods, so a Secret or
+/// NetworkPolicy create failing is a different problem and keeps the generic
+/// mapping.
+fn classify_create_err(e: kube::Error) -> ProviderError {
+    if let kube::Error::Api(ref ae) = e {
+        let quota =
+            ae.code == 403 && ae.reason == "Forbidden" && ae.message.contains("exceeded quota");
+        if quota || ae.code == 429 {
+            return ProviderError::CapacityDenied(ae.message.clone());
+        }
+    }
+    map_err(e)
+}
+
 /// Grace for `CreateContainerConfigError`: Pod-first/Secret-second means the
 /// kubelet reports it TRANSIENTLY between Pod creation and the Secret landing
 /// (~1 s in practice) — by design, not misconfiguration. Only a config error
@@ -480,7 +506,7 @@ impl ExecutionProvider for KubernetesProvider {
             .pods
             .create(&Default::default(), &pod)
             .await
-            .map_err(map_err)?;
+            .map_err(classify_create_err)?;
         let uid = created
             .metadata
             .uid
@@ -1023,6 +1049,81 @@ mod tests {
         ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
         ContainerStatus, PodStatus,
     };
+
+    /// The quota 403 is CAPACITY, the RBAC 403 is not, and an apiserver 429 is
+    /// throttling. Getting this wrong in either direction is expensive: a
+    /// misclassified RBAC failure would bounce forever behind a wall it can
+    /// never get past, and a misclassified quota rejection keeps today's
+    /// terminal failure — the headline problem the feature exists to fix.
+    #[test]
+    fn quota_403_and_apiserver_429_classify_as_capacity() {
+        // `kube::core::ErrorResponse` is a deprecated alias for `Status` in
+        // kube 4, whose `status` field is an enum and which carries two more
+        // fields. `..Default::default()` sets only what the classifier reads,
+        // so a future kube bump that adds a field cannot break this test.
+        let api = |code: u16, reason: &str, message: &str| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                status: Some(kube::core::response::StatusSummary::Failure),
+                code,
+                message: message.into(),
+                reason: reason.into(),
+                ..Default::default()
+            }))
+        };
+
+        let quota = api(
+            403,
+            "Forbidden",
+            r#"pods "fbx-run-x" is forbidden: exceeded quota: fluidbox-sandboxes, requested: pods=1, used: pods=20, limited: pods=20"#,
+        );
+        assert!(matches!(
+            classify_create_err(quota),
+            ProviderError::CapacityDenied(_)
+        ));
+
+        let throttle = api(429, "TooManyRequests", "too many requests");
+        assert!(matches!(
+            classify_create_err(throttle),
+            ProviderError::CapacityDenied(_)
+        ));
+
+        // An RBAC 403 is NOT capacity — it must stay terminal, or the run
+        // bounces against a permission wall until the attempt cap.
+        let rbac = api(
+            403,
+            "Forbidden",
+            r#"pods is forbidden: User "system:serviceaccount:fluidbox:runner" cannot create resource "pods""#,
+        );
+        assert!(matches!(classify_create_err(rbac), ProviderError::Other(_)));
+
+        // Neither is an admission-webhook rejection, a 404, or a transport
+        // error: everything unrecognized stays on the terminal path.
+        let webhook = api(
+            403,
+            "Forbidden",
+            "admission webhook \"policy.example\" denied the request",
+        );
+        assert!(matches!(
+            classify_create_err(webhook),
+            ProviderError::Other(_)
+        ));
+        assert!(matches!(
+            classify_create_err(api(404, "NotFound", "namespaces \"fluidbox\" not found")),
+            ProviderError::Other(_)
+        ));
+
+        // The verbatim substrate message rides the variant — it is what the
+        // ledger's status_reason shows the operator (the Kueue practice of
+        // preserving the exact blocker).
+        let ProviderError::CapacityDenied(detail) = classify_create_err(api(
+            403,
+            "Forbidden",
+            "exceeded quota: fluidbox-sandboxes, limited: pods=20",
+        )) else {
+            panic!("expected CapacityDenied");
+        };
+        assert!(detail.contains("fluidbox-sandboxes"));
+    }
 
     fn pod_with(runner: Option<ContainerState>, inits: Vec<ContainerStatus>) -> Pod {
         Pod {
