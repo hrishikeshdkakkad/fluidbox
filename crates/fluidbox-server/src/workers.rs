@@ -1107,6 +1107,65 @@ async fn finalize_worker(state: AppState) {
     }
 }
 
+/// Report log records the throttle suppressed, once per interval.
+///
+/// The per-callsite rate limit in `fluidbox-obs` protects the disk and the log
+/// bill from a retry loop pointed at a persistent fault. Suppression without
+/// accounting would be worse than the flood, though: an operator reading a quiet
+/// log would conclude the system is quiet. This worker turns a flood into ONE
+/// line per interval naming the offending callsites and their counts, which is
+/// both actionable and bounded.
+///
+/// Deliberately silent when nothing was suppressed — a healthy deployment never
+/// sees this line, so seeing it means something.
+///
+/// It is spawned before configuration is read (it needs only the log handle) and
+/// therefore lives here rather than in `spawn_all`, whose workers all take
+/// `AppState`.
+pub fn spawn_log_throttle_reporter(log: fluidbox_obs::LogHandle) {
+    let period = log.config().throttle_report_secs;
+    if period == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(period));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let report = log.throttle_report();
+            if report.is_empty() {
+                continue;
+            }
+            let total: u64 = report.iter().map(|(_, n)| n).sum();
+            // Name the worst offenders explicitly and cap the list: this line
+            // exists because something is already too loud, and it must not
+            // become the next thing that is.
+            let worst = report
+                .iter()
+                .take(5)
+                .map(|(k, n)| {
+                    format!(
+                        "{}@{}:{} ×{n}",
+                        k.target,
+                        k.file.unwrap_or("?"),
+                        k.line.unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                suppressed = total,
+                callsites = report.len(),
+                window_secs = period,
+                worst = %worst,
+                "log records were suppressed by the per-callsite rate limit — this log is \
+                 INCOMPLETE for the callsites named (raise FLUIDBOX_LOG_THROTTLE_PER_SEC, or \
+                 fix the loop)"
+            );
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
