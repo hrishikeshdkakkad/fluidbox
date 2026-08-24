@@ -254,6 +254,7 @@ mod tests {
             // asserting on THIS value proves nothing about production, which builds
             // its Config in `config.rs::from_env`; test that path instead.
             workload_identity: crate::config::WorkloadIdentityMode::default(),
+            queue: None,
             // Task 4: this fixture packs no archive, so the shipped default
             // (node-local `fs`, one replica) is carried. Same NOTE as above —
             // asserting on THESE values proves nothing about production, which
