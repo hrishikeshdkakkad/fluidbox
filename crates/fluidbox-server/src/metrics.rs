@@ -325,9 +325,14 @@ pub struct Metrics {
     pub queue_shed: Family,
     /// Time from first enqueue to admission, observed at the claim.
     pub queue_wait_seconds: Histogram,
-    /// Runs re-parked after a provider refused them. `reason` = capacity today;
-    /// the `_other` slot exists so a future classification cannot silently
-    /// widen the label set (the registry's fixed-cardinality doctrine).
+    /// Runs re-parked after a provider refused them, by the SUBSTRATE'S OWN
+    /// classification: `quota` = a configured admission ceiling is full (an
+    /// operator action item — raise the tier or lower the run cap), `throttle` =
+    /// the substrate's control plane is shedding load (self-clearing, not a
+    /// quota signal). Merging the two would send an operator to adjust a quota
+    /// that is not firing. The `_other` slot exists so a future classification
+    /// cannot silently widen the label set (the registry's fixed-cardinality
+    /// doctrine).
     pub queue_requeues: Family,
     // ── Durability (design: database event and ledger write rates).
     pub ledger_events: Counter,
@@ -443,7 +448,7 @@ impl Default for Metrics {
             queue_requeues: Family::new(
                 "fluidbox_queue_requeues_total",
                 "reason",
-                &["capacity", "_other"],
+                &["quota", "throttle", "_other"],
             ),
             ledger_events: Counter::default(),
             scrape_errors: Counter::default(),
@@ -849,7 +854,8 @@ mod tests {
         m.active_runs.inc();
         m.queue_dispatched.inc();
         m.queue_shed.inc("depth");
-        m.queue_requeues.inc("capacity");
+        m.queue_requeues.inc("quota");
+        m.queue_requeues.inc("throttle");
         m.queue_wait_seconds.observe(12.5);
         let live = Live {
             pool_size: 8,
@@ -876,7 +882,10 @@ mod tests {
             // alerts on, plus the histogram a dashboard plots.
             "fluidbox_runs_dispatched_total 1",
             "fluidbox_queue_shed_total{reason=\"depth\"} 1",
-            "fluidbox_queue_requeues_total{reason=\"capacity\"} 1",
+            "fluidbox_queue_requeues_total{reason=\"quota\"} 1",
+            // …and the throttle series is DISTINCT: a merged label would tell
+            // an operator to raise a quota that never fired.
+            "fluidbox_queue_requeues_total{reason=\"throttle\"} 1",
             "fluidbox_runs_queued_depth 7",
             "fluidbox_queue_oldest_wait_seconds 91",
             "fluidbox_queue_wait_seconds_count 1",
