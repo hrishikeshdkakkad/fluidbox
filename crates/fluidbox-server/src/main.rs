@@ -247,6 +247,25 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("execution provider: {}", provider.runtime_name());
     }
 
+    // Run admission. Saying this at boot matters for the SAME reason the
+    // enforcer line below does, and for one more: the rollout discipline is
+    // migrate → roll every replica → enable (design 2026-08-23 §6), and an
+    // operator mid-roll needs a way to see which replicas have picked the
+    // feature up. Silence means the queue is off and runs spawn directly —
+    // byte-identical to before the feature existed.
+    match &cfg.queue {
+        Some(q) => tracing::info!(
+            "run admission: ENABLED — cap {} concurrent, queue depth {}, max wait {}s,              {} capacity retries. On Kubernetes keep the cap at or below the namespace              quota's `pods` tier so the quota stays a backstop.",
+            q.max_concurrent_runs,
+            q.max_depth,
+            q.max_wait_secs,
+            q.requeue_max
+        ),
+        None => tracing::info!(
+            "run admission: off (FLUIDBOX_MAX_CONCURRENT_RUNS unset) — runs launch on creation"
+        ),
+    }
+
     // Sandbox network grants. Saying this at boot matters: with no enforcer the
     // deployment is offline-only and every non-offline run is REFUSED, which an
     // operator should learn here rather than from a 422 on their first run.

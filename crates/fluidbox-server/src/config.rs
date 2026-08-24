@@ -120,6 +120,98 @@ impl WorkloadIdentityMode {
     }
 }
 
+/// Run admission & queueing, resolved (design 2026-08-23 §8). Present only
+/// when `FLUIDBOX_MAX_CONCURRENT_RUNS` is set: `Config::queue == None` IS the
+/// feature switch, and with it unset the dispatcher never spawns, no run parks,
+/// and migration 0034's columns are simply never written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueCfg {
+    /// Deployment-wide ceiling on sandbox-holding runs. On Kubernetes set this
+    /// at or below the namespace quota's `pods` tier, so the app cap is the
+    /// waiting room and the quota is the backstop it was meant to be.
+    pub max_concurrent_runs: i64,
+    /// Depth backstop before new work is shed (429 for interactive callers, a
+    /// recorded skip for events). Defaults to `max(4 * cap, 50)`: at cap 60 and
+    /// a ~10-minute mean run, 240 queued is roughly a 40-minute full drain,
+    /// which is consistent with the age bound below. The floor keeps a small
+    /// cap from producing a queue so shallow that a normal burst sheds.
+    pub max_depth: i64,
+    /// Age bound measured from FIRST enqueue (`sessions.queued_at`, which is
+    /// coalesce-stamped, so this bounds TOTAL time in queue across capacity
+    /// bounces). Default 3600: CI products allow far longer (GitHub holds
+    /// self-hosted jobs 24 h), but a PR review that lands a day late is noise
+    /// with a cost. Raise it per deployment for long-horizon agents.
+    pub max_wait_secs: i64,
+    /// Provider capacity bounces before a terminal, explained failure. With the
+    /// 30→300 s backoff, five attempts spans ~13 minutes of sustained external
+    /// quota pressure.
+    pub requeue_max: i32,
+}
+
+/// The four queue variables, named ONCE. `from_env` reads through these and the
+/// resolver reports through these, so the class of bug the workload-identity
+/// source guard exists to catch — a knob that parses, validates, and is wired to
+/// a variable nobody sets — is not expressible here at all.
+const QUEUE_ENV_CAP: &str = "FLUIDBOX_MAX_CONCURRENT_RUNS";
+const QUEUE_ENV_DEPTH: &str = "FLUIDBOX_QUEUE_MAX_DEPTH";
+const QUEUE_ENV_WAIT: &str = "FLUIDBOX_QUEUE_MAX_WAIT_SECS";
+const QUEUE_ENV_REQUEUE: &str = "FLUIDBOX_QUEUE_REQUEUE_MAX";
+
+/// Resolve the four queue knobs. Split out (like [`parse_workload_identity`])
+/// so every failure message is testable without touching the process
+/// environment, and so the source guard can prove `from_env` reads the same
+/// variables it passes in.
+///
+/// The cap is the FEATURE SWITCH, which makes one rule non-obvious but
+/// important: any other queue knob set WITHOUT the cap is dead config and fails
+/// boot. Silently ignoring it would leave an operator who configured a depth
+/// bound with no way to discover that nothing is queueing.
+fn resolve_queue_cfg(
+    cap: Option<String>,
+    depth: Option<String>,
+    wait: Option<String>,
+    requeue: Option<String>,
+) -> anyhow::Result<Option<QueueCfg>> {
+    let nonempty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let (cap, depth, wait, requeue) = (
+        nonempty(cap),
+        nonempty(depth),
+        nonempty(wait),
+        nonempty(requeue),
+    );
+    let Some(cap) = cap else {
+        for (name, set) in [
+            (QUEUE_ENV_DEPTH, depth.is_some()),
+            (QUEUE_ENV_WAIT, wait.is_some()),
+            (QUEUE_ENV_REQUEUE, requeue.is_some()),
+        ] {
+            if set {
+                anyhow::bail!(
+                    "{name} is set but {QUEUE_ENV_CAP} is not — run queueing is off, so this \
+                     knob would do nothing. Set {QUEUE_ENV_CAP} to enable the queue, or unset \
+                     {name}."
+                );
+            }
+        }
+        return Ok(None);
+    };
+
+    let max_concurrent_runs = parse_positive_i64_env(QUEUE_ENV_CAP, Some(cap), 0)?;
+    let max_depth = parse_positive_i64_env(
+        QUEUE_ENV_DEPTH,
+        depth,
+        (max_concurrent_runs.saturating_mul(4)).max(50),
+    )?;
+    let max_wait_secs = parse_positive_i64_env(QUEUE_ENV_WAIT, wait, 3600)?;
+    let requeue_max = parse_positive_i64_env(QUEUE_ENV_REQUEUE, requeue, 5)?;
+    Ok(Some(QueueCfg {
+        max_concurrent_runs,
+        max_depth,
+        max_wait_secs,
+        requeue_max: requeue_max.min(i32::MAX as i64) as i32,
+    }))
+}
+
 /// Read `FLUIDBOX_WORKLOAD_IDENTITY`. Split out (rather than inlined in
 /// [`Config::from_env`]) so the failure message is testable without an env var,
 /// and so the source guard below can prove `from_env` passes the SAME name it
@@ -380,6 +472,12 @@ pub struct Config {
     /// [`WorkloadIdentityMode`] for why the default is a no-op and what `observe`
     /// is for; a malformed value fails boot.
     pub workload_identity: WorkloadIdentityMode,
+    /// Run admission & queueing (`FLUIDBOX_MAX_CONCURRENT_RUNS` + three
+    /// derived knobs, design 2026-08-23 §8). `None` — the default — means the
+    /// feature is OFF and behaviour is byte-identical to before it existed:
+    /// runs spawn directly, no dispatcher runs, and migration 0034's columns
+    /// are never written. See [`QueueCfg`] for each knob's derivation.
+    pub queue: Option<QueueCfg>,
 
     // ---- Workspace-archive storage (Phase F, Task 4) -----------------------
     /// Where packed workspace archives live (`FLUIDBOX_ARCHIVE_STORE`, plus the
@@ -725,6 +823,12 @@ impl Config {
             workload_identity: parse_workload_identity(
                 "FLUIDBOX_WORKLOAD_IDENTITY",
                 get("FLUIDBOX_WORKLOAD_IDENTITY").ok(),
+            )?,
+            queue: resolve_queue_cfg(
+                get(QUEUE_ENV_CAP).ok(),
+                get(QUEUE_ENV_DEPTH).ok(),
+                get(QUEUE_ENV_WAIT).ok(),
+                get(QUEUE_ENV_REQUEUE).ok(),
             )?,
             // Phase F, Task 4. `FLUIDBOX_REPLICAS` was consumed above: its only
             // job is to refuse `fs` on a deployment that has already told us one
@@ -1484,6 +1588,134 @@ mod tests {
             .find("#[cfg(test)]\nmod tests {")
             .expect("this file has a test module");
         &src[..end]
+    }
+
+    /// The four run-queue knobs (design 2026-08-23 §8). The cap is the FEATURE
+    /// SWITCH: unset means the whole feature is off and the other three are dead
+    /// config, which fails boot rather than being silently ignored — an operator
+    /// who set a depth bound and got no queueing would have no way to tell.
+    #[test]
+    fn queue_cfg_resolves_defaults_and_refuses_nonsense() {
+        // Unset cap ⇒ feature off.
+        assert!(resolve_queue_cfg(None, None, None, None).unwrap().is_none());
+        // An empty value is unset, not zero — a chart default that renders to
+        // "" must not be read as a cap.
+        assert!(resolve_queue_cfg(Some(String::new()), None, None, None)
+            .unwrap()
+            .is_none());
+
+        // Any queue knob without the cap is dead config → refuse to boot, and
+        // say which variable is orphaned.
+        for (depth, wait, requeue) in [
+            (Some("10".to_string()), None, None),
+            (None, Some("60".to_string()), None),
+            (None, None, Some("3".to_string())),
+        ] {
+            let e = resolve_queue_cfg(None, depth, wait, requeue)
+                .expect_err("a queue knob without the cap must fail boot")
+                .to_string();
+            assert!(
+                e.contains("FLUIDBOX_MAX_CONCURRENT_RUNS"),
+                "the error must name the missing switch, got: {e}"
+            );
+        }
+
+        // Cap set ⇒ derived defaults: depth = max(4*cap, 50), wait 3600,
+        // requeue 5.
+        let q = resolve_queue_cfg(Some("60".into()), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                q.max_concurrent_runs,
+                q.max_depth,
+                q.max_wait_secs,
+                q.requeue_max
+            ),
+            (60, 240, 3600, 5)
+        );
+        // …and the depth FLOOR keeps a small cap from producing a queue so
+        // shallow that a normal burst sheds.
+        let q = resolve_queue_cfg(Some("5".into()), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(q.max_depth, 50, "the depth floor");
+
+        // Explicit overrides win over the derivations.
+        let q = resolve_queue_cfg(
+            Some("60".into()),
+            Some("100".into()),
+            Some("900".into()),
+            Some("2".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (
+                q.max_concurrent_runs,
+                q.max_depth,
+                q.max_wait_secs,
+                q.requeue_max
+            ),
+            (60, 100, 900, 2)
+        );
+
+        // Malformed and out-of-range values fail loudly, each naming ITS OWN
+        // variable — a cap of 0 admits nothing and would wedge every run, and a
+        // depth of 0 sheds everything.
+        for (cap, depth, wait, requeue, name) in [
+            ("zero", None, None, None, "FLUIDBOX_MAX_CONCURRENT_RUNS"),
+            ("0", None, None, None, "FLUIDBOX_MAX_CONCURRENT_RUNS"),
+            ("-1", None, None, None, "FLUIDBOX_MAX_CONCURRENT_RUNS"),
+            ("10", Some("0"), None, None, "FLUIDBOX_QUEUE_MAX_DEPTH"),
+            ("10", Some("nope"), None, None, "FLUIDBOX_QUEUE_MAX_DEPTH"),
+            ("10", None, Some("0"), None, "FLUIDBOX_QUEUE_MAX_WAIT_SECS"),
+            ("10", None, None, Some("0"), "FLUIDBOX_QUEUE_REQUEUE_MAX"),
+        ] {
+            let e = resolve_queue_cfg(
+                Some(cap.into()),
+                depth.map(Into::into),
+                wait.map(Into::into),
+                requeue.map(Into::into),
+            )
+            .expect_err("must fail boot")
+            .to_string();
+            assert!(e.contains(name), "the error must name {name}, got: {e}");
+        }
+    }
+
+    /// The source guard the workload-identity knob established, one step
+    /// stronger: a parser can be perfect and still be wired to a variable
+    /// nobody sets. Rather than asserting that two independent literals agree,
+    /// each name exists EXACTLY ONCE in the production half — as the constant
+    /// both `from_env` and the resolver go through — so a read/report mismatch
+    /// is not expressible. This test pins the constants to the names the design,
+    /// the chart and the runbook document.
+    #[test]
+    fn queue_knobs_are_read_from_the_documented_variables() {
+        assert_eq!(QUEUE_ENV_CAP, "FLUIDBOX_MAX_CONCURRENT_RUNS");
+        assert_eq!(QUEUE_ENV_DEPTH, "FLUIDBOX_QUEUE_MAX_DEPTH");
+        assert_eq!(QUEUE_ENV_WAIT, "FLUIDBOX_QUEUE_MAX_WAIT_SECS");
+        assert_eq!(QUEUE_ENV_REQUEUE, "FLUIDBOX_QUEUE_REQUEUE_MAX");
+
+        let src = production_src();
+        for name in [
+            QUEUE_ENV_CAP,
+            QUEUE_ENV_DEPTH,
+            QUEUE_ENV_WAIT,
+            QUEUE_ENV_REQUEUE,
+        ] {
+            assert_eq!(
+                src.matches(&format!("\"{name}\"")).count(),
+                1,
+                "{name} must exist once, as the constant everything reads through"
+            );
+        }
+        assert!(src.contains("queue: resolve_queue_cfg("));
+        assert!(src.contains("get(QUEUE_ENV_CAP).ok()"));
+        assert!(src.contains("get(QUEUE_ENV_DEPTH).ok()"));
+        assert!(src.contains("get(QUEUE_ENV_WAIT).ok()"));
+        assert!(src.contains("get(QUEUE_ENV_REQUEUE).ok()"));
     }
 
     /// Same guard, for the Gap-6 workload-identity knob (Phase F). The name is
