@@ -561,4 +561,83 @@ mod tests {
             "trigger token leaked: {s}"
         );
     }
+
+    // ── Redaction parity with the LOG path ─────────────────────────────────
+    //
+    // This crate's `Redactor` guards the LEDGER. `fluidbox-obs`'s guards STDOUT.
+    // They are deliberately independent restatements of the same rule (see
+    // `SESSION_TOKEN_PREFIX` above for why independence is the point), which
+    // buys defence in depth and costs a drift hazard: a new credential family
+    // taught to one and not the other.
+    //
+    // These two tests are the tripwire. They are the reason the duplication is
+    // defensible rather than sloppy.
+
+    /// Everything the log path recognises, it must actually remove. This runs
+    /// here rather than in `fluidbox-obs` because the corpus is the shared
+    /// contract between the two redactors, and a shared contract asserted in
+    /// only one crate is a contract with one party.
+    #[test]
+    fn log_redactor_removes_every_family_in_the_shared_corpus() {
+        for (family, text, must_go) in fluidbox_obs::redact::secret_corpus() {
+            let out = fluidbox_obs::Redactor::new().scrub(&text).into_owned();
+            assert!(
+                !out.contains(&must_go),
+                "{family}: the LOG redactor let it through: {out}"
+            );
+        }
+    }
+
+    /// The ledger's redactor is NARROWER than the log path's, and this test
+    /// pins exactly how — so the gap is a reviewed, named list rather than an
+    /// accident nobody has looked at.
+    ///
+    /// It fails in both useful directions:
+    ///
+    /// * Extend this crate's `Redactor` to cover one of these families and the
+    ///   test fails, telling you to shorten the list. (That is a WELCOME
+    ///   failure — every name removed from `UNCOVERED_BY_LEDGER` is a real
+    ///   hardening of the audit trail.)
+    /// * Drop or weaken an existing pattern here and a family moves the other
+    ///   way, which also fails.
+    ///
+    /// The five families listed are the ones the log path added and the ledger
+    /// has never had: JWTs (an OIDC `id_token` or a GitHub App JWT quoted in an
+    /// error), PEM private-key blocks (the GitHub App custody secret), OAuth
+    /// `code`/`state` in a callback URL, an explicit `client_secret=…`
+    /// assignment, and shapeless secrets named in prose (`kek=…`). Each CAN
+    /// reach an event body — tool summaries, agent text and error strings all
+    /// flow into one — so this is a real, if narrow, gap in the ledger's
+    /// scrubbing. It is left as its own change rather than folded into a
+    /// logging one: the ledger's redactor is a distinct security control with
+    /// its own review surface, and widening it deserves that review rather than
+    /// a ride-along.
+    #[test]
+    fn the_ledgers_narrower_coverage_is_pinned_not_assumed() {
+        const UNCOVERED_BY_LEDGER: &[&str] = &[
+            "jwt / id_token",
+            "pem private key",
+            "oauth callback url",
+            "client secret assignment",
+            "shapeless kek",
+        ];
+        let ledger = Redactor::default();
+        let mut leaked = Vec::new();
+        for (family, text, must_go) in fluidbox_obs::redact::secret_corpus() {
+            let out = ledger.scrub_text(&text);
+            if out.contains(&must_go) {
+                leaked.push(family);
+            }
+        }
+        leaked.sort_unstable();
+        let mut expected: Vec<&str> = UNCOVERED_BY_LEDGER.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            leaked, expected,
+            "the ledger redactor's coverage moved. If it now covers MORE, delete the \
+             newly-covered families from UNCOVERED_BY_LEDGER (that is a hardening, and \
+             this failure is how you learn you achieved it). If it covers LESS, a \
+             pattern was weakened and the audit trail regressed."
+        );
+    }
 }

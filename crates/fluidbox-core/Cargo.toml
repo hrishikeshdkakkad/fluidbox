@@ -27,3 +27,9 @@ futures.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+# DEV-ONLY, and the direction matters: `fluidbox-obs` is a leaf crate that does
+# not depend on this one, so using it here creates no cycle and no runtime
+# coupling. It is present solely for the redaction parity test below — the
+# tripwire that keeps the ledger's redactor and the log path's redactor, which
+# are deliberately independent restatements of one rule, from silently forking.
+fluidbox-obs.workspace = true
