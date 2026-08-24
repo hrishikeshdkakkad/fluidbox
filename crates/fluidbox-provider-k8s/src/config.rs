@@ -2,6 +2,8 @@
 //! isolation class, resources, security baseline). Never RunSpec/agent input:
 //! `runtimeClassName` and friends come from the deployment, not the run.
 
+use fluidbox_obs::field::error_kind as EK;
+
 /// The sandbox Pod security + scheduling baseline, portable to any conformant
 /// cluster (design 2026-07-15, §"Sandbox pod security baseline").
 #[derive(Debug, Clone)]
@@ -197,7 +199,7 @@ fn parse_tolerations(s: Option<String>) -> Vec<Toleration> {
     let elements: Vec<serde_json::Value> = match serde_json::from_str(&s) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("FLUIDBOX_K8S_TOLERATIONS is not a JSON array ({e}); ignoring it");
+            tracing::warn!(error = %e, error_kind = EK::INVALID, "FLUIDBOX_K8S_TOLERATIONS is not a JSON array; ignoring it");
             return Vec::new();
         }
     };
@@ -207,7 +209,7 @@ fn parse_tolerations(s: Option<String>) -> Vec<Toleration> {
             |el| match serde_json::from_value::<Toleration>(el.clone()) {
                 Ok(t) => Some(t),
                 Err(e) => {
-                    tracing::warn!("skipping malformed toleration {el} ({e})");
+                    tracing::warn!(toleration = %el, error = %e, error_kind = EK::INVALID, "skipping a malformed toleration");
                     None
                 }
             },
