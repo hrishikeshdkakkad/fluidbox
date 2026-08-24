@@ -3931,6 +3931,159 @@ if restart_server "control plane rebooted with tenant=0 host=0 connection=12/min
   # leaves a re-claimable claim — is asserted above.
 fi
 
+# ── (k) Observability ────────────────────────────────────────────────────────
+#
+# This section reads the CONTROL PLANE'S OWN LOG, which every section above has
+# been filling with real traffic — real admin-token requests, real brokered calls
+# to credentialed fakes, real OAuth-shaped failures. That is the point: the
+# properties here cannot be proved by a unit test with a synthetic record,
+# because what matters is what a WHOLE RUN of this suite put on stdout.
+#
+# The log is already JSON: `_spawn` redirects stdout to a file, and
+# FLUIDBOX_LOG_FORMAT defaults to `auto` — text on a terminal, json off one — so
+# this asserts the shipped default resolves the way an operator running in a
+# container gets it, not a special test configuration.
+say "(k) Observability — the log is machine-readable, correlated, and carries no credential"
+
+# Only the records; the file also holds cargo output and restart banners.
+OBS_RECORDS="$WORK/obs-records.jsonl"
+grep '^{' "$SERVER_LOG" > "$OBS_RECORDS" 2>/dev/null || true
+OBS_N=$(wc -l < "$OBS_RECORDS" | tr -d ' ')
+
+if [ "${OBS_N:-0}" -lt 20 ]; then
+  no "the control plane emitted only ${OBS_N:-0} structured record(s) across this whole suite — expected the default format to be JSON off a terminal"
+else
+  ok "the control plane emitted $OBS_N structured records under the SHIPPED default format"
+
+  # 1. EVERY record parses. One malformed line is a formatter bug that costs an
+  #    aggregator the whole file, and it is exactly the failure a quote or a
+  #    control byte in a tool name would produce.
+  OBS_BAD=$(python3 - "$OBS_RECORDS" <<'PYEOF'
+import json, sys
+bad = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            json.loads(line)
+        except Exception:
+            bad += 1
+            if bad == 1:
+                print(line[:300], file=sys.stderr)
+print(bad)
+PYEOF
+)
+  [ "$OBS_BAD" = 0 ]     && ok "every one of the $OBS_N records is independently parsable JSON"     || no "$OBS_BAD record(s) are NOT valid JSON — one malformed line costs an aggregator the whole file"
+
+  # 2. NO CREDENTIAL. The suite drove this server with the admin token as a
+  #    bearer on every admin call, and the broker turned two credentialed fake
+  #    upstreams. If a header, a URL, an error body or a Debug rendering ever
+  #    reached a record, one of these appears. This is the assertion the whole
+  #    redaction design exists to hold.
+  OBS_LEAK=0
+  for secret_name in ADMIN_TOKEN TOK_HQ TOK_HQ2 CRED_KEY MASTER_KEY; do
+    eval "secret_val=\${$secret_name:-}"
+    [ -z "$secret_val" ] && continue
+    if grep -qF "$secret_val" "$OBS_RECORDS"; then
+      no "a live credential reached the log: \$$secret_name appears in a structured record"
+      OBS_LEAK=1
+    fi
+  done
+  [ "$OBS_LEAK" = 0 ]     && ok "not one live credential this suite used — admin token, both upstream bearers, the sealing key, the LLM master key — appears in any record"     || true
+
+  # 3. CORRELATION. A request record must carry the id the caller was handed,
+  #    the route PATTERN (not the concrete path, or "which endpoint is slow" is
+  #    a regex), a status and a duration.
+  OBS_REQ=$(python3 - "$OBS_RECORDS" <<'PYEOF'
+import json, sys
+need = ("request_id", "route", "status", "duration_ms", "method", "plane")
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if r.get("msg") != "request" or not all(k in r for k in need):
+        continue
+    found = True
+    # The STRONG proof: a record whose route is a pattern and whose path is the
+    # concrete URL it matched. That is the property "which endpoint is slow" is
+    # a group-by rather than a regex, and only a parameterised route shows it.
+    if "{" in r["route"] and r.get("path") not in (None, r["route"]):
+        print("ok")
+        break
+    # A route with no parameters (e.g. POST /v1/sessions) cannot demonstrate it
+    # either way; keep looking, but remember that the record shape was right.
+    if r["route"].count("-") >= 4:
+        print("concrete")
+        break
+else:
+    print("ok-unparameterised" if found else "missing")
+PYEOF
+)
+  case "$OBS_REQ" in
+    ok) ok "the per-request record carries request_id + route PATTERN (distinct from the concrete path) + status + duration_ms" ;;
+    ok-unparameterised) ok "the per-request record carries request_id + route + status + duration_ms (no parameterised route was exercised, so pattern-vs-path is untested here)" ;;
+    concrete) no "the per-request record carries a CONCRETE path as 'route' — grouping by endpoint would be a regex" ;;
+    *) no "no per-request completion record was emitted at all (msg=\"request\" with the documented fields)" ;;
+  esac
+
+  # 4. The run join. Every record about a run carries session_id, from any plane
+  #    and any task — this is what makes "show me everything about run X" one
+  #    filter instead of an archaeology project.
+  OBS_SESSIONS=$(python3 - "$OBS_RECORDS" <<'PYEOF'
+import json, sys
+seen = set()
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if r.get("session_id"):
+        seen.add(r["session_id"])
+print(len(seen))
+PYEOF
+)
+  [ "${OBS_SESSIONS:-0}" -ge 2 ]     && ok "records from $OBS_SESSIONS distinct runs carry session_id — one filter reads a whole run"     || no "only ${OBS_SESSIONS:-0} run(s) appear with a session_id; the run join is not being stamped"
+
+  # 5. The gate's verdicts are IN the log, at a level the default filter shows.
+  #    Section (e) denied calls with source='schema' and section (a) with
+  #    source='capability'; "why did this run not do the thing" must be
+  #    answerable without raising the level and reproducing.
+  OBS_DENIES=$(python3 - "$OBS_RECORDS" <<'PYEOF'
+import json, sys
+sources = set()
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if r.get("event") == "tool.decision" and r.get("verdict") != "allow":
+        if r.get("level") in ("info", "warn", "error") and r.get("source"):
+            sources.add(r["source"])
+print(",".join(sorted(sources)))
+PYEOF
+)
+  [ -n "$OBS_DENIES" ]     && ok "gate refusals are visible at the DEFAULT level, classified by deciding stage: $OBS_DENIES"     || no "no gate refusal reached the log with a deciding stage — 'why was this denied' is unanswerable without raising the level"
+
+  # 6. The log did not silently lose records. A non-zero suppression counter
+  #    means the file above is INCOMPLETE, which would void every assertion in
+  #    this section that reasons from absence.
+  OBS_SUPPRESSED=$(curl -sf -H "Authorization: Bearer $ADMIN_TOKEN" "$API/v1/admin/metrics" 2>/dev/null \
+    | awk '$1=="fluidbox_log_suppressed_total"{print $2}')
+  [ "${OBS_SUPPRESSED:-0}" = "0" ]     && ok "fluidbox_log_suppressed_total is 0 — the log this section read is COMPLETE"     || no "fluidbox_log_suppressed_total=$OBS_SUPPRESSED: records were dropped, so every absence asserted above is unproven"
+fi
+
 # ── Result ───────────────────────────────────────────────────────────────────
 # EVERY psql statement this run issued had to succeed. db() cannot count its own
 # failures (it runs inside `$( )`, and a subshell's counter increment is lost),

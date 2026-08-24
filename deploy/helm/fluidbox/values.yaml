@@ -48,6 +48,31 @@ secretKeys:
   archiveS3SecretAccessKey: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY
 
 server:
+  # ── Logging ────────────────────────────────────────────────────────────
+  #
+  # The control plane and the in-sandbox runner emit the same flat JSON record
+  # schema, correlated by request_id and session_id, with every value scrubbed
+  # by credential shape and by field name. See docs/hosted/observability.md.
+  #
+  # Left empty, the server's own defaults apply: JSON (stdout is a pipe here),
+  # `info` with the third-party transport crates quieted, a 200/callsite/second
+  # limiter, and a suppression report once a minute.
+  #
+  # logFormat: json | text | auto. Leave empty in a cluster — `auto` resolves to
+  # json off a terminal anyway, and pinning it only matters if someone later runs
+  # the image interactively.
+  logFormat: ""
+  # A bare level, or a full EnvFilter directive set. Forwarded to sandbox runners
+  # so ONE setting governs both halves of a run.
+  logLevel: ""
+  # Records per callsite per second before suppression; "0" disables the limiter.
+  # Set it deliberately if you would rather pay for the volume than lose records.
+  # Either way nothing is lost SILENTLY: the suppressed count is always kept
+  # (fluidbox_log_suppressed_total) and the offending callsites are named in a
+  # periodic warning.
+  logThrottlePerSec: ""
+  # Seconds between those suppression reports; "0" disables the report.
+  logThrottleReportSecs: ""
   # Default stays 1. Phase F made >1 POSSIBLE, not automatic: raising this
   # requires archiveStore "s3" (boot REFUSES "fs" with replicas > 1, because the
   # alternative is an init container's archive GET landing on a replica that does
