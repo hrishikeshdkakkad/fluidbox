@@ -1708,6 +1708,28 @@ pub fn build_runner_env(
             runner_capability_manifest(&run_spec.capabilities, &run_spec.brokered).to_string(),
         ));
     }
+    // Forward the logging knobs so ONE setting governs both halves of a run.
+    // The runner emits the same JSON record schema as the control plane
+    // (`images/runner-lib/log.mjs`), so a deployment that switched the control
+    // plane to text for a human, or raised it to debug for an incident, would
+    // otherwise find the sandbox half still speaking the other dialect.
+    //
+    // Read from the process environment rather than threaded through `Config`
+    // because these are pass-throughs, not decisions this crate makes: the
+    // runner parses them itself and falls back to `info`/`json` on anything it
+    // does not recognise, so an `EnvFilter` directive string (which the runner's
+    // simple level parser cannot read) degrades to the default rather than
+    // silencing the sandbox.
+    //
+    // Only forwarded when SET, so the default runner environment — and its
+    // serialized size, which is capped — is unchanged.
+    for k in ["FLUIDBOX_LOG_FORMAT", "FLUIDBOX_LOG_LEVEL"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                env.push((k.into(), v));
+            }
+        }
+    }
     env
 }
 
