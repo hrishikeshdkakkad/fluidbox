@@ -29,6 +29,7 @@ use fluidbox_core::state::SessionStatus;
 /// retrying by hand is not misled about the deployment being wedged.
 const QUEUE_SHED_RETRY_AFTER_SECS: u64 = 30;
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -165,8 +166,10 @@ pub async fn create_run(
             fluidbox_db::system_worker::count_admission_pending_sessions(&state.pool).await?;
         if depth >= q.max_depth {
             tracing::warn!(
-                "run queue at depth {depth} (bound {}) — shedding",
-                q.max_depth
+                queue_depth = depth,
+                max_depth = q.max_depth,
+                error_kind = EK::CAPACITY,
+                "run queue at its depth bound — shedding"
             );
             state.metrics.queue_shed.inc("depth");
             return Err(ApiError::AtCapacity {
@@ -294,8 +297,9 @@ pub async fn create_run(
                         }
                         if !persisted {
                             tracing::warn!(
-                                "replace: cancel intent for {} not persisted after retries",
-                                s.id
+                                session_id = %s.id,
+                                error_kind = EK::DB,
+                                "replace policy: the cancel intent did not persist after retries"
                             );
                             return Ok(RunCreation::ReplaceUnpersisted {
                                 running_session_id: s.id,
