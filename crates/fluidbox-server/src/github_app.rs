@@ -31,6 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
 use fluidbox_db::{GithubAppRegistrationRow, IntegrationConnectionRow};
+use fluidbox_obs::field::error_kind as EK;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -741,7 +742,7 @@ pub async fn manifest_go(State(state): State<AppState>, Query(q): Query<GoParams
         Ok(Some(r)) if r == reg_id => {}
         Ok(_) => return refusal("This link was already used — start again from the dashboard."),
         Err(e) => {
-            tracing::error!("bootstrap claim failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::DB, "github app: bootstrap flow claim failed");
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
@@ -864,7 +865,7 @@ pub async fn manifest_callback(
             )
         }
         Err(e) => {
-            tracing::error!("flow claim failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::DB, "github app: flow claim failed");
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
@@ -914,7 +915,7 @@ pub async fn manifest_callback(
             // NEVER format this error with its URL: the path segment is the
             // unauthenticated conversion code — in a log it would let a
             // reader mint the app credentials themselves.
-            tracing::warn!("manifest conversion unreachable: {}", e.without_url());
+            tracing::warn!(error = %e.without_url(), error_kind = EK::UPSTREAM, "github app: manifest conversion endpoint unreachable");
             return refusal(
                 "GitHub was unreachable during the exchange — start again from the dashboard.",
             );
@@ -997,7 +998,7 @@ pub async fn manifest_callback(
             );
         }
         Err(e) => {
-            tracing::error!("registration activation failed: {e}");
+            tracing::error!(error = %e, "github app: registration activation failed");
             return refusal("Storing the app failed — try again from the dashboard.");
         }
     }
@@ -1071,7 +1072,7 @@ pub async fn install_go(State(state): State<AppState>, Query(q): Query<GoParams>
         Ok(Some(r)) if r == reg_id => {}
         Ok(_) => return refusal("This link was already used — start again from the dashboard."),
         Err(e) => {
-            tracing::error!("bootstrap claim failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::DB, "github app: bootstrap flow claim failed");
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
@@ -1177,7 +1178,7 @@ pub async fn setup(
             )
         }
         Err(e) => {
-            tracing::error!("flow claim failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::DB, "github app: flow claim failed");
             return refusal("Something went wrong — try again from the dashboard.");
         }
     }
@@ -1251,17 +1252,19 @@ pub async fn app_ingress(
     // loader) to fetch the verification material; a TenantScope is NOT
     // constructed from its tenant until the HMAC verifies (system_worker module
     // doc) — exactly parallel to events.rs per-connection ingress.
-    let reg =
-        match fluidbox_db::system_worker::get_github_app_registration(&state.pool, registration_id)
-            .await
-        {
-            Ok(Some(r)) if r.status == "active" => r,
-            Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-            Err(e) => {
-                tracing::error!("registration lookup failed: {e}");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+    let reg = match fluidbox_db::system_worker::get_github_app_registration(
+        &state.pool,
+        registration_id,
+    )
+    .await
+    {
+        Ok(Some(r)) if r.status == "active" => r,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, error_kind = EK::DB, "github app: registration lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     // Verification material only — a tenant-less reader, because there is no
     // verified tenant yet (the signature has not been checked).
     let (sealed, kv) =
@@ -1274,7 +1277,7 @@ pub async fn app_ingress(
             Ok(Some(s)) => s,
             Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
             Err(e) => {
-                tracing::error!("webhook secret lookup failed: {e}");
+                tracing::error!(error = %e, error_kind = EK::DB, "github app: webhook secret lookup failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
@@ -1284,14 +1287,14 @@ pub async fn app_ingress(
     let secret = match sealer_ref.open(&sealed, kv, open_ctx).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("webhook secret unseal failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::CUSTODY, "github app: webhook secret unseal failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     let verified = match github::verify(&headers, &body, &secret) {
         Ok(v) => v,
         Err(reason) => {
-            tracing::warn!("app ingress {registration_id}: rejected delivery: {reason}");
+            tracing::warn!(registration_id = %registration_id, reason = %reason, error_kind = EK::UNAUTHENTICATED, "github app ingress: delivery rejected");
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
@@ -1341,7 +1344,7 @@ pub async fn app_ingress(
                 .into_response();
         }
         Err(e) => {
-            tracing::error!("connection lookup failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::DB, "github app: connection lookup failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1379,16 +1382,19 @@ async fn handle_lifecycle(
     // connection mutation this app-level lifecycle handler performs.
     let scope = fluidbox_db::TenantScope::assume(reg.tenant_id);
     let iid_str = iid.to_string();
-    let existing =
-        match fluidbox_db::get_github_app_connection_by_installation(&state.pool, scope, &iid_str)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("connection lookup failed: {e}");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+    let existing = match fluidbox_db::get_github_app_connection_by_installation(
+        &state.pool,
+        scope,
+        &iid_str,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, error_kind = EK::DB, "github app: connection lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     // Rows owned by another custody path (legacy paste / other
     // registration) are never touched from this app's ingress.
     let owned = existing
@@ -1399,7 +1405,7 @@ async fn handle_lifecycle(
     // webhook is gone once acked). 500 makes GitHub redeliver; semantic
     // no-ops still ack.
     let db500 = |e: sqlx::Error| {
-        tracing::error!("lifecycle transition failed: {e}");
+        tracing::error!(error = %e, "github app: installation lifecycle transition failed");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     };
     let outcome = match lc {
@@ -1422,7 +1428,7 @@ async fn handle_lifecycle(
                         json!({ "handled": action, "connection_id": row.id, "status": row.status })
                     }
                     Err(e) => {
-                        tracing::error!("installation.created handling failed: {e}");
+                        tracing::error!(error = %e, "github app: installation.created handling failed");
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 }

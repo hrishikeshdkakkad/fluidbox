@@ -552,8 +552,10 @@ pub async fn create_org(
             if state.cfg.llm_key_mode == crate::config::LlmKeyMode::Tenant {
                 if let Err(e) = crate::llm_keys::ensure_tenant_key(&state, org.id).await {
                     tracing::warn!(
-                        "eager LLM virtual-key mint for new org {} failed (lazy path will retry): {e}",
-                        org.id
+                        tenant_id = %org.id,
+                        error = %e,
+                        retrying = true,
+                        "eager LLM virtual-key mint for a new org failed; the lazy path will retry"
                     );
                 }
             }
@@ -579,10 +581,11 @@ pub async fn create_org(
                     .await
             {
                 tracing::warn!(
-                    "seeding policies for new org {} ({}) failed — runs in it fail closed at \
-                     create_run until it is re-seeded: {e}",
-                    slug,
-                    org.id
+                    tenant_id = %org.id,
+                    org = %slug,
+                    error = %e,
+                    "seeding policies for a new org failed — runs in it FAIL CLOSED at create_run \
+                     until it is re-seeded"
                 );
             }
             Ok(Json(json!({ "org": org })))

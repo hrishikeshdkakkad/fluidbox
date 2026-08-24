@@ -26,6 +26,7 @@ use fluidbox_core::event::{Actor, EventBody};
 use fluidbox_core::spec::RunSpec;
 use fluidbox_core::usage::{estimate_cost_usd, UsageDelta};
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -295,8 +296,11 @@ async fn release_reservation(state: &AppState, scope: TenantScope, request_id: U
     state.metrics.reservations.inc("released");
     if let Err(e) = fluidbox_db::release_llm_reservation(&state.pool, scope, request_id).await {
         tracing::warn!(
-            "facade: releasing LLM reservation {request_id} failed: {e} — it will be swept \
-             as a conservative charge"
+            reservation_id = %request_id,
+            error = %e,
+            error_kind = EK::DB,
+            "releasing an LLM reservation failed — the expiry sweep will convert it into a \
+             conservative charge"
         );
     }
 }
@@ -350,14 +354,15 @@ async fn reconcile_reservation(
     .await;
     if !should_charge_reservation(usage_written) {
         tracing::warn!(
-            "facade: usage for LLM reservation {request_id} did not persist — leaving the \
-             reservation `reserved` so the expiry sweep converts it into a conservative \
-             charge (charging now would lose the spend permanently)"
+            reservation_id = %request_id,
+            error_kind = EK::DB,
+            "usage for an LLM reservation did not persist — leaving it `reserved` so the expiry \
+             sweep charges conservatively (charging now would lose the spend permanently)"
         );
         return;
     }
     if let Err(e) = fluidbox_db::charge_llm_reservation(&state.pool, scope, request_id).await {
-        tracing::warn!("facade: charging LLM reservation {request_id} failed: {e}");
+        tracing::warn!(reservation_id = %request_id, error = %e, error_kind = EK::DB, "charging an LLM reservation failed");
     } else {
         state.metrics.reservations.inc("charged");
     }
@@ -570,8 +575,26 @@ pub async fn messages(
     // credential can no longer spend the run's model budget. Refused at the auth
     // layer (like an unresolvable token), not as a dialect-shaped body.
     if !crate::auth::audience_allows(crate::auth::AUD_LLM, &sess_auth.audience) {
+        tracing::warn!(
+            session_id = %sess_auth.session_id,
+            token_audience = %sess_auth.audience,
+            required_audience = crate::auth::AUD_LLM,
+            error_kind = EK::FORBIDDEN,
+            "model request refused: the credential is not the run's LLM token"
+        );
         return Err(ApiError::Forbidden("wrong_audience".into()));
     }
+    // Stamp the run onto the request span. The facade resolves its token by
+    // hand rather than through the `SessionAuth` extractor, so without this the
+    // one record covering the most expensive route in the system — the request
+    // completion record, carrying its latency and status — would not say which
+    // run spent the money.
+    fluidbox_obs::span::record_caller(
+        fluidbox_obs::field::principal::RUNNER,
+        &sess_auth.tenant_id.to_string(),
+        None,
+    );
+    fluidbox_obs::span::record_subject_run(&sess_auth.session_id.to_string());
     let session_id = sess_auth.session_id;
     let scope = TenantScope::assume(sess_auth.tenant_id);
 
@@ -698,7 +721,8 @@ pub async fn messages(
         let stripped = strip_server_tools(dialect, &mut parsed);
         if stripped > 0 {
             tracing::debug!(
-                "facade: stripped {stripped} server-executed tool(s) from the codex request"
+                stripped = stripped,
+                "stripped server-executed tools from the codex request"
             );
         }
     }
@@ -831,8 +855,10 @@ pub async fn messages(
                 Ok(k) => k,
                 Err(e) => {
                     tracing::warn!(
-                        "facade: tenant LLM key unavailable for tenant {}: {e}",
-                        sess_auth.tenant_id
+                        tenant_id = %sess_auth.tenant_id,
+                        error = %e,
+                        error_kind = EK::CUSTODY,
+                        "tenant LLM key unavailable — refusing the model request"
                     );
                     // R1: refused before any byte left the process.
                     release_reservation(&state, scope, request_id).await;
@@ -925,8 +951,9 @@ pub async fn messages(
             return Ok(forward_buffered(status, body));
         }
         tracing::warn!(
-            tenant = %sess_auth.tenant_id,
-            "facade: LiteLLM rejected the tenant's virtual key — attempting recovery"
+            tenant_id = %sess_auth.tenant_id,
+            error_kind = EK::CUSTODY,
+            "the LLM upstream rejected this tenant's virtual key — attempting recovery"
         );
         let fresh =
             match llm_keys::recover_rejected_tenant_key(&state, sess_auth.tenant_id, &upstream_key)
@@ -935,9 +962,10 @@ pub async fn messages(
                 llm_keys::KeyRecovery::Retry(k) => k,
                 llm_keys::KeyRecovery::Refused(reason) => {
                     tracing::warn!(
-                        tenant = %sess_auth.tenant_id,
+                        tenant_id = %sess_auth.tenant_id,
                         reason,
-                        "facade: tenant LLM key not re-provisioned — forwarding the rejection"
+                        error_kind = EK::CUSTODY,
+                        "tenant LLM key not re-provisioned — forwarding the rejection"
                     );
                     // R6: same 401 proof as R5.
                     release_reservation(&state, scope, request_id).await;
@@ -1134,8 +1162,9 @@ async fn trigger_budget_stop(
                 }
             }
             tracing::error!(
-                "budget finalize for {} did not persist after retries",
-                session.id
+                session_id = %session.id,
+                error_kind = EK::DB,
+                "budget finalize did not persist after retries"
             );
         });
     }
@@ -1173,7 +1202,7 @@ async fn record_usage(
     {
         Ok(_) => true,
         Err(e) => {
-            tracing::warn!("facade: recording usage for session {session_id} failed: {e}");
+            tracing::warn!(session_id = %session_id, error = %e, error_kind = EK::DB, "recording model usage failed");
             false
         }
     };
