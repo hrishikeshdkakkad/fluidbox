@@ -10,6 +10,8 @@
 #   phase 8: connector catalog & oauth custody (seeded catalog, custom
 #            headers, PKCE dance, rotating refresh, fail-closed reconnect)
 #   phase 9: failure paths      (budget stop, watchdog, restart — no model)
+#   phase 12: run admission     (cap 1 FIFO + depth 429 through REAL Docker
+#             provisioning on the replay tier — no key, no model spend)
 # Owns the stack: builds binaries, starts the gateway + control plane.
 # Refuses to run while `just dev` holds :8787.
 set -uo pipefail
@@ -53,41 +55,47 @@ trap 'stop_server' EXIT
 start_server || exit 1
 ok "stack up (gateway + control plane)"
 
-say "PHASE 1/11 — live demo A"
+say "PHASE 1/12 — live demo A"
 bash "$ROOT/scripts/e2e-live.sh" || SUITE_FAIL=1
 
-say "PHASE 2/11 — governance plane"
+say "PHASE 2/12 — governance plane"
 bash "$ROOT/scripts/governance-e2e.sh" || SUITE_FAIL=1
 
-say "PHASE 3/11 — git workspaces"
+say "PHASE 3/12 — git workspaces"
 bash "$ROOT/scripts/e2e-git-workspace.sh" || SUITE_FAIL=1
 
-say "PHASE 4/11 — api triggers & signed callbacks"
+say "PHASE 4/12 — api triggers & signed callbacks"
 bash "$ROOT/scripts/e2e-trigger.sh" || SUITE_FAIL=1
 
-say "PHASE 5/11 — scheduled borrowing"
+say "PHASE 5/12 — scheduled borrowing"
 stop_server   # the schedule suite owns (and restarts) its own control plane
 bash "$ROOT/scripts/e2e-schedule.sh" || SUITE_FAIL=1
 
-say "PHASE 6/11 — github pr-review fan-out"
+say "PHASE 6/12 — github pr-review fan-out"
 bash "$ROOT/scripts/e2e-github.sh" || SUITE_FAIL=1
 
-say "PHASE 7/11 — capability & MCP catalog"
+say "PHASE 7/12 — capability & MCP catalog"
 bash "$ROOT/scripts/e2e-capabilities.sh" || SUITE_FAIL=1
 
-say "PHASE 8/11 — connector catalog & oauth custody"
+say "PHASE 8/12 — connector catalog & oauth custody"
 bash "$ROOT/scripts/e2e-connectors.sh" || SUITE_FAIL=1
 
-say "PHASE 9/11 — failure paths"
+say "PHASE 9/12 — failure paths"
 bash "$ROOT/scripts/e2e-failures.sh" || SUITE_FAIL=1
 
-say "PHASE 10/11 — enterprise recipes"
+say "PHASE 10/12 — enterprise recipes"
 # Owns its own stack (throwaway DB, ports 18797/18798/18899) — the shared
 # server keeps running; the phase never touches it.
 bash "$ROOT/scripts/recipes-e2e.sh" || SUITE_FAIL=1
 
-say "PHASE 11/11 — codex (second harness)"
+say "PHASE 11/12 — codex (second harness)"
 bash "$ROOT/scripts/e2e-codex.sh" || SUITE_FAIL=1
+
+say "PHASE 12/12 — run admission on the replay tier"
+# Owns its own stack (throwaway DB, compose project fluidbox-queue-live, ports
+# 19794/19795/15436) — the shared server keeps running; the phase never touches
+# it. Real Docker provisioning, zero keys, zero model spend.
+bash "$ROOT/scripts/e2e-queue-live.sh" || SUITE_FAIL=1
 
 say "E2E RESULT"
 if [ "$SUITE_FAIL" = "0" ]; then
