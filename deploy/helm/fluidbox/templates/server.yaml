@@ -281,6 +281,21 @@ spec:
             # redesigned rather than reconfigured.
             - { name: FLUIDBOX_WORKLOAD_IDENTITY, value: {{ . | quote }} }
             {{- end }}
+            {{- with .Values.server.maxConcurrentRuns }}
+            # Run admission: the app-level cap that turns over-capacity runs into
+            # a FIFO queue instead of a failure. Keep it at or below
+            # sandbox.quota.pods — see the comment on both values.
+            - { name: FLUIDBOX_MAX_CONCURRENT_RUNS, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.server.queueMaxDepth }}
+            - { name: FLUIDBOX_QUEUE_MAX_DEPTH, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.server.queueMaxWaitSecs }}
+            - { name: FLUIDBOX_QUEUE_MAX_WAIT_SECS, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.server.queueRequeueMax }}
+            - { name: FLUIDBOX_QUEUE_REQUEUE_MAX, value: {{ . | quote }} }
+            {{- end }}
             {{- if .Values.server.allowRlsBypass }}
             # Review M2 escape hatch: accept a pool role that bypasses RLS even in
             # multi-user mode. Local/single-user only — a hosted install must instead

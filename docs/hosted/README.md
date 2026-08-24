@@ -13,6 +13,8 @@ These documents define the supported product boundary for the hosted, multi-user
 
 **Operator runbook.** [KMS operations](kms-operations.md) — the Phase D custody layer: envelope sealing (DEK/KEK, the `FLUIDBOX_KMS_MODE` boot matrix), the resumable re-seal + legacy-key retirement procedure, disaster recovery, per-tenant LiteLLM virtual keys, and Row-Level Security operations.
 
+**Capacity.** [Run queue operations](run-queue-operations.md) — enabling capacity admission (`FLUIDBOX_MAX_CONCURRENT_RUNS`): the migrate → roll-every-replica → enable order and why it is not advisory, sizing the app cap against the namespace `ResourceQuota`, what each metric means, what callers see when the queue is full, and the drain-first rollback.
+
 **Authority.** These documents *state* settled decisions; they make none. The normative sources are:
 
 - [`../plans/2026-07-14-multi-user-mcp-control-plane-design.md`](../plans/2026-07-14-multi-user-mcp-control-plane-design.md) (v4) — the multi-user architecture, security invariants 1–22, Gaps 1–14, Phases A–F
