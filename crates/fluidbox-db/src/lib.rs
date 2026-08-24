@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use fluidbox_core::event::{EventEnvelope, Redacted};
 use fluidbox_core::state::SessionStatus;
+use fluidbox_obs::field::error_kind as EK;
 use serde_json::Value;
 use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
@@ -7831,7 +7832,7 @@ where
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         continue;
                     }
-                    tracing::info!("pg listener connected ({channel})");
+                    tracing::info!(channel = %channel, "postgres listener connected");
                     loop {
                         match listener.recv().await {
                             Ok(n) => {
@@ -7841,7 +7842,11 @@ where
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "pg listener ({channel}) dropped: {e}; reconnecting"
+                                    channel = %channel,
+                                    error = %e,
+                                    error_kind = EK::DB,
+                                    retrying = true,
+                                    "postgres listener dropped; reconnecting"
                                 );
                                 break;
                             }
@@ -7849,7 +7854,7 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("pg listener ({channel}) connect failed: {e}; retrying");
+                    tracing::warn!(channel = %channel, error = %e, error_kind = EK::DB, retrying = true, "postgres listener connect failed");
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;

@@ -1902,6 +1902,18 @@ async fn materialize_workspace(
     epoch: i64,
 ) -> anyhow::Result<(Option<PathBuf>, Option<String>)> {
     let data_dir = state.cfg.data_dir.clone();
+    // Workspace materialization is the other step a run visibly sits in, and
+    // the credentialed git fetch inside it can take minutes on a large repo.
+    // `fluidbox-workspace` deliberately keeps `tracing` behind the `store`
+    // feature so the in-pod musl collector links neither it nor an async
+    // runtime, so the timing record belongs HERE — in the caller, which already
+    // has the run span and the frozen spec.
+    let sw = fluidbox_obs::Stopwatch::start();
+    tracing::debug!(
+        session_id = %session_id,
+        workspace_kind = run_spec.workspace.kind_name(),
+        "materialising the workspace"
+    );
     let (ws, repo, r#ref) = match &run_spec.workspace {
         WorkspaceSpec::LocalCopy { path } => {
             let src = PathBuf::from(path);
@@ -1987,6 +1999,19 @@ async fn materialize_workspace(
             (ws, None, None)
         }
     };
+    tracing::info!(
+        session_id = %session_id,
+        workspace_kind = run_spec.workspace.kind_name(),
+        // HOST only for a git workspace — a clone URL can carry userinfo, and
+        // the host is what distinguishes "GitHub is slow" from "our fixture
+        // path is wrong" anyway.
+        host = repo.as_deref().and_then(fluidbox_obs::url_host),
+        git_ref = r#ref.as_deref(),
+        base_commit = ws.base_commit.as_deref(),
+        files = ws.file_count,
+        duration_ms = sw.ms_f64(),
+        "workspace materialised"
+    );
 
     // RE-PROVE THE LEASE ADJACENT TO THE EFFECT (#33 review 3). The clone/copy
     // above can take minutes; the epoch we carry was proven BEFORE it. In that
