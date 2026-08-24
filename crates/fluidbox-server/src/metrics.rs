@@ -245,6 +245,13 @@ const PROVISION_LATENCY_MS: &[f64] = &[
     100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0, 120000.0,
 ];
 
+/// Queue-wait buckets, SECONDS. The interesting range is set by what the
+/// operator can act on: sub-5 s means the queue is effectively absent, the
+/// minutes band is a healthy backlog draining, and the top bucket brackets the
+/// 3600 s default age bound so "runs are being expired" is visible as mass
+/// piling into the last bucket rather than as a separate signal.
+const QUEUE_WAIT_SECS: &[f64] = &[1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0];
+
 /// The process-wide metrics registry. One instance lives on [`crate::state::AppStateInner`].
 ///
 /// Fields are grouped by the design's §Operational-metrics bullets. Each is fed
@@ -305,6 +312,19 @@ pub struct Metrics {
     /// In-flight runs (provisioning..finalizing). Replica-local; resets on restart.
     pub active_runs: Gauge,
     pub run_provisioning_ms: Histogram,
+    // ── Run admission (design 2026-08-23 §13). Fixed cardinality, like the
+    // grant families above: no tenant label — per-tenant attribution is the
+    // ledger's job, and the deployment-wide queue is what these answer for.
+    /// Runs admitted by the dispatcher. Counts ADMISSIONS, not runs: a
+    /// capacity-bounced run that is redispatched increments this again, which
+    /// is what makes `dispatched - terminal` readable against the requeue
+    /// counter.
+    pub queue_dispatched: Counter,
+    /// Work refused rather than queued. `depth` = the create-time bound,
+    /// `age` = the queue-age sweeper.
+    pub queue_shed: Family,
+    /// Time from first enqueue to admission, observed at the claim.
+    pub queue_wait_seconds: Histogram,
     // ── Durability (design: database event and ledger write rates).
     pub ledger_events: Counter,
     /// Metrics-scrape failures (a live read — pool count etc. — that errored).
@@ -409,6 +429,13 @@ impl Default for Metrics {
                 "fluidbox_run_provisioning_latency_ms",
                 PROVISION_LATENCY_MS,
             ),
+            queue_dispatched: Counter::default(),
+            queue_shed: Family::new(
+                "fluidbox_queue_shed_total",
+                "reason",
+                &["depth", "age", "requeue_exhausted"],
+            ),
+            queue_wait_seconds: Histogram::new("fluidbox_queue_wait_seconds", QUEUE_WAIT_SECS),
             ledger_events: Counter::default(),
             scrape_errors: Counter::default(),
         }
@@ -510,6 +537,17 @@ pub fn render(m: &Metrics, live: &Live) -> String {
         &mut out,
         "Run provisioning latency (created to running), milliseconds.",
     );
+
+    counter(
+        &mut out,
+        "fluidbox_runs_dispatched_total",
+        "Runs admitted from the capacity queue (a redispatched bounce counts again).",
+        m.queue_dispatched.get(),
+    );
+    m.queue_shed
+        .render(&mut out, "Work refused rather than queued, by reason.");
+    m.queue_wait_seconds
+        .render(&mut out, "Time from first enqueue to admission, seconds.");
 
     counter(
         &mut out,
