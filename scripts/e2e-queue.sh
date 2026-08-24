@@ -24,6 +24,9 @@
 #     isolates it: no live Neon URL, no real provider key, no GitHub App secret.
 #
 # Phases:
+#   P0  INERT BY DEFAULT: with the cap unset, nothing queues and 0034's columns
+#       are never written — the epic's hard requirement, asserted rather than
+#       argued
 #   P1  cap=1 FIFO: three runs, one admitted, two parked; cancel releases the
 #       next in creation order; queue_position reports the wait
 #   P2  depth bound: a full queue answers 429 + Retry-After
@@ -51,6 +54,13 @@ j() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null
 # Trim the ends only: `tr -d ' '` would mangle the text columns these
 # assertions read (a status_reason is a sentence, not a token).
 q() { psql "$PGBASE/$DB" -tAc "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+# How long to wait for a cancelled run to RELEASE its capacity slot. Generous on
+# purpose: `cancelling` and `finalizing` are deliberately counted as occupied
+# (they still hold a sandbox until it is reaped), and with a runnerless provider
+# the wind-down always costs the full 30s quiesce deadline plus a watchdog tick
+# plus a finalize-worker tick. See the note at P1's first cancel.
+SLOT_RELEASE_WAIT=240
 
 DATA_DIR=$(mktemp -d)
 # Absolute, because the server is started from DATA_DIR (see start_server).
@@ -145,8 +155,54 @@ ok "throwaway database $DB created"
 cargo build -q -p fluidbox-server --features test-provider || { no "build"; exit 1; }
 ok "server built with the test-provider feature (NullProvider available)"
 
+# ── P0 ─────────────────────────────────────────────────────────────────────
+# The epic's hard requirement is "with FLUIDBOX_MAX_CONCURRENT_RUNS unset,
+# behaviour is byte-identical to before the feature existed". That is a claim
+# about ABSENCE, which is exactly the kind of claim that quietly stops being
+# true — a stray call site, a check that forgot its feature gate — and which no
+# other phase can catch, because every other phase turns the feature ON.
+say "P0 — inert by default: the feature off changes nothing"
+start_server || exit 1
+grep -q "run admission: off" "$DATA_DIR/server.log" \
+  && ok "boot reports admission off" \
+  || no "boot did not report admission off: $(grep -o 'run admission:.*' "$DATA_DIR/server.log" | head -1)"
+resolve_agent
+[ -n "$AGENT" ] && ok "agent '$AGENT' available" || no "no agent resolved"
+
+Z=$(new_run "inert mode")
+[ -n "$Z" ] && ok "run created with no cap configured" || no "create failed: $(cat "$DATA_DIR/last.json")"
+SZ=$(await_status "$Z" '^(provisioning|initializing|running)$' 30)
+[[ "$SZ" =~ ^(provisioning|initializing|running)$ ]] \
+  && ok "it launched directly, with no dispatcher involved (status $SZ)" \
+  || no "the run did not launch (status $SZ)"
+[ "$(q "select count(*) from sessions where status = 'queued'")" = 0 ] \
+  && ok "nothing ever entered 'queued'" || no "a run was parked with the feature off"
+
+# Migration 0034's columns must sit unused. `launched_at` is the ONE exception
+# and is deliberate: it is the design §3.10 fix for the stale-launch watchdog,
+# which is a bug fix for network grants and is NOT feature-gated.
+[ "$(q "select coalesce(queued_at::text,'NULL') from sessions where id = '$Z'")" = NULL ] \
+  && ok "queued_at is unwritten" || no "queued_at was written with the feature off"
+[ "$(q "select coalesce(dispatch_after::text,'NULL') from sessions where id = '$Z'")" = NULL ] \
+  && ok "dispatch_after is unwritten" || no "dispatch_after was written"
+[ "$(q "select dispatch_attempts from sessions where id = '$Z'")" = 0 ] \
+  && ok "dispatch_attempts is 0 (nothing claimed it)" || no "dispatch_attempts moved"
+[ "$(q "select coalesce(launched_at::text,'NULL') from sessions where id = '$Z'")" != NULL ] \
+  && ok "launched_at IS stamped — the stale-launch fix is deliberately not gated" \
+  || no "launched_at was not stamped"
+
+# And no depth check runs: a create that WOULD be past a bound is accepted.
+for i in 1 2 3 4 5; do new_run "inert $i" >/dev/null; done
+RESP=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$H" -H 'content-type: application/json' \
+  -d '{"agent":"'"$AGENT"'","task":"no bound exists","repo":{"kind":"none"}}' "$API/v1/sessions")
+[ "$RESP" = 200 ] || [ "$RESP" = 201 ] \
+  && ok "no depth bound is enforced (create returns $RESP, never 429)" \
+  || no "a create was shed with the feature off: $RESP"
+curl -s -o /dev/null -X POST -H "$H" "$API/v1/sessions/$Z/cancel"
+
 # ── P1 ─────────────────────────────────────────────────────────────────────
 say "P1 — cap 1: one runs, the rest queue FIFO"
+reset_db || exit 1
 start_server FLUIDBOX_MAX_CONCURRENT_RUNS=1 FLUIDBOX_QUEUE_MAX_DEPTH=50 || exit 1
 grep -q "run admission: ENABLED" "$DATA_DIR/server.log" \
   && ok "boot announces admission is enabled" || no "boot did not announce admission"
@@ -185,14 +241,27 @@ POS_C=$(curl -s -H "$H" "$API/v1/sessions/$C" | j "['queue_position']")
 [ "$POS_C" = 1 ] && ok "C reports queue_position 1 (behind B)" || no "C position: $POS_C"
 
 # Cancelling A frees the slot; B goes next because FIFO orders by created_at.
+#
+# Wait for A to reach a TERMINAL state, not merely for the cancel to be
+# accepted. `cancelling` and `finalizing` are deliberately counted as OCCUPIED
+# by the occupancy query — they still hold a sandbox until it is reaped — so the
+# slot is not free until A releases it.
+#
+# B's dispatch IS the proof that A released the slot, so that is the only thing
+# asserted. An intermediate "A reached a terminal state" assertion was tried and
+# removed: it couples the test to how long wind-down takes, which with a
+# RUNNERLESS provider is both slow and variable — a cancel can never be
+# acknowledged, so it always costs the full 30s quiesce deadline plus a watchdog
+# tick plus a finalize-worker tick, and it flaked at both 60s and 120s budgets.
+# None of that is queue behaviour. Assert the property, not the mechanism.
 curl -s -o /dev/null -X POST -H "$H" "$API/v1/sessions/$A/cancel"
-SB=$(await_status "$B" '^(provisioning|initializing|running)$' 40)
+SB=$(await_status "$B" '^(provisioning|initializing|running)$' "$SLOT_RELEASE_WAIT")
 [[ "$SB" =~ ^(provisioning|initializing|running)$ ]] \
   && ok "cancelling A admitted B next (FIFO, status $SB)" || no "B never dispatched (status $SB)"
 [ "$(status_of "$C")" = queued ] && ok "C still waits (the cap is still 1)" || no "C: $(status_of "$C")"
 
 curl -s -o /dev/null -X POST -H "$H" "$API/v1/sessions/$B/cancel"
-SC=$(await_status "$C" '^(provisioning|initializing|running)$' 40)
+SC=$(await_status "$C" '^(provisioning|initializing|running)$' "$SLOT_RELEASE_WAIT")
 [[ "$SC" =~ ^(provisioning|initializing|running)$ ]] \
   && ok "cancelling B admitted C (status $SC)" || no "C never dispatched (status $SC)"
 curl -s -o /dev/null -X POST -H "$H" "$API/v1/sessions/$C/cancel"
