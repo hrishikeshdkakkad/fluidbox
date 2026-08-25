@@ -165,6 +165,40 @@ variable "sql_backup_retention_days" {
 
 # ── Edge ─────────────────────────────────────────────────────────────────────
 
+variable "cilium_mode" {
+  description = <<-EOT
+    Which Cilium the cluster runs, and therefore which network policies are
+    expressible.
+
+      dataplane_v2   GKE's managed Cilium. Google patches it, nothing to
+                     operate - but it exposes only CiliumClusterwideNetworkPolicy
+                     (behind enable_cilium_clusterwide_network_policy) and NO
+                     namespaced CiliumNetworkPolicy. Fluidbox's per-run enforcer
+                     writes the namespaced kind, so governed egress is
+                     IMPOSSIBLE and every sandbox is offline-only.
+
+      upstream       Legacy datapath plus self-managed upstream Cilium (installed
+                     by the app stack). Provides BOTH policy CRDs, so governed
+                     egress works. Verified on a probe cluster before adoption:
+                     a namespaced CNP carrying toFQDNs was accepted Valid=True.
+
+    CHANGING THIS REPLACES THE CLUSTER. datapath_provider is immutable, so
+    Terraform destroys and recreates - every workload, PVC and Ingress with it.
+
+    The cost of `upstream` is ongoing, not one-off: GKE stops managing the CNI,
+    and node upgrades or reboots can undo Cilium's node configuration. The
+    agent-not-ready taint below is what makes that survivable - pods are held off
+    a node until Cilium has re-prepared it.
+  EOT
+  type        = string
+  default     = "dataplane_v2"
+
+  validation {
+    condition     = contains(["dataplane_v2", "upstream"], var.cilium_mode)
+    error_message = "cilium_mode must be dataplane_v2 or upstream."
+  }
+}
+
 variable "enable_cilium_clusterwide_network_policy" {
   description = <<-EOT
     Expose the CiliumClusterwideNetworkPolicy CRD on GKE Dataplane V2, which is
@@ -248,4 +282,18 @@ variable "labels" {
     managed-by = "terraform"
     stack      = "platform"
   }
+}
+
+variable "cluster_deletion_protection" {
+  description = <<-EOT
+    Guards the GKE cluster against deletion, including the delete+create a
+    `datapath_provider` change forces.
+
+    Default TRUE. Clearing it is a deliberate, recorded act - pass
+    -var cluster_deletion_protection=false for the one apply that replaces the
+    cluster, then restore it. That two-step is the point: an operator cannot
+    replace the cluster by editing one unrelated field.
+  EOT
+  type        = bool
+  default     = true
 }

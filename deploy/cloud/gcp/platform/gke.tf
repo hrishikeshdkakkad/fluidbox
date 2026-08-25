@@ -28,17 +28,23 @@ resource "google_container_cluster" "fluidbox" {
   network    = google_compute_network.vpc.id
   subnetwork = google_compute_subnetwork.gke.id
 
-  networking_mode   = "VPC_NATIVE"
-  datapath_provider = "ADVANCED_DATAPATH"
+  networking_mode = "VPC_NATIVE"
 
-  # Turns on the CiliumClusterwideNetworkPolicy CRD. Dataplane V2 does not
-  # expose Cilium's POLICY CRDs unless asked - see the variable's comment for
-  # why the absence is easy to misread as a platform limitation.
-  enable_cilium_clusterwide_network_policy = var.enable_cilium_clusterwide_network_policy
+  # IMMUTABLE. Changing this REPLACES the cluster - see var.cilium_mode.
+  #   dataplane_v2 -> GKE's managed Cilium (ADVANCED_DATAPATH)
+  #   upstream     -> legacy datapath, so self-managed Cilium owns the CNI
+  datapath_provider = var.cilium_mode == "dataplane_v2" ? "ADVANCED_DATAPATH" : "LEGACY_DATAPATH"
+
+  # Dataplane-V2-only knob: it exposes the CiliumClusterwideNetworkPolicy CRD.
+  # Meaningless (and rejected) on the legacy datapath, where upstream Cilium
+  # brings its own CRDs - both of them.
+  enable_cilium_clusterwide_network_policy = (
+    var.cilium_mode == "dataplane_v2" ? var.enable_cilium_clusterwide_network_policy : null
+  )
 
   # A cluster is not a cattle resource: deleting it destroys every PVC and
-  # every running sandbox. Removal is a reviewed act - flip this deliberately.
-  deletion_protection = true
+  # every running sandbox. Removal is a reviewed act - see the variable.
+  deletion_protection = var.cluster_deletion_protection
 
   release_channel {
     channel = var.gke_release_channel
@@ -221,6 +227,20 @@ resource "google_container_node_pool" "system" {
       "fluidbox.dev/role" = "system"
     })
 
+    # Self-managed Cilium only. Holds every pod off a node until Cilium has
+    # prepared it and removed the taint. Without it, pods start on whatever CNI
+    # is present at boot and stay UNMANAGED - and because a GKE node upgrade or
+    # reboot re-applies the stock CNI config, this is not just a first-boot
+    # concern. It is the mechanism that makes a self-managed CNI survivable here.
+    dynamic "taint" {
+      for_each = var.cilium_mode == "upstream" ? [1] : []
+      content {
+        key    = "node.cilium.io/agent-not-ready"
+        value  = "true"
+        effect = "NO_EXECUTE"
+      }
+    }
+
     tags = ["fluidbox-node", "fluidbox-system"]
 
     metadata = {
@@ -296,6 +316,15 @@ resource "google_container_node_pool" "sandbox" {
       key    = "fluidbox.dev/role"
       value  = "sandbox"
       effect = "NO_SCHEDULE"
+    }
+
+    dynamic "taint" {
+      for_each = var.cilium_mode == "upstream" ? [1] : []
+      content {
+        key    = "node.cilium.io/agent-not-ready"
+        value  = "true"
+        effect = "NO_EXECUTE"
+      }
     }
 
     tags = ["fluidbox-node", "fluidbox-sandbox"]
