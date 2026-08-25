@@ -106,6 +106,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.3
       - name: helm lint + render assertions
         run: bash deploy/helm/chart-assertions.sh
       - name: production overlay lints and renders
@@ -345,6 +347,8 @@ jobs:
           cluster_name: ${{ vars.GKE_CLUSTER }}
           location: ${{ vars.GKE_LOCATION }}
       - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.3
       - name: record the CURRENT revision (rollback target)
         id: before
         run: |
@@ -368,10 +372,11 @@ jobs:
             -f deploy/helm/fluidbox/values/gke.yaml \
             -f deploy/cloud/gcp/values/production.yaml \
             "${ARGS[@]}" \
-            --atomic \
+            --rollback-on-failure \
             --wait --wait-for-jobs \
             --timeout 20m
-          # --atomic is the readiness gate AND the automatic rollback: if the
+          # --rollback-on-failure (Helm 4's name for --atomic) is the readiness
+          # gate AND the automatic rollback: if the
           # pre-upgrade migration Job fails, or any pod never becomes ready
           # within the timeout, Helm restores the previous revision and exits
           # non-zero. Promotion stops here, with the cluster back where it was.
@@ -494,6 +499,8 @@ jobs:
           cluster_name: ${{ vars.GKE_CLUSTER }}
           location: ${{ vars.GKE_LOCATION }}
       - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.3
       - name: helm rollback
         run: |
           set -euo pipefail
