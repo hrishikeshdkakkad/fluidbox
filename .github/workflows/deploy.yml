@@ -24,11 +24,19 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "apps/web/**"
+      # The post-deploy GATES are part of the deploy surface. Leaving them out
+      # meant a change to a verification script merged to main WITHOUT ever
+      # being run against the deployment - the pipeline's own tests were the
+      # one thing it never tested.
+      - "scripts/cloud/**"
+      - "tests/browser/**"
       - ".github/workflows/deploy.yml"
   pull_request:
     paths:
       - "deploy/cloud/gcp/**"
       - "deploy/helm/**"
+      - "scripts/cloud/**"
+      - "tests/browser/**"
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
     inputs:
@@ -97,7 +105,7 @@ jobs:
           has '^(crates/(workspaced|fluidbox-workspace)/|deploy/workspaced\.Dockerfile)' && echo "workspaced=true" >> "$GITHUB_OUTPUT" || echo "workspaced=false" >> "$GITHUB_OUTPUT"
           has '^images/' && echo "runners=true" >> "$GITHUB_OUTPUT" || echo "runners=false" >> "$GITHUB_OUTPUT"
           has '^deploy/cloud/gcp/' && echo "infra=true" >> "$GITHUB_OUTPUT" || echo "infra=false" >> "$GITHUB_OUTPUT"
-          has '^deploy/(helm|cloud/gcp/values)/' && echo "chart=true" >> "$GITHUB_OUTPUT" || echo "chart=false" >> "$GITHUB_OUTPUT"
+          has '^(deploy/(helm|cloud/gcp/values)/|scripts/cloud/|tests/browser/)' && echo "chart=true" >> "$GITHUB_OUTPUT" || echo "chart=false" >> "$GITHUB_OUTPUT"
           has '^apps/web/' && echo "web=true" >> "$GITHUB_OUTPUT" || echo "web=false" >> "$GITHUB_OUTPUT"
 
   # ── Static gates: these run before anything reaches the cloud ─────────────
