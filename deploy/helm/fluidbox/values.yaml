@@ -46,6 +46,11 @@ secretKeys:
   # Only read when server.archiveStore is "s3".
   archiveS3AccessKeyId: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID
   archiveS3SecretAccessKey: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY
+  # Only read when litellm.database.enabled. This is LiteLLM's OWN database —
+  # never the fluidbox application database. LiteLLM runs prisma migrations
+  # against whatever it is given, so pointing it at the app database would let
+  # it alter the schema fluidbox owns.
+  litellmDatabaseUrl: LITELLM_DATABASE_URL
 
 server:
   # Default stays 1. Phase F made >1 POSSIBLE, not automatic: raising this
@@ -233,6 +238,25 @@ server:
   archivePvc:
     size: 10Gi
     storageClass: ""     # "" = cluster default; per-cloud presets set gp3/managed-csi/…
+  # ── Placement ───────────────────────────────────────────────────────────────
+  # The control plane must NOT land on preemptible sandbox capacity: a node
+  # taken back mid-run kills the thing that governs every other run. On a
+  # tainted sandbox pool the taint already excludes it, but a nodeSelector says
+  # so positively rather than relying on the absence of a toleration.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Spread replicas across failure domains. Inert at replicas: 1; the moment
+  # archiveStore "s3" allows more, this is what stops both landing on one node.
+  topologySpreadConstraints: []
+  # Outranks sandboxes so a capacity burst can never evict the control plane.
+  priorityClassName: ""
+  serviceAccount:
+    # e.g. iam.gke.io/gcp-service-account for GKE Workload Identity. Leave empty
+    # unless the control plane genuinely needs a cloud API: on GKE with
+    # GKE_METADATA, an UNANNOTATED ServiceAccount gets no cloud credential at
+    # all, which is the stronger default.
+    annotations: {}
   extraEnv: []
 
 web:
@@ -249,6 +273,10 @@ web:
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits: { cpu: "500m", memory: "512Mi" }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
   # Extra env for the web container (mirrors server.extraEnv).
   extraEnv: []
 
@@ -262,6 +290,18 @@ litellm:
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
     limits: { cpu: "1", memory: "1Gi" }
+  nodeSelector: {}
+  tolerations: []
+  priorityClassName: ""
+  # LiteLLM's own Postgres. REQUIRED for llm.keyMode "tenant": /key/generate is
+  # a database-backed LiteLLM feature and simply 404s on a stateless proxy.
+  #
+  # Turning this on ALSO requires the `litellm-database` image variant rather
+  # than plain `litellm` — only that variant ships the prisma client that
+  # applies LiteLLM's schema at start. Setting the URL against the plain image
+  # produces a container that starts, serves, and silently has no key store.
+  database:
+    enabled: false
 # External LiteLLM (production default): the facade upstream URL + master key.
 llm:
   upstreamUrl: ""      # e.g. http://litellm.example:4000 ; empty + litellm.enabled uses the bundled one
@@ -274,14 +314,21 @@ llm:
   # server env (server.yaml) and back the LiteLLM proxy with its OWN Postgres (a
   # DEDICATED LiteLLM database — /key/* is a Postgres-backed LiteLLM feature; NOT
   # wired in this chart today, and never the fluidbox app DB):
-  # keyMode: shared            # shared | tenant
-  # adminUrl: ""               # FLUIDBOX_LLM_ADMIN_URL; defaults to upstreamUrl
-  # tenant:
-  #   models: []               # FLUIDBOX_LLM_TENANT_MODELS (CSV) — virtual-key allowlist
-  #   maxBudget: ""            # FLUIDBOX_LLM_TENANT_MAX_BUDGET (USD)
-  #   budgetDuration: ""       # FLUIDBOX_LLM_TENANT_BUDGET_DURATION, e.g. 30d
-  #   tpm: ""                  # FLUIDBOX_LLM_TENANT_TPM
-  #   rpm: ""                  # FLUIDBOX_LLM_TENANT_RPM
+  #
+  # NOW WIRED (2026-08). It has to be: a hosted deployment sets
+  # FLUIDBOX_REQUIRE_SSO=1, and REQUIRE_SSO combined with keyMode "shared"
+  # makes the facade answer 503 tenant_llm_keys_required on EVERY model call.
+  # A multi-user deployment left on "shared" is therefore not a degraded
+  # deployment, it is a non-functional one — so the chart refuses that
+  # combination at render time rather than shipping it.
+  keyMode: shared            # shared | tenant
+  adminUrl: ""               # FLUIDBOX_LLM_ADMIN_URL; "" defaults to upstreamUrl
+  tenant:
+    models: []               # FLUIDBOX_LLM_TENANT_MODELS (CSV) — virtual-key allowlist
+    maxBudget: ""            # FLUIDBOX_LLM_TENANT_MAX_BUDGET (USD)
+    budgetDuration: ""       # FLUIDBOX_LLM_TENANT_BUDGET_DURATION, e.g. 30d
+    tpm: ""                  # FLUIDBOX_LLM_TENANT_TPM
+    rpm: ""                  # FLUIDBOX_LLM_TENANT_RPM
 
 ingress:
   enabled: false
@@ -445,3 +492,145 @@ networkGrants:
     nodeSelector:
       fluidbox.dev/egress-gateway: "true"
     interface: ""
+
+# ── Disruption budgets ──────────────────────────────────────────────────────
+#
+# A PDB constrains VOLUNTARY disruption only — node drains, cluster upgrades,
+# autoscaler scale-down. It cannot protect against a node that simply dies.
+#
+# Read the interaction with replicas carefully, because a PDB on a
+# single-replica Deployment is not harmless: `minAvailable: 1` with one replica
+# means the node can NEVER be drained, which turns a routine GKE upgrade into a
+# stuck operation that times out hours later with no obvious cause. The chart
+# therefore renders a server PDB only when there is more than one replica, and
+# `helm template` FAILS if you ask for one anyway — a wrong PDB is worse than
+# no PDB, and silence would hide it until the next node upgrade.
+podDisruptionBudget:
+  enabled: true
+  server:
+    # "" = maxUnavailable: 1, which is the correct shape for a small fleet:
+    # it allows a drain to proceed one pod at a time regardless of replica
+    # count. Set minAvailable instead only if you know why.
+    minAvailable: ""
+    maxUnavailable: 1
+  web:
+    minAvailable: ""
+    maxUnavailable: 1
+
+# ── Horizontal autoscaling ──────────────────────────────────────────────────
+#
+# OFF by default, and REFUSED outright for the server unless archiveStore is
+# "s3". The reason is not caution: with the node-local archive backend the
+# server runs behind a single ReadWriteOnce PVC, so a second replica cannot
+# even attach the volume — an HPA would scale into pods that never start, and
+# the boot-time FLUIDBOX_REPLICAS guard would refuse them if they did.
+#
+# Cluster-level autoscaling is separate and always on: the Terraform node pools
+# scale the system pool 1→3 and the sandbox pool 0→N. That is the elasticity
+# that actually matters here, because sandbox load is what varies.
+autoscaling:
+  server:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    # Scale up promptly, down slowly. A control plane that sheds a replica the
+    # moment load dips drops the SSE streams that replica was serving; browsers
+    # reconnect via Last-Event-ID, but it is gratuitous churn.
+    scaleDownStabilizationWindowSeconds: 600
+  web:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    scaleDownStabilizationWindowSeconds: 300
+
+# ── GKE edge (Ingress companions) ───────────────────────────────────────────
+#
+# The GKE Ingress controller is configured through CRDs that sit BESIDE the
+# Ingress, not through annotations on it alone. All three are off by default so
+# the chart still renders on clusters where these CRDs do not exist.
+gke:
+  enabled: false
+  # Google-managed TLS. Provisioning takes 15–60 minutes and REQUIRES the DNS
+  # record to already resolve to the Ingress address — the ACME-style challenge
+  # is served by the load balancer itself, so a certificate for a name that does
+  # not point here stays Provisioning forever.
+  managedCertificate:
+    enabled: false
+    domains: []
+  # Per-Service backend behaviour. timeoutSec is the load-bearing one.
+  backendConfig:
+    enabled: false
+    # SECONDS THE BACKEND MAY TAKE, and for a streaming response that is the
+    # whole stream duration — not time-to-first-byte. The GCLB default is 30s,
+    # which would cut every SSE timeline at 30 seconds and look exactly like a
+    # flaky network. 3600 matches the documented per-hop budget.
+    timeoutSec: 3600
+    # Finish in-flight requests when a backend is removed, instead of resetting
+    # them. Without it, every rolling update kills live streams.
+    drainingTimeoutSec: 60
+    healthCheck:
+      # GCLB health-checks "/" by default. The control plane answers
+      # /v1/health; on "/" it would return 404 and the whole backend would be
+      # marked UNHEALTHY with a perfectly healthy application behind it.
+      requestPath: /v1/health
+      port: 8787
+      checkIntervalSec: 15
+      timeoutSec: 5
+      healthyThreshold: 1
+      unhealthyThreshold: 3
+  # Frontend behaviour: TLS policy and the plain-HTTP redirect.
+  frontendConfig:
+    enabled: false
+    redirectToHttps: true
+    # Name of a pre-created compute SSL policy ("" = Google default).
+    sslPolicy: ""
+
+# ── External Secrets ────────────────────────────────────────────────────────
+#
+# Populates `existingSecret` from a cloud secret manager instead of a human
+# running `kubectl create secret`. The chart still only READS the Secret — this
+# just declares where its contents come from, so the credential never appears
+# in a values file, a CI log, or Terraform state.
+#
+# Requires the External Secrets operator and its CRDs (installed by the
+# platform's app stack, not by this chart).
+externalSecrets:
+  enabled: false
+  # gcpsm | awssm | azurekv — only gcpsm is wired today.
+  provider: gcpsm
+  # GCP project holding the secrets.
+  projectID: ""
+  refreshInterval: 1h
+  # secretKey = the key inside the Kubernetes Secret; remoteRef = the Secret
+  # Manager secret id. The keys must match the secretKeys map above.
+  data: []
+    # - secretKey: DATABASE_URL
+    #   remoteRef: fluidbox-database-url
+
+# ── Pre-upgrade migration gate ──────────────────────────────────────────────
+#
+# Runs the NEW server image with FLUIDBOX_MIGRATE_ONLY=1 as a Helm pre-upgrade
+# hook: config parsed, migrations applied, RLS posture verified, exit 0. Helm
+# waits for it, so a bad migration OR a bad config fails the release before any
+# new pod rolls, instead of surfacing as a CrashLoopBackOff mid-rollout.
+#
+# OFF by default so existing installs keep exactly today's behaviour (migrations
+# run at pod boot). Turn it on wherever a pipeline promotes automatically - that
+# is the case where "the gate failed, so promotion stopped" has to be true.
+migrationJob:
+  enabled: false
+  # A few retries absorb transient database unavailability (a Cloud SQL
+  # maintenance failover, a cold connection). It does NOT paper over a broken
+  # migration: sqlx applies each migration in a transaction, so a failing one
+  # fails identically every attempt.
+  backoffLimit: 3
+  # Hard ceiling on the whole gate. Long enough for a large migration, short
+  # enough that a wedged deploy fails rather than hanging the pipeline.
+  activeDeadlineSeconds: 900
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits: { cpu: "1", memory: "1Gi" }

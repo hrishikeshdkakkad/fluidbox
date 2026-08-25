@@ -1,0 +1,250 @@
+# Fluidbox on GKE — production overlay for project fluidbox-506603.
+#
+# Layered ON TOP of deploy/helm/fluidbox/values/gke.yaml:
+#   helm upgrade --install fluidbox deploy/helm/fluidbox \
+#     -f deploy/helm/fluidbox/values/gke.yaml \
+#     -f deploy/cloud/gcp/values/production.yaml
+#
+# Contains NO credential material. Every secret arrives through External
+# Secrets from Secret Manager (see externalSecrets below), so this file is
+# safe to commit and safe to read.
+#
+# VALUES-MERGE TRAP (bit the EKS kit, documented in deploy/cloud/README.md):
+# Helm deep-merges MAPS across -f files but REPLACES lists. `nodeSelector: {}`
+# in a later file therefore does NOT clear an earlier one — use
+# `--set x.nodeSelector=null`.
+
+fullnameOverride: fluidbox
+
+# ── Topology ────────────────────────────────────────────────────────────────
+#
+#   browser -> https://platform.fluidzero.ai            (Vercel, Next.js)
+#                 ├── /, /docs, /app/*                  rendered by Vercel
+#                 ├── /api/fluidbox/*  proxy route  ──┐
+#                 └── /v1/*            next rewrite ──┤  (SAME origin: __Host-
+#                                                     │   cookies and the Origin
+#                                                     │   check both require it)
+#                                                     ▼
+#              https://api.platform.fluidzero.ai   (this GKE Ingress)
+#
+# publicUrl is therefore the VERCEL origin, not this one: it feeds the OAuth
+# redirect_uri, the CIMD document, and the exact-match Origin check on
+# cookie-authenticated writes — all of which are about what the BROWSER sees.
+server:
+  # Two replicas, which the s3 archive backend is what makes possible. The
+  # payoff is a RollingUpdate strategy: deploys stop being an outage.
+  replicas: 2
+
+  archiveStore: "s3"
+  archiveS3:
+    bucket: fluidbox-506603-archives
+    # SigV4 credential scope. GCS accepts the bucket's location.
+    region: us-central1
+    # GCS's S3-compatible XML API.
+    endpoint: https://storage.googleapis.com
+    prefix: "archives/"
+    # Explicit rather than inferred. The chart defaults to path style whenever
+    # an endpoint is set, but writing it down keeps the addressing mode from
+    # depending on a default that could change.
+    forcePathStyle: "true"
+
+  publicUrl: https://platform.fluidzero.ai
+
+  # Migration 0018's NOLOGIN least-privilege role. Cloud SQL's user is neither
+  # SUPERUSER nor BYPASSRLS, so unlike the Neon posture the 0018 policies
+  # actually execute here — and this pool split makes every request run as the
+  # non-owner role on top of that.
+  runtimeRole: "fluidbox_runtime"
+  allowRlsBypass: false
+
+  # Keep the control plane on the always-on pool. The sandbox pool is Spot: a
+  # node reclaimed mid-run would take down the process governing every OTHER
+  # run at the same time.
+  nodeSelector:
+    fluidbox.dev/role: system
+  priorityClassName: fluidbox-control-plane
+  # Inert on a single-node pool; the moment the autoscaler adds a second node
+  # this is what stops both replicas landing together. ScheduleAnyway, not
+  # DoNotSchedule — a hard constraint would leave replica 2 Pending forever on
+  # a one-node cluster.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: fluidbox
+          app.kubernetes.io/component: server
+
+  resources:
+    requests: { cpu: "250m", memory: "512Mi" }
+    limits: { cpu: "1", memory: "1Gi" }
+
+  # Two replicas x (25 + 2) = 54 connections against a max_connections of 100,
+  # leaving headroom for migrations, psql and a surge upgrade running three
+  # replicas briefly. "" keeps the server's own default (25) rather than
+  # pinning a second copy of the number here.
+  dbPool:
+    maxConnections: ""
+
+  # ── Run admission: deliberately NOT enabled ───────────────────────────────
+  # Setting maxConcurrentRuns switches the Deployment to strategy: Recreate,
+  # because the cap is a per-pod environment variable and a RollingUpdate would
+  # run two generations with two different "deployment-wide" caps. That is a
+  # visible outage on every deploy.
+  #
+  # The trade is explicit: this deployment keeps zero-downtime rollouts, and the
+  # sandbox ResourceQuota below remains the capacity backstop (over-quota runs
+  # take the bounce-and-retry path rather than waiting in a FIFO queue).
+  # To switch, set maxConcurrentRuns <= sandbox.quota.pods and accept the
+  # Recreate window. See docs/hosted/run-queue-operations.md.
+  maxConcurrentRuns: ""
+
+  extraEnv:
+    # Hosted multi-user identity. Confines the admin token to /v1/admin/*;
+    # browsers authenticate through each org's OIDC issuer (Auth0).
+    - { name: FLUIDBOX_REQUIRE_SSO, value: "1" }
+    # Envelope sealing (v2): per-tenant DEKs, AAD-bound so a blob cannot be
+    # transplanted across tenants or columns.
+    #
+    # KEK CUSTODY, stated honestly: fluidbox ships `off | static | aws` and has
+    # no native GCP KMS backend, so `static` is the only mode that gives v2
+    # envelope sealing on GCP. The KEK lives in Secret Manager encrypted by a
+    # customer-managed Cloud KMS key, so custody roots on Cloud KMS + IAM +
+    # audit logs — but unlike the `aws` backend the key plaintext IS present in
+    # this pod's environment. A native `gcp` KeyWrapper is the follow-up that
+    # closes that gap. See docs/hosted/gcp-architecture.md#sealing.
+    - { name: FLUIDBOX_KMS_MODE, value: "static" }
+    - name: FLUIDBOX_KMS_STATIC_KEK
+      valueFrom:
+        secretKeyRef: { name: fluidbox-secrets, key: FLUIDBOX_KMS_STATIC_KEK }
+    # FLUIDBOX_TRUST_FORWARDED_FOR is deliberately LEFT OFF. This Ingress is
+    # publicly reachable, so an X-Forwarded-For header can be forged by anyone
+    # who addresses it directly rather than going through Vercel. Trusting it
+    # would let an attacker choose the identity that per-IP limiting and audit
+    # rows record. The cost of leaving it off is that client IPs read as the
+    # load balancer's — the correct trade for a public origin.
+
+# The dashboard is served by Vercel, not by the cluster.
+web:
+  enabled: false
+
+# ── LiteLLM: database-backed, for per-tenant virtual keys ───────────────────
+#
+# NOT optional here. With FLUIDBOX_REQUIRE_SSO=1 the facade answers
+# 503 tenant_llm_keys_required on every model call unless llm.keyMode is
+# "tenant", and per-tenant virtual keys are a Postgres-backed LiteLLM feature —
+# hence the database image variant and its OWN database.
+litellm:
+  enabled: true
+  image: ghcr.io/berriai/litellm-database:main-stable
+  database:
+    enabled: true
+  nodeSelector:
+    fluidbox.dev/role: system
+  priorityClassName: fluidbox-control-plane
+  resources:
+    requests: { cpu: "250m", memory: "512Mi" }
+    limits: { cpu: "1", memory: "2Gi" }
+
+llm:
+  keyMode: tenant
+  tenant:
+    # Allowlist. A virtual key that can reach any model is a budget with no
+    # shape; this pins tenants to the models this deployment intends to serve.
+    models:
+      - claude-haiku-4-5
+      - claude-sonnet-5
+    maxBudget: "25"
+    budgetDuration: "30d"
+
+# ── Edge ────────────────────────────────────────────────────────────────────
+ingress:
+  enabled: true
+  className: gce
+  host: api.platform.fluidzero.ai
+  annotations:
+    # The reserved address from Terraform. Without this the controller
+    # allocates an ephemeral one, and the Route 53 record (in a different
+    # cloud) would silently point at nothing after any Ingress recreation.
+    kubernetes.io/ingress.global-static-ip-name: fluidbox-ingress
+    networking.gke.io/managed-certificates: fluidbox-server
+    networking.gke.io/v1beta1.FrontendConfig: fluidbox-server
+  # No `tls:` block: the certificate is a GKE ManagedCertificate referenced by
+  # the annotation above, not a Kubernetes Secret.
+  tls: []
+
+gke:
+  enabled: true
+  managedCertificate:
+    enabled: true
+    domains:
+      - api.platform.fluidzero.ai
+  backendConfig:
+    enabled: true
+    # SSE. The GCLB default of 30s would cut every run timeline at 30 seconds.
+    timeoutSec: 3600
+    drainingTimeoutSec: 60
+    healthCheck:
+      requestPath: /v1/health
+      port: 8787
+  frontendConfig:
+    enabled: true
+    redirectToHttps: true
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
+externalSecrets:
+  enabled: true
+  provider: gcpsm
+  projectID: fluidbox-506603
+  refreshInterval: 1h
+  data:
+    - { secretKey: DATABASE_URL, remoteRef: fluidbox-database-url }
+    - { secretKey: FLUIDBOX_ADMIN_TOKEN, remoteRef: fluidbox-admin-token }
+    - { secretKey: FLUIDBOX_CREDENTIAL_KEY, remoteRef: fluidbox-credential-key }
+    - { secretKey: FLUIDBOX_KMS_STATIC_KEK, remoteRef: fluidbox-kms-static-kek }
+    - { secretKey: LITELLM_MASTER_KEY, remoteRef: litellm-master-key }
+    - { secretKey: LITELLM_DATABASE_URL, remoteRef: litellm-database-url }
+    - { secretKey: ANTHROPIC_API_KEY, remoteRef: anthropic-api-key }
+    - { secretKey: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID, remoteRef: fluidbox-archive-access-key-id }
+    - { secretKey: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY, remoteRef: fluidbox-archive-secret-access-key }
+
+# ── Sandbox plane ───────────────────────────────────────────────────────────
+sandbox:
+  egressProfile: zeroEgress
+  nodeSelector:
+    fluidbox.dev/role: sandbox
+  tolerations:
+    - key: fluidbox.dev/role
+      operator: Equal
+      value: sandbox
+      effect: NoSchedule
+  priorityClassName: fluidbox-sandbox
+  # Sized to the lean sandbox pool: 3 x e2-standard-4 is ~11 allocatable vCPU
+  # and ~36 GiB. The three quota numbers are ONE setting expressed three ways —
+  # pods x resources.requests — and leaving one behind silently caps you at
+  # whichever binds first.
+  quota:
+    enabled: true
+    pods: "12"
+    requestsCpu: "6"
+    requestsMemory: "12Gi"
+
+# Pre-upgrade gate: the new image parses its config, applies migrations and
+# verifies the RLS posture BEFORE any new pod rolls. A failure fails the Helm
+# release, so `--atomic` rolls back and promotion stops - which is the whole
+# point of an automatic commit-to-production pipeline having a gate at all.
+migrationJob:
+  enabled: true
+
+podDisruptionBudget:
+  enabled: true
+
+netpol:
+  # Dataplane V2 is Cilium and enforces natively. Fail closed anyway: the boot
+  # probe gates runs until it PROVES the CNI drops traffic.
+  requireEnforced: true
+  # GKE DPv2 programs policy for a new pod asynchronously; a t=0 sample can
+  # observe an unprogrammed network. This is a deadline on observations, not a
+  # delay - it ends at the first successful one.
+  waitSeconds: 90

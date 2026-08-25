@@ -1,0 +1,63 @@
+{{- /*
+PodDisruptionBudgets.
+
+A PDB is only meaningful above one replica, and actively HARMFUL at one: with a
+single pod, `minAvailable: 1` makes the pod undrainable, so a node upgrade or an
+autoscaler scale-down blocks indefinitely and surfaces hours later as a stuck
+operation with no obvious cause. The chart therefore renders a PDB only when the
+workload can actually tolerate losing a pod, and REFUSES a hand-set minAvailable
+that would create the stuck-drain case — silence there would hide the mistake
+until the next upgrade window.
+*/ -}}
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- $srvAuto := .Values.autoscaling.server.enabled -}}
+{{- $srvReplicas := int .Values.server.replicas -}}
+{{- $srvEffective := ternary (int .Values.autoscaling.server.minReplicas) $srvReplicas $srvAuto -}}
+{{- if and (ne (toString .Values.podDisruptionBudget.server.minAvailable) "") (le $srvEffective 1) }}
+{{- fail (printf "podDisruptionBudget.server.minAvailable is set but the server runs %d replica(s): a PDB requiring 1 available pod makes that pod undrainable and blocks every node upgrade. Raise server.replicas (which needs server.archiveStore=\"s3\") or leave minAvailable empty." $srvEffective) }}
+{{- end }}
+{{- if gt $srvEffective 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  {{- if ne (toString .Values.podDisruptionBudget.server.minAvailable) "" }}
+  minAvailable: {{ .Values.podDisruptionBudget.server.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.server.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: server
+{{- end }}
+{{- if .Values.web.enabled }}
+{{- $webAuto := .Values.autoscaling.web.enabled -}}
+{{- $webEffective := ternary (int .Values.autoscaling.web.minReplicas) (int .Values.web.replicas) $webAuto -}}
+{{- if and (ne (toString .Values.podDisruptionBudget.web.minAvailable) "") (le $webEffective 1) }}
+{{- fail (printf "podDisruptionBudget.web.minAvailable is set but the dashboard runs %d replica(s) — same undrainable-pod trap as the server. Raise web.replicas or leave minAvailable empty." $webEffective) }}
+{{- end }}
+{{- if gt $webEffective 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "fluidbox.webName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  {{- if ne (toString .Values.podDisruptionBudget.web.minAvailable) "" }}
+  minAvailable: {{ .Values.podDisruptionBudget.web.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.web.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "fluidbox.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: web
+{{- end }}
+{{- end }}
+{{- end }}

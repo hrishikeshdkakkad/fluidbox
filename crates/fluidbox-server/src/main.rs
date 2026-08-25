@@ -127,6 +127,27 @@ fn bounded(router: Router, max_request_body_bytes: usize) -> Router {
     router.layer(axum::extract::DefaultBodyLimit::max(max_request_body_bytes))
 }
 
+/// `FLUIDBOX_MIGRATE_ONLY=1` applies migrations, verifies the RLS posture, and
+/// exits 0 without serving.
+///
+/// This is what gives a deploy pipeline MIGRATION ORDERING. Without it,
+/// migrations run at pod boot: a failing migration surfaces as a
+/// CrashLoopBackOff *after* the rollout has already started, `helm --atomic`
+/// rolls the release back, and the operator is left reading pod logs to learn
+/// that the schema — not the image — was the problem. With it, the pipeline
+/// runs ONE Job to completion first. It either succeeds, and the rollout
+/// proceeds against a schema known to be current, or it fails and promotion
+/// stops with the migration error as the visible cause.
+///
+/// ONLY the exact string "1" enables it. Unset, empty, "true", "yes" and every
+/// typo mean SERVE. The asymmetry is deliberate and the failure modes are not
+/// symmetric: a missed enable costs one redundant migration pass, while an
+/// accidental enable would turn a production rollout into a fleet of pods that
+/// exit 0 before binding a port — a "successful" deploy that serves nothing.
+fn migrate_only(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
@@ -200,6 +221,18 @@ async fn main() -> anyhow::Result<()> {
              are skipped by PostgreSQL (single-user mode, tolerated). Set FLUIDBOX_RUNTIME_ROLE \
              before enabling FLUIDBOX_REQUIRE_SSO=1, or boot will refuse."
         ),
+    }
+
+    // Migration-only mode. `connect_with` above has already applied every
+    // migration and the block above has verified the RLS posture, so a deploy
+    // pipeline's pre-upgrade Job has learned everything it needs. Return HERE,
+    // before seeding, to keep the Job's contract narrow: schema and posture
+    // only, no application writes.
+    if migrate_only(std::env::var("FLUIDBOX_MIGRATE_ONLY").ok().as_deref()) {
+        tracing::info!(
+            "FLUIDBOX_MIGRATE_ONLY=1: migrations applied and RLS posture verified — exiting 0 without serving"
+        );
+        return Ok(());
     }
 
     tracing::info!("seeding…");
@@ -860,6 +893,59 @@ mod tests {
             src.contains("get(metrics::metrics_endpoint)"),
             "the optional listener must serve the unauth metrics handler"
         );
+    }
+
+    /// Only "1" may enable migrate-only mode.
+    ///
+    /// The asymmetry is the point: a missed enable costs a redundant migration
+    /// pass, an accidental one produces pods that exit 0 without ever binding a
+    /// port — which reads as a successful deploy that serves nothing.
+    #[test]
+    fn migrate_only_accepts_exactly_one() {
+        assert!(super::migrate_only(Some("1")));
+        assert!(
+            super::migrate_only(Some(" 1 ")),
+            "surrounding whitespace is trimmed"
+        );
+
+        for serve in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("yes"),
+            Some("11"),
+            Some("1 1"),
+        ] {
+            assert!(
+                !super::migrate_only(serve),
+                "{serve:?} must mean SERVE, not exit-without-serving"
+            );
+        }
+    }
+
+    /// Migrate-only must return BEFORE seeding and before anything binds a
+    /// listener, and AFTER the RLS posture check — a Job that skipped the
+    /// posture gate would report a healthy schema on a database where tenant
+    /// isolation is inert.
+    #[test]
+    fn migrate_only_returns_after_the_rls_gate_and_before_seeding() {
+        let src = production_src();
+        let gate = src
+            .find("row-level security is ENFORCED")
+            .expect("RLS posture check");
+        // Anchor on the env READ, not the bare name: "FLUIDBOX_MIGRATE_ONLY"
+        // also appears in the helper's doc comment far earlier in the file, and
+        // matching that made this assertion compare the wrong two positions.
+        let early = src
+            .find("std::env::var(\"FLUIDBOX_MIGRATE_ONLY\")")
+            .expect("migrate-only early return");
+        let seed = src.find("tracing::info!(\"seeding…\")").expect("seed step");
+        assert!(
+            gate < early,
+            "migrate-only must return AFTER the RLS posture check"
+        );
+        assert!(early < seed, "migrate-only must return BEFORE seeding");
     }
 
     /// The pool must be built from the CONFIG, not from the crate default: a

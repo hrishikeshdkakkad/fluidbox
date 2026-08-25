@@ -22,11 +22,243 @@
 */}}
 {{- $queueOn := and (not (kindIs "invalid" .Values.server.maxConcurrentRuns))
                     (ne (toString .Values.server.maxConcurrentRuns) "") -}}
+{{- /*
+  The control-plane environment, defined ONCE and consumed TWICE: by the server
+  Deployment and by the pre-upgrade migration Job (templates/migrate-job.yaml).
+
+  Sharing it is not tidiness. The Job runs config::Config::from_env() before it
+  touches the database, so an identical environment makes that Job a CONFIG gate
+  as well as a schema gate: a value the server would refuse at boot fails the Job
+  first, before any pod rolls. A divergent copy would let the Job pass on a
+  config the Deployment then refuses — the exact failure this ordering exists to
+  prevent.
+
+  The template locals are recomputed here rather than passed in, so the block can
+  be included from any file with the root context.
+*/}}
+{{- /* NOTE the missing trailing dash: `-}}` here would chomp the newline
+       that separates `env:` from the first entry, and since the include
+       site uses `{{- include }}` (which chomps backwards) the two would
+       collapse onto one line and YAML would reject the mapping. */}}
+{{- define "fluidbox.serverEnv" }}
+{{- $fullname := include "fluidbox.fullname" . -}}
+{{- $sandboxNs := .Values.sandbox.namespace -}}
+{{- $nodeLocalArchive := ne .Values.server.archiveStore "s3" -}}
+{{- /* Trailing `}}` WITHOUT the dash, deliberately. `-}}` here trims the
+       whitespace that follows, which is the newline AND the 12-space indent of
+       the first env entry - so the first entry would render flush against
+       `env:` while every later one kept its indentation. That produced a YAML
+       "mapping values are not allowed in this context" error pointing at a line
+       200 further down. */}}
+{{- $queueOn := and (not (kindIs "invalid" .Values.server.maxConcurrentRuns))
+                    (ne (toString .Values.server.maxConcurrentRuns) "") }}
+            - { name: FLUIDBOX_BIND, value: "0.0.0.0:8787" }
+            - { name: FLUIDBOX_INTERNAL_BIND, value: "0.0.0.0:8788" }
+            - { name: FLUIDBOX_DATA_DIR, value: "/var/lib/fluidbox" }
+            - { name: FLUIDBOX_PROVIDER, value: "kubernetes" }
+            - { name: FLUIDBOX_K8S_NAMESPACE, value: {{ $sandboxNs | quote }} }
+            - { name: FLUIDBOX_COLLECTOR_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.collector "name" "workspaced" "ctx" $) | quote }} }
+            - { name: FLUIDBOX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.sandboxRunner "name" "sandbox-runner" "ctx" $) | quote }} }
+            - { name: FLUIDBOX_CODEX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.codexRunner "name" "codex-runner" "ctx" $) | quote }} }
+            {{- with .Values.sandbox.runtimeClassName }}
+            - { name: FLUIDBOX_K8S_RUNTIME_CLASS, value: {{ . | quote }} }
+            {{- end }}
+            # Sandbox pod baseline + placement: values.sandbox.* → the exact
+            # FLUIDBOX_K8S_* env K8sConfig::from_env reads (M3).
+            - { name: FLUIDBOX_K8S_RUN_AS_USER, value: {{ .Values.sandbox.runAsUser | quote }} }
+            - { name: FLUIDBOX_K8S_CPU_REQUEST, value: {{ .Values.sandbox.resources.requests.cpu | quote }} }
+            - { name: FLUIDBOX_K8S_MEM_REQUEST, value: {{ .Values.sandbox.resources.requests.memory | quote }} }
+            - { name: FLUIDBOX_K8S_EPHEMERAL_REQUEST, value: {{ .Values.sandbox.resources.requests.ephemeralStorage | quote }} }
+            - { name: FLUIDBOX_K8S_CPU_LIMIT, value: {{ .Values.sandbox.resources.limits.cpu | quote }} }
+            - { name: FLUIDBOX_K8S_MEM_LIMIT, value: {{ .Values.sandbox.resources.limits.memory | quote }} }
+            - { name: FLUIDBOX_K8S_EPHEMERAL_LIMIT, value: {{ .Values.sandbox.resources.limits.ephemeralStorage | quote }} }
+            - { name: FLUIDBOX_K8S_VOLUME_SIZE_LIMIT, value: {{ .Values.sandbox.volumeSizeLimit | quote }} }
+            {{- with .Values.sandbox.priorityClassName }}
+            - { name: FLUIDBOX_K8S_PRIORITY_CLASS, value: {{ . | quote }} }
+            {{- end }}
+            {{- if .Values.sandbox.nodeSelector }}
+            - { name: FLUIDBOX_K8S_NODE_SELECTOR, value: {{ include "fluidbox.sandboxNodeSelector" . | quote }} }
+            {{- end }}
+            {{- if .Values.sandbox.tolerations }}
+            - { name: FLUIDBOX_K8S_TOLERATIONS, value: {{ toJson .Values.sandbox.tolerations | quote }} }
+            {{- end }}
+            {{- if .Values.images.pullSecrets }}
+            # Names only — the provider recreates the refs on sandbox + probe
+            # pods; the Secrets themselves must exist in the sandbox namespace.
+            - { name: FLUIDBOX_K8S_IMAGE_PULL_SECRETS, value: {{ include "fluidbox.pullSecretNames" . | quote }} }
+            {{- end }}
+            - { name: FLUIDBOX_NETWORK_MODE, value: "hardened" }
+            - { name: FLUIDBOX_REQUIRE_ENFORCED_NETPOL, value: {{ .Values.netpol.requireEnforced | quote }} }
+            - { name: FLUIDBOX_NETPOL_PROBE_IMAGE, value: {{ .Values.netpol.probeImage | quote }} }
+{{- if .Values.networkGrants.enabled }}
+            # The CONTROLLED resolver lives in the RELEASE namespace, which is
+            # not the sandbox namespace — the per-run policy's DNS rule selects
+            # on it, and getting it wrong makes every FQDN grant fail to resolve
+            # while the policy still verifies as Valid.
+            - { name: FLUIDBOX_SANDBOX_DNS_NAMESPACE, value: {{ .Release.Namespace | quote }} }
+            # Identify OUR resolver specifically. The component label alone
+            # would admit any pod wearing it — including a second release in the
+            # same namespace — as a legitimate resolver.
+            - { name: FLUIDBOX_SANDBOX_DNS_APP_NAME, value: {{ include "fluidbox.name" . | quote }} }
+            - { name: FLUIDBOX_SANDBOX_DNS_INSTANCE, value: {{ .Release.Name | quote }} }
+            # Sandbox pods are pointed here via `dnsPolicy: None`, whose
+            # `nameservers` MUST be IP addresses — a Service DNS name is not
+            # valid there, and kubelet would reject the pod. So this is a
+            # REQUIRED pinned ClusterIP rather than something the chart guesses:
+            # a wrong or absent value makes every FQDN grant fail to resolve
+            # while the policy still verifies as Valid, which is the failure
+            # mode hardest to diagnose from the outside.
+            - name: FLUIDBOX_SANDBOX_DNS_IP
+              value: {{ required "networkGrants.dnsClusterIP is required when networkGrants.enabled=true — pick a free address in your Service CIDR (e.g. kubectl get svc kube-dns -n kube-system -o jsonpath='{.spec.clusterIP}' shows the shape); sandbox pods use dnsPolicy: None, whose nameservers must be IPs" .Values.networkGrants.dnsClusterIP | quote }}
+{{- end }}
+            - { name: FLUIDBOX_NETPOL_WAIT_SECS, value: {{ .Values.netpol.waitSeconds | quote }} }
+            # Boot-resolve the internal Service ClusterIP → the runner's
+            # control URL (no DNS under zeroEgress).
+            - { name: FLUIDBOX_INTERNAL_SERVICE, value: {{ include "fluidbox.internalServiceName" . | quote }} }
+            - { name: FLUIDBOX_INTERNAL_SERVICE_NAMESPACE, value: {{ .Release.Namespace | quote }} }
+            {{- if .Values.server.publicControlUrl }}
+            - { name: FLUIDBOX_PUBLIC_CONTROL_URL, value: {{ .Values.server.publicControlUrl | quote }} }
+            {{- end }}
+            {{- with .Values.server.publicUrl }}
+            - { name: FLUIDBOX_PUBLIC_URL, value: {{ . | quote }} }
+            {{- end }}
+            {{- $up := include "fluidbox.llmUpstreamUrl" . }}
+            {{- with $up }}
+            - { name: LLM_UPSTREAM_URL, value: {{ . | quote }} }
+            {{- end }}
+            {{- /* Per-tenant LiteLLM virtual keys (Phase D). Not a tuning knob in
+                   a hosted deployment: with FLUIDBOX_REQUIRE_SSO=1 the facade
+                   answers 503 tenant_llm_keys_required on EVERY model call unless
+                   keyMode is "tenant", so the default there ships a control plane
+                   on which no run can ever reach a model. Guarded at render time
+                   rather than left to be discovered in production. */}}
+            {{- if not (has .Values.llm.keyMode (list "shared" "tenant")) }}
+            {{- fail (printf "llm.keyMode must be \"shared\" or \"tenant\", got %q" .Values.llm.keyMode) }}
+            {{- end }}
+            {{- if eq .Values.llm.keyMode "tenant" }}
+            {{- if and .Values.litellm.enabled (not .Values.litellm.database.enabled) }}
+            {{- fail "llm.keyMode=\"tenant\" needs a DATABASE-BACKED LiteLLM: /key/generate is a Postgres-backed LiteLLM feature and 404s on the stateless bundled proxy. Set litellm.database.enabled=true with the litellm-database image, or point llm.upstreamUrl at a LiteLLM that already has its own database." }}
+            {{- end }}
+            - { name: FLUIDBOX_LLM_KEY_MODE, value: "tenant" }
+            {{- with .Values.llm.adminUrl }}
+            - { name: FLUIDBOX_LLM_ADMIN_URL, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.llm.tenant.models }}
+            - { name: FLUIDBOX_LLM_TENANT_MODELS, value: {{ join "," . | quote }} }
+            {{- end }}
+            {{- with .Values.llm.tenant.maxBudget }}
+            - { name: FLUIDBOX_LLM_TENANT_MAX_BUDGET, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.llm.tenant.budgetDuration }}
+            - { name: FLUIDBOX_LLM_TENANT_BUDGET_DURATION, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.llm.tenant.tpm }}
+            - { name: FLUIDBOX_LLM_TENANT_TPM, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.llm.tenant.rpm }}
+            - { name: FLUIDBOX_LLM_TENANT_RPM, value: {{ . | quote }} }
+            {{- end }}
+            {{- end }}
+            {{- with .Values.server.runtimeRole }}
+            # RLS pool split (migration 0018): every pooled connection SET ROLEs to
+            # this NON-owner role. Boot FAILS if it does not exist, or if its posture
+            # is unsafe (LOGIN/SUPERUSER/BYPASSRLS/inherited or foreign memberships).
+            - { name: FLUIDBOX_RUNTIME_ROLE, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.server.dbPool.maxConnections }}
+            # Phase F capacity knob. Rendered ONLY when set, so an unset value keeps
+            # the server's own default rather than pinning a copy of it in the chart.
+            # The deployment-wide figure is replicas × (this + 2 listener
+            # connections) — that is what has to fit the Postgres/Neon compute.
+            - { name: FLUIDBOX_DB_MAX_CONNECTIONS, value: {{ . | quote }} }
+            {{- end }}
+            {{- with .Values.server.maxRequestBodyBytes }}
+            # Buffered-body ceiling. Costs `value × concurrent requests` of server
+            # memory — raise server.resources.limits.memory with it.
+            - { name: FLUIDBOX_MAX_REQUEST_BODY_BYTES, value: {{ . | quote }} }
+            {{- end }}
+            # Phase F: a DECLARATION of the replica count, not an observation.
+            # Boot refuses archiveStore "fs" when this is > 1.
+            - { name: FLUIDBOX_REPLICAS, value: {{ .Values.server.replicas | quote }} }
+            {{- with .Values.server.archiveStore }}
+            - { name: FLUIDBOX_ARCHIVE_STORE, value: {{ . | quote }} }
+            {{- end }}
+            {{- if eq .Values.server.archiveStore "s3" }}
+            - { name: FLUIDBOX_ARCHIVE_S3_BUCKET, value: {{ .Values.server.archiveS3.bucket | quote }} }
+            - { name: FLUIDBOX_ARCHIVE_S3_REGION, value: {{ .Values.server.archiveS3.region | quote }} }
+            {{- with .Values.server.archiveS3.endpoint }}
+            - { name: FLUIDBOX_ARCHIVE_S3_ENDPOINT, value: {{ . | quote }} }
+            {{- end }}
+            - { name: FLUIDBOX_ARCHIVE_S3_PREFIX, value: {{ .Values.server.archiveS3.prefix | quote }} }
+            {{- with .Values.server.archiveS3.forcePathStyle }}
+            - { name: FLUIDBOX_ARCHIVE_S3_FORCE_PATH_STYLE, value: {{ . | quote }} }
+            {{- end }}
+            - name: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.archiveS3AccessKeyId | quote }} } }
+            - name: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.archiveS3SecretAccessKey | quote }} } }
+            {{- end }}
+            {{- with .Values.server.workloadIdentity }}
+            # Gap 6 workload identity on the sandbox-facing internal gateway.
+            # Only meaningful under FLUIDBOX_PROVIDER=kubernetes, and only while
+            # NOTHING NATs or proxies between sandbox pods and the internal
+            # Service — introducing a mesh sidecar or egress gateway on that path
+            # turns every run into a mismatch, and the control would have to be
+            # redesigned rather than reconfigured.
+            - { name: FLUIDBOX_WORKLOAD_IDENTITY, value: {{ . | quote }} }
+            {{- end }}
+            {{- /* Run admission: the app-level cap that turns over-capacity runs
+                   into a FIFO queue instead of a failure. Keep it at or below
+                   sandbox.quota.pods — see the comment on both values.
+
+                   Rendered through an explicit is-it-set test rather than
+                   `with`, because `with` treats a numeric 0 as empty and would
+                   drop the variable: the server REFUSES to boot on a 0 for any
+                   of these four (a zero cap admits nothing, a zero depth sheds
+                   everything, a zero wait expires everything), and silently
+                   omitting the value turns each of those refusals into a
+                   silent default. */}}
+            {{- range $name, $value := dict
+                  "FLUIDBOX_MAX_CONCURRENT_RUNS" .Values.server.maxConcurrentRuns
+                  "FLUIDBOX_QUEUE_MAX_DEPTH"     .Values.server.queueMaxDepth
+                  "FLUIDBOX_QUEUE_MAX_WAIT_SECS" .Values.server.queueMaxWaitSecs
+                  "FLUIDBOX_QUEUE_REQUEUE_MAX"   .Values.server.queueRequeueMax }}
+            {{- if not (kindIs "invalid" $value) }}
+            {{- if ne (toString $value) "" }}
+            - { name: {{ $name }}, value: {{ $value | quote }} }
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.server.allowRlsBypass }}
+            # Review M2 escape hatch: accept a pool role that bypasses RLS even in
+            # multi-user mode. Local/single-user only — a hosted install must instead
+            # set server.runtimeRole (or a non-superuser DATABASE_URL).
+            - { name: FLUIDBOX_ALLOW_RLS_BYPASS, value: "1" }
+            {{- end }}
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.databaseUrl | quote }} } }
+            - name: FLUIDBOX_ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.adminToken | quote }} } }
+            - name: FLUIDBOX_CREDENTIAL_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.credentialKey | quote }} } }
+            - name: LITELLM_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.litellmMasterKey | quote }} } }
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ include "fluidbox.serverName" . }}
   labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  {{- with .Values.server.serviceAccount.annotations }}
+  {{- /* Cloud workload-identity bindings live here (GKE:
+         iam.gke.io/gcp-service-account). Leaving this EMPTY is the hardened
+         default on GKE: with node pools in GKE_METADATA mode an unannotated
+         ServiceAccount receives no cloud credential at all. */}}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
 ---
 # The control plane is the only run controller (no operator, no CRD). It needs
 # to drive Pods + per-run Secrets in the sandbox namespace ONLY — nothing
@@ -167,6 +399,26 @@ spec:
         app.kubernetes.io/component: server
     spec:
       serviceAccountName: {{ include "fluidbox.serverName" . }}
+      {{- /* Placement. The control plane must stay OFF preemptible sandbox
+             capacity: a node reclaimed mid-run takes down the process that
+             governs every other run. A tainted sandbox pool already excludes
+             it, but a nodeSelector states the requirement positively instead
+             of depending on the absence of a toleration. */}}
+      {{- with .Values.server.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- with .Values.images.pullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -187,167 +439,7 @@ spec:
             - { name: public, containerPort: 8787 }
             - { name: internal, containerPort: 8788 }
           env:
-            - { name: FLUIDBOX_BIND, value: "0.0.0.0:8787" }
-            - { name: FLUIDBOX_INTERNAL_BIND, value: "0.0.0.0:8788" }
-            - { name: FLUIDBOX_DATA_DIR, value: "/var/lib/fluidbox" }
-            - { name: FLUIDBOX_PROVIDER, value: "kubernetes" }
-            - { name: FLUIDBOX_K8S_NAMESPACE, value: {{ $sandboxNs | quote }} }
-            - { name: FLUIDBOX_COLLECTOR_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.collector "name" "workspaced" "ctx" $) | quote }} }
-            - { name: FLUIDBOX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.sandboxRunner "name" "sandbox-runner" "ctx" $) | quote }} }
-            - { name: FLUIDBOX_CODEX_SANDBOX_IMAGE, value: {{ include "fluidbox.flatImage" (dict "value" .Values.images.codexRunner "name" "codex-runner" "ctx" $) | quote }} }
-            {{- with .Values.sandbox.runtimeClassName }}
-            - { name: FLUIDBOX_K8S_RUNTIME_CLASS, value: {{ . | quote }} }
-            {{- end }}
-            # Sandbox pod baseline + placement: values.sandbox.* → the exact
-            # FLUIDBOX_K8S_* env K8sConfig::from_env reads (M3).
-            - { name: FLUIDBOX_K8S_RUN_AS_USER, value: {{ .Values.sandbox.runAsUser | quote }} }
-            - { name: FLUIDBOX_K8S_CPU_REQUEST, value: {{ .Values.sandbox.resources.requests.cpu | quote }} }
-            - { name: FLUIDBOX_K8S_MEM_REQUEST, value: {{ .Values.sandbox.resources.requests.memory | quote }} }
-            - { name: FLUIDBOX_K8S_EPHEMERAL_REQUEST, value: {{ .Values.sandbox.resources.requests.ephemeralStorage | quote }} }
-            - { name: FLUIDBOX_K8S_CPU_LIMIT, value: {{ .Values.sandbox.resources.limits.cpu | quote }} }
-            - { name: FLUIDBOX_K8S_MEM_LIMIT, value: {{ .Values.sandbox.resources.limits.memory | quote }} }
-            - { name: FLUIDBOX_K8S_EPHEMERAL_LIMIT, value: {{ .Values.sandbox.resources.limits.ephemeralStorage | quote }} }
-            - { name: FLUIDBOX_K8S_VOLUME_SIZE_LIMIT, value: {{ .Values.sandbox.volumeSizeLimit | quote }} }
-            {{- with .Values.sandbox.priorityClassName }}
-            - { name: FLUIDBOX_K8S_PRIORITY_CLASS, value: {{ . | quote }} }
-            {{- end }}
-            {{- if .Values.sandbox.nodeSelector }}
-            - { name: FLUIDBOX_K8S_NODE_SELECTOR, value: {{ include "fluidbox.sandboxNodeSelector" . | quote }} }
-            {{- end }}
-            {{- if .Values.sandbox.tolerations }}
-            - { name: FLUIDBOX_K8S_TOLERATIONS, value: {{ toJson .Values.sandbox.tolerations | quote }} }
-            {{- end }}
-            {{- if .Values.images.pullSecrets }}
-            # Names only — the provider recreates the refs on sandbox + probe
-            # pods; the Secrets themselves must exist in the sandbox namespace.
-            - { name: FLUIDBOX_K8S_IMAGE_PULL_SECRETS, value: {{ include "fluidbox.pullSecretNames" . | quote }} }
-            {{- end }}
-            - { name: FLUIDBOX_NETWORK_MODE, value: "hardened" }
-            - { name: FLUIDBOX_REQUIRE_ENFORCED_NETPOL, value: {{ .Values.netpol.requireEnforced | quote }} }
-            - { name: FLUIDBOX_NETPOL_PROBE_IMAGE, value: {{ .Values.netpol.probeImage | quote }} }
-{{- if .Values.networkGrants.enabled }}
-            # The CONTROLLED resolver lives in the RELEASE namespace, which is
-            # not the sandbox namespace — the per-run policy's DNS rule selects
-            # on it, and getting it wrong makes every FQDN grant fail to resolve
-            # while the policy still verifies as Valid.
-            - { name: FLUIDBOX_SANDBOX_DNS_NAMESPACE, value: {{ .Release.Namespace | quote }} }
-            # Identify OUR resolver specifically. The component label alone
-            # would admit any pod wearing it — including a second release in the
-            # same namespace — as a legitimate resolver.
-            - { name: FLUIDBOX_SANDBOX_DNS_APP_NAME, value: {{ include "fluidbox.name" . | quote }} }
-            - { name: FLUIDBOX_SANDBOX_DNS_INSTANCE, value: {{ .Release.Name | quote }} }
-            # Sandbox pods are pointed here via `dnsPolicy: None`, whose
-            # `nameservers` MUST be IP addresses — a Service DNS name is not
-            # valid there, and kubelet would reject the pod. So this is a
-            # REQUIRED pinned ClusterIP rather than something the chart guesses:
-            # a wrong or absent value makes every FQDN grant fail to resolve
-            # while the policy still verifies as Valid, which is the failure
-            # mode hardest to diagnose from the outside.
-            - name: FLUIDBOX_SANDBOX_DNS_IP
-              value: {{ required "networkGrants.dnsClusterIP is required when networkGrants.enabled=true — pick a free address in your Service CIDR (e.g. kubectl get svc kube-dns -n kube-system -o jsonpath='{.spec.clusterIP}' shows the shape); sandbox pods use dnsPolicy: None, whose nameservers must be IPs" .Values.networkGrants.dnsClusterIP | quote }}
-{{- end }}
-            - { name: FLUIDBOX_NETPOL_WAIT_SECS, value: {{ .Values.netpol.waitSeconds | quote }} }
-            # Boot-resolve the internal Service ClusterIP → the runner's
-            # control URL (no DNS under zeroEgress).
-            - { name: FLUIDBOX_INTERNAL_SERVICE, value: {{ include "fluidbox.internalServiceName" . | quote }} }
-            - { name: FLUIDBOX_INTERNAL_SERVICE_NAMESPACE, value: {{ .Release.Namespace | quote }} }
-            {{- if .Values.server.publicControlUrl }}
-            - { name: FLUIDBOX_PUBLIC_CONTROL_URL, value: {{ .Values.server.publicControlUrl | quote }} }
-            {{- end }}
-            {{- with .Values.server.publicUrl }}
-            - { name: FLUIDBOX_PUBLIC_URL, value: {{ . | quote }} }
-            {{- end }}
-            {{- $up := include "fluidbox.llmUpstreamUrl" . }}
-            {{- with $up }}
-            - { name: LLM_UPSTREAM_URL, value: {{ . | quote }} }
-            {{- end }}
-            {{- with .Values.server.runtimeRole }}
-            # RLS pool split (migration 0018): every pooled connection SET ROLEs to
-            # this NON-owner role. Boot FAILS if it does not exist, or if its posture
-            # is unsafe (LOGIN/SUPERUSER/BYPASSRLS/inherited or foreign memberships).
-            - { name: FLUIDBOX_RUNTIME_ROLE, value: {{ . | quote }} }
-            {{- end }}
-            {{- with .Values.server.dbPool.maxConnections }}
-            # Phase F capacity knob. Rendered ONLY when set, so an unset value keeps
-            # the server's own default rather than pinning a copy of it in the chart.
-            # The deployment-wide figure is replicas × (this + 2 listener
-            # connections) — that is what has to fit the Postgres/Neon compute.
-            - { name: FLUIDBOX_DB_MAX_CONNECTIONS, value: {{ . | quote }} }
-            {{- end }}
-            {{- with .Values.server.maxRequestBodyBytes }}
-            # Buffered-body ceiling. Costs `value × concurrent requests` of server
-            # memory — raise server.resources.limits.memory with it.
-            - { name: FLUIDBOX_MAX_REQUEST_BODY_BYTES, value: {{ . | quote }} }
-            {{- end }}
-            # Phase F: a DECLARATION of the replica count, not an observation.
-            # Boot refuses archiveStore "fs" when this is > 1.
-            - { name: FLUIDBOX_REPLICAS, value: {{ .Values.server.replicas | quote }} }
-            {{- with .Values.server.archiveStore }}
-            - { name: FLUIDBOX_ARCHIVE_STORE, value: {{ . | quote }} }
-            {{- end }}
-            {{- if eq .Values.server.archiveStore "s3" }}
-            - { name: FLUIDBOX_ARCHIVE_S3_BUCKET, value: {{ .Values.server.archiveS3.bucket | quote }} }
-            - { name: FLUIDBOX_ARCHIVE_S3_REGION, value: {{ .Values.server.archiveS3.region | quote }} }
-            {{- with .Values.server.archiveS3.endpoint }}
-            - { name: FLUIDBOX_ARCHIVE_S3_ENDPOINT, value: {{ . | quote }} }
-            {{- end }}
-            - { name: FLUIDBOX_ARCHIVE_S3_PREFIX, value: {{ .Values.server.archiveS3.prefix | quote }} }
-            {{- with .Values.server.archiveS3.forcePathStyle }}
-            - { name: FLUIDBOX_ARCHIVE_S3_FORCE_PATH_STYLE, value: {{ . | quote }} }
-            {{- end }}
-            - name: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID
-              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.archiveS3AccessKeyId | quote }} } }
-            - name: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY
-              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.archiveS3SecretAccessKey | quote }} } }
-            {{- end }}
-            {{- with .Values.server.workloadIdentity }}
-            # Gap 6 workload identity on the sandbox-facing internal gateway.
-            # Only meaningful under FLUIDBOX_PROVIDER=kubernetes, and only while
-            # NOTHING NATs or proxies between sandbox pods and the internal
-            # Service — introducing a mesh sidecar or egress gateway on that path
-            # turns every run into a mismatch, and the control would have to be
-            # redesigned rather than reconfigured.
-            - { name: FLUIDBOX_WORKLOAD_IDENTITY, value: {{ . | quote }} }
-            {{- end }}
-            {{- /* Run admission: the app-level cap that turns over-capacity runs
-                   into a FIFO queue instead of a failure. Keep it at or below
-                   sandbox.quota.pods — see the comment on both values.
-
-                   Rendered through an explicit is-it-set test rather than
-                   `with`, because `with` treats a numeric 0 as empty and would
-                   drop the variable: the server REFUSES to boot on a 0 for any
-                   of these four (a zero cap admits nothing, a zero depth sheds
-                   everything, a zero wait expires everything), and silently
-                   omitting the value turns each of those refusals into a
-                   silent default. */}}
-            {{- range $name, $value := dict
-                  "FLUIDBOX_MAX_CONCURRENT_RUNS" .Values.server.maxConcurrentRuns
-                  "FLUIDBOX_QUEUE_MAX_DEPTH"     .Values.server.queueMaxDepth
-                  "FLUIDBOX_QUEUE_MAX_WAIT_SECS" .Values.server.queueMaxWaitSecs
-                  "FLUIDBOX_QUEUE_REQUEUE_MAX"   .Values.server.queueRequeueMax }}
-            {{- if not (kindIs "invalid" $value) }}
-            {{- if ne (toString $value) "" }}
-            - { name: {{ $name }}, value: {{ $value | quote }} }
-            {{- end }}
-            {{- end }}
-            {{- end }}
-            {{- if .Values.server.allowRlsBypass }}
-            # Review M2 escape hatch: accept a pool role that bypasses RLS even in
-            # multi-user mode. Local/single-user only — a hosted install must instead
-            # set server.runtimeRole (or a non-superuser DATABASE_URL).
-            - { name: FLUIDBOX_ALLOW_RLS_BYPASS, value: "1" }
-            {{- end }}
-            - name: DATABASE_URL
-              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.databaseUrl | quote }} } }
-            - name: FLUIDBOX_ADMIN_TOKEN
-              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.adminToken | quote }} } }
-            - name: FLUIDBOX_CREDENTIAL_KEY
-              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.credentialKey | quote }} } }
-            - name: LITELLM_MASTER_KEY
-              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.litellmMasterKey | quote }} } }
-            {{- with .Values.server.extraEnv }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
+            {{- include "fluidbox.serverEnv" . }}
           {{- if $nodeLocalArchive }}
           volumeMounts:
             - { name: archives, mountPath: /var/lib/fluidbox }
@@ -370,6 +462,19 @@ kind: Service
 metadata:
   name: {{ include "fluidbox.serverName" . }}
   labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  {{- if .Values.gke.enabled }}
+  annotations:
+    {{- /* Container-native load balancing: the GCLB targets Pod IPs through a
+           NEG instead of hopping via kube-proxy. That removes a hop, makes the
+           health check observe the POD rather than a node, and is what lets
+           connection draining actually drain a pod. */}}
+    cloud.google.com/neg: '{"ingress": true}'
+    {{- if .Values.gke.backendConfig.enabled }}
+    {{- /* Without this link the BackendConfig object exists and is ignored —
+           the 30s GCLB default timeout would still cut every SSE stream. */}}
+    cloud.google.com/backend-config: '{"default": "{{ include "fluidbox.serverName" . }}"}'
+    {{- end }}
+  {{- end }}
 spec:
   type: ClusterIP
   selector:
