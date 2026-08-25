@@ -390,8 +390,26 @@ jobs:
         env:
           CONTROL_HOST: ${{ vars.CONTROL_PLANE_HOST }}
           DASHBOARD_HOST: ${{ vars.DASHBOARD_HOST }}
-          EXPECT_SERVER_DIGEST: ${{ needs.deploy.outputs.revision && '' || '' }}
-        run: bash scripts/cloud/gcp-smoke.sh
+        run: |
+          # Read the admin token from Secret Manager so the smoke run can
+          # exercise the checks that MATTER most: that the admin token is
+          # REFUSED on tenant data under FLUIDBOX_REQUIRE_SSO and still works on
+          # /v1/admin/*. Without it those two skip, and the multi-user
+          # confinement claim goes unverified on every deploy.
+          #
+          # ::add-mask:: first so the value cannot be echoed by anything later
+          # in the job, and it is never written to a file.
+          TOKEN="$(gcloud secrets versions access latest                      --secret=fluidbox-admin-token --project "${{ vars.GCP_PROJECT_ID }}")"
+          echo "::add-mask::$TOKEN"
+          export FLUIDBOX_ADMIN_TOKEN="$TOKEN"
+          bash scripts/cloud/gcp-smoke.sh
+
+      - name: tenant isolation + governed egress
+        env:
+          CONTROL_HOST: ${{ vars.CONTROL_PLANE_HOST }}
+          ORG_SLUG: ${{ vars.ORG_SLUG }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+        run: bash scripts/cloud/gcp-isolation-check.sh
 
   # ── Browser journeys ─────────────────────────────────────────────────────
   #
@@ -496,6 +514,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: enable pnpm
+        # The Vercel build runs the project's own install command, which is
+        # `pnpm install` - and the runner ships npm only, so the build died on
+        # a bare `spawn pnpm ENOENT` that named neither pnpm nor the build.
+        # corepack ships with Node and provisions the pinned version.
+        run: corepack enable && corepack prepare pnpm@latest --activate
       - name: deploy to Vercel production
         # REPO ROOT, not apps/web. The Vercel project's rootDirectory is
         # already "apps/web", so running the CLI from inside that directory
