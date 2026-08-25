@@ -31,22 +31,35 @@ fullnameOverride: fluidbox
 # redirect_uri, the CIMD document, and the exact-match Origin check on
 # cookie-authenticated writes — all of which are about what the BROWSER sees.
 server:
-  # Two replicas, which the s3 archive backend is what makes possible. The
-  # payoff is a RollingUpdate strategy: deploys stop being an outage.
-  replicas: 2
-
-  archiveStore: "s3"
-  archiveS3:
-    bucket: fluidbox-506603-archives
-    # SigV4 credential scope. GCS accepts the bucket's location.
-    region: us-central1
-    # GCS's S3-compatible XML API.
-    endpoint: https://storage.googleapis.com
-    prefix: "archives/"
-    # Explicit rather than inferred. The chart defaults to path style whenever
-    # an endpoint is set, but writing it down keeps the addressing mode from
-    # depending on a default that could change.
-    forcePathStyle: "true"
+  # ── ONE replica, forced by an org policy — not by preference ──────────────
+  #
+  # The plan was two replicas on the chart's archiveStore "s3" backend, which
+  # is what unlocks RollingUpdate (zero-downtime deploys), a meaningful
+  # PodDisruptionBudget and a usable HPA.
+  #
+  # That backend needs a STATIC HMAC key — the chart supports neither workload
+  # identity nor STS for it, because the point of the backend is that MinIO and
+  # R2 behave identically. Creating one is REFUSED on this project by
+  # `constraints/iam.disableServiceAccountKeyCreation`, enforced by inheritance
+  # (Google's secure-by-default for projects with no organization).
+  #
+  # That policy exists precisely to stop long-lived static credentials, so the
+  # answer is to do without one rather than to seek an exception. The
+  # node-local archive PVC needs NO credential at all.
+  #
+  # What it costs, stated plainly: one ReadWriteOnce volume means one replica,
+  # which means `strategy: Recreate` — a brief outage on every upgrade — and no
+  # PodDisruptionBudget (the chart refuses one at a single replica, because a
+  # PDB there makes the pod undrainable and blocks node upgrades).
+  #
+  # To restore two replicas: lift the constraint for this project, set
+  # enable_gcs_archive_store=true in the platform stack, and put archiveStore
+  # "s3" back here. See docs/hosted/gcp-architecture.md.
+  replicas: 1
+  archiveStore: ""
+  archivePvc:
+    size: 20Gi
+    storageClass: standard-rwo
 
   publicUrl: https://platform.fluidzero.ai
 
@@ -63,18 +76,6 @@ server:
   nodeSelector:
     fluidbox.dev/role: system
   priorityClassName: fluidbox-control-plane
-  # Inert on a single-node pool; the moment the autoscaler adds a second node
-  # this is what stops both replicas landing together. ScheduleAnyway, not
-  # DoNotSchedule — a hard constraint would leave replica 2 Pending forever on
-  # a one-node cluster.
-  topologySpreadConstraints:
-    - maxSkew: 1
-      topologyKey: kubernetes.io/hostname
-      whenUnsatisfiable: ScheduleAnyway
-      labelSelector:
-        matchLabels:
-          app.kubernetes.io/name: fluidbox
-          app.kubernetes.io/component: server
 
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
@@ -206,8 +207,12 @@ externalSecrets:
     - { secretKey: LITELLM_MASTER_KEY, remoteRef: litellm-master-key }
     - { secretKey: LITELLM_DATABASE_URL, remoteRef: litellm-database-url }
     - { secretKey: ANTHROPIC_API_KEY, remoteRef: anthropic-api-key }
-    - { secretKey: FLUIDBOX_ARCHIVE_S3_ACCESS_KEY_ID, remoteRef: fluidbox-archive-access-key-id }
-    - { secretKey: FLUIDBOX_ARCHIVE_S3_SECRET_ACCESS_KEY, remoteRef: fluidbox-archive-secret-access-key }
+    # NO archive S3 credentials. They exist only when
+    # enable_gcs_archive_store is on in the platform stack, which it is not:
+    # the static HMAC key that backend needs is refused by
+    # constraints/iam.disableServiceAccountKeyCreation. Listing a secret that
+    # does not exist fails the WHOLE ExternalSecret - one bad entry means none
+    # of the other eight sync, and the server then cannot start at all.
 
 # ── Sandbox plane ───────────────────────────────────────────────────────────
 sandbox:
@@ -237,6 +242,9 @@ sandbox:
 migrationJob:
   enabled: true
 
+# Enabled, but the chart renders NOTHING at one replica - and deliberately so:
+# a PDB requiring one available pod makes that pod undrainable and blocks every
+# node upgrade. It starts applying the moment replicas rise above one.
 podDisruptionBudget:
   enabled: true
 

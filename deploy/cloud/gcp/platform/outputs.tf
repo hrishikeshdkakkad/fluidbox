@@ -59,10 +59,7 @@ output "kms_key_secrets" {
 
 output "secret_ids" {
   description = "Secret Manager secret ids the app stack materialises into the chart's existingSecret."
-  value = sort(concat(
-    [for s in google_secret_manager_secret.generated : s.secret_id],
-    [for s in google_secret_manager_secret.external : s.secret_id],
-  ))
+  value       = sort(concat(keys(local.generated_secrets), keys(local.external_secrets)))
 }
 
 # Deliberately NOT output: database_url, admin_token, credential_key, kek.
@@ -72,8 +69,8 @@ output "secret_ids" {
 #   gcloud secrets versions access latest --secret=fluidbox-admin-token
 
 output "archive_bucket" {
-  description = "Workspace-archive bucket for the chart's server.archiveS3.bucket."
-  value       = google_storage_bucket.archives.name
+  description = "Workspace-archive bucket for the chart's server.archiveS3.bucket. Empty unless enable_gcs_archive_store is on."
+  value       = try(google_storage_bucket.archives[0].name, "")
 }
 
 output "archive_endpoint" {

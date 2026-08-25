@@ -20,6 +20,8 @@
 # service account whose ONLY permission is objectAdmin on this one bucket.
 
 resource "google_storage_bucket" "archives" {
+  count = var.enable_gcs_archive_store ? 1 : 0
+
   name     = "${var.project_id}-archives"
   project  = var.project_id
   location = var.region
@@ -44,8 +46,7 @@ resource "google_storage_bucket" "archives" {
   # Abandoned multipart uploads otherwise accumulate invisibly and are billed.
   lifecycle_rule {
     condition {
-      age                        = 1
-      days_since_noncurrent_time = 1
+      age = 1
     }
     action {
       type = "AbortIncompleteMultipartUpload"
@@ -58,6 +59,8 @@ resource "google_storage_bucket" "archives" {
 }
 
 resource "google_service_account" "archives" {
+  count = var.enable_gcs_archive_store ? 1 : 0
+
   project      = var.project_id
   account_id   = "fbx-archives"
   display_name = "Fluidbox workspace archives (S3/XML)"
@@ -65,16 +68,20 @@ resource "google_service_account" "archives" {
 }
 
 resource "google_storage_bucket_iam_member" "archives" {
-  bucket = google_storage_bucket.archives.name
+  count = var.enable_gcs_archive_store ? 1 : 0
+
+  bucket = google_storage_bucket.archives[0].name
   role   = "roles/storage.objectAdmin"
-  member = google_service_account.archives.member
+  member = google_service_account.archives[0].member
 }
 
 # The HMAC key IS the credential. It lands in Secret Manager (secrets.tf) and
 # nowhere else.
 resource "google_storage_hmac_key" "archives" {
+  count = var.enable_gcs_archive_store ? 1 : 0
+
   project               = var.project_id
-  service_account_email = google_service_account.archives.email
+  service_account_email = google_service_account.archives[0].email
 
   depends_on = [google_storage_bucket_iam_member.archives]
 }

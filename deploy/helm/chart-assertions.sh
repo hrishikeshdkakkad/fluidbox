@@ -244,4 +244,21 @@ grep -qF '{ name: FLUIDBOX_BIND, value: "0.0.0.0:8787" }' <<<"$mig" \
 grep -qF '"helm.sh/hook-delete-policy": before-hook-creation' <<<"$mig" \
   || fail "hook-succeeded would delete the finished Job and with it the migration log"
 
+# Pod Security Admission `restricted` requires allowPrivilegeEscalation=false
+# and capabilities.drop=[ALL] on EVERY container, not just at pod level. A
+# namespace labelled enforce=restricted refuses the pod otherwise, and the only
+# clue is an admission warning on the Deployment.
+psa="$(render --set litellm.enabled=true -s templates/litellm.yaml)"
+grep -qF 'allowPrivilegeEscalation: false' <<<"$psa" \
+  || fail "the litellm container must set allowPrivilegeEscalation=false (PSA restricted)"
+grep -qF 'capabilities: { drop: ["ALL"] }' <<<"$psa" \
+  || fail "the litellm container must drop ALL capabilities (PSA restricted)"
+
+# The migration Job must run as the SERVER's ServiceAccount. As `default` it has
+# no RBAC and emits a stream of "pods is forbidden" warnings that read like a
+# broken deployment.
+migsa="$(render --set migrationJob.enabled=true -s templates/migrate-job.yaml)"
+grep -qF 'serviceAccountName: fluidbox-fluidbox-server' <<<"$migsa" \
+  || fail "the migration Job must use the server ServiceAccount, not default"
+
 echo "chart assertions: OK"

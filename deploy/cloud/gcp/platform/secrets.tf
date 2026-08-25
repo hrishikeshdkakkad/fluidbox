@@ -49,10 +49,19 @@ locals {
     "fluidbox-kms-static-kek" = random_bytes.kms_kek.hex
     "litellm-master-key"      = "sk-${random_password.litellm_master_key.result}"
     "litellm-database-url"    = local.litellm_database_url
-    # GCS XML API (S3-compatible) credentials for the workspace archive store.
-    "fluidbox-archive-access-key-id"     = google_storage_hmac_key.archives.access_id
-    "fluidbox-archive-secret-access-key" = google_storage_hmac_key.archives.secret
   }
+
+  # GCS XML API (S3-compatible) credentials for the workspace archive store.
+  # Present ONLY when that backend is provisioned - see
+  # var.enable_gcs_archive_store for why it is off by default (the org policy
+  # constraints/iam.disableServiceAccountKeyCreation forbids the static HMAC key
+  # it requires). Merged rather than inlined so the map stays a known-key set.
+  archive_secrets = var.enable_gcs_archive_store ? {
+    "fluidbox-archive-access-key-id"     = google_storage_hmac_key.archives[0].access_id
+    "fluidbox-archive-secret-access-key" = google_storage_hmac_key.archives[0].secret
+  } : {}
+
+  all_generated_secrets = merge(local.generated_secrets, local.archive_secrets)
 
   external_secrets = {
     "anthropic-api-key"   = "Anthropic key for the LiteLLM gateway. The control plane never holds it."
@@ -82,7 +91,7 @@ resource "random_bytes" "kms_kek" {
 }
 
 resource "google_secret_manager_secret" "generated" {
-  for_each = local.generated_secrets
+  for_each = local.all_generated_secrets
 
   project   = var.project_id
   secret_id = each.key
@@ -107,7 +116,7 @@ resource "google_secret_manager_secret" "generated" {
 }
 
 resource "google_secret_manager_secret_version" "generated" {
-  for_each = local.generated_secrets
+  for_each = local.all_generated_secrets
 
   secret      = google_secret_manager_secret.generated[each.key].id
   secret_data = each.value
@@ -157,20 +166,25 @@ resource "google_secret_manager_secret" "external" {
 # because it receives these values as environment variables from the
 # Kubernetes Secret rather than by calling Secret Manager itself.
 
+# for_each over the static LOCAL, not over google_secret_manager_secret.generated.
+# A for_each keyed on a resource map is unknown at plan time until those
+# resources exist, and Terraform refuses any for_each over an unknown value -
+# which breaks `terraform import` for EVERY resource in the stack, not just this
+# one. The keys are the secret ids either way, so nothing is lost.
 resource "google_secret_manager_secret_iam_member" "external_secrets_generated" {
-  for_each = google_secret_manager_secret.generated
+  for_each = local.all_generated_secrets
 
   project   = var.project_id
-  secret_id = each.value.secret_id
+  secret_id = google_secret_manager_secret.generated[each.key].secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = google_service_account.external_secrets.member
 }
 
 resource "google_secret_manager_secret_iam_member" "external_secrets_external" {
-  for_each = google_secret_manager_secret.external
+  for_each = local.external_secrets
 
   project   = var.project_id
-  secret_id = each.value.secret_id
+  secret_id = google_secret_manager_secret.external[each.key].secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = google_service_account.external_secrets.member
 }
