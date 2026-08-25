@@ -37,8 +37,16 @@ say "1. Row-level security is ENFORCED, not merely applied"
 # The server states this at boot after inspecting the EFFECTIVE role of a
 # pooled connection. That is the authoritative answer: it is the role Postgres
 # will actually evaluate policies for, after any SET ROLE.
-LOG="$(kubectl -n "$NS" logs -l app.kubernetes.io/component=server --tail=500 2>/dev/null)"
-if grep -q "row-level security is ENFORCED" <<<"$LOG"; then
+# Whole log for the NEWEST server pod: the RLS and netpol verdicts are boot
+# lines, emitted once, and a --tail window silently misses them on a pod that
+# has been logging since - which turns a real check into a skip.
+POD="$(kubectl -n "$NS" get pod -l app.kubernetes.io/component=server \
+        --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | tail -1)"
+LOG="$(kubectl -n "$NS" logs "$POD" 2>/dev/null)"
+# Structured FIELD first, prose as fallback. Field names outlive wording: the
+# observability rewrite moved these to JSON and reworded them, silently turning
+# real checks into skips.
+if grep -qE '"rls":"enforced"|row-level security is ENFORCED' <<<"$LOG"; then
   ok "boot log: RLS enforced (pool role has neither SUPERUSER nor BYPASSRLS)"
 elif grep -q "bypasses RLS\|SUPERUSER or has BYPASSRLS" <<<"$LOG"; then
   bad "the pool role BYPASSES RLS — migration 0018's policies are decoration" \
@@ -47,7 +55,9 @@ else
   skip "RLS posture line" "outside the retained log window"
 fi
 
-if grep -q "app pool runs under non-owner role" <<<"$LOG"; then
+# The rewrite inserted an article ("a non-owner role"), which broke an
+# exact-phrase match.
+if grep -qE '"rls":"role_split"|non-owner role' <<<"$LOG"; then
   ok "pool runs as the non-owner runtime role (RLS role split active)"
 else
   skip "runtime-role line" "outside the retained log window"
@@ -123,7 +133,7 @@ say "3. Sandbox containment (governed egress)"
 
 # The server refuses to start ANY run until a boot probe proves the CNI
 # actually drops traffic. That refusal is the containment guarantee.
-if grep -qiE 'netpol.*(enforced|verified)|network policy enforcement' <<<"$LOG"; then
+if grep -qiE '"worker":"netpol_gate"|NetworkPolicy enforcement verified' <<<"$LOG"; then
   ok "boot probe proved the CNI enforces NetworkPolicy (runs are gated on this)"
 else
   skip "boot netpol line" "outside the retained log window"

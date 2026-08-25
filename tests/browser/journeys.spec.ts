@@ -167,26 +167,45 @@ test.describe("authenticated journey", () => {
     });
     expect(status, "POST /v1/auth/logout must be accepted").toBeLessThan(400);
 
-    // Require the cookie to be GONE, not merely empty. `?? ""` would pass for a
-    // cookie that is still present with an empty value - and the navigation
-    // gate uses cookies.has(), which is TRUE for exactly that case, so the weak
-    // form would report a pass on a session that still gates as signed-in.
-    const after = (await context.cookies()).find((c) => c.name === "__Host-fbx_web");
-    expect(after, `the session cookie must be removed, got ${JSON.stringify(after)}`).toBeUndefined();
-
-    // CACHE-BUST the navigation. We are already ON /app, and Chromium will
-    // happily satisfy `goto` for the same URL from its cache without issuing a
-    // request - so the server-side gate never runs and the page appears
-    // unprotected when it is not. A unique query string forces a real trip.
+    // POLL for the cookie's removal rather than reading once. Chromium applies
+    // a Set-Cookie from a fetch() asynchronously, so a single immediate read
+    // races it - which is exactly how this test flaked (failed, passed on
+    // retry). A flaky gate is worse than a missing one: it either blocks good
+    // deploys or teaches people to re-run until green.
     //
-    // The gate also redirects mid-navigation, which Chromium reports as
-    // ERR_ABORTED on the original goto; that is the redirect working.
-    const bust = `/app?_=${process.hrtime.bigint()}`;
-    await page.goto(bust, { waitUntil: "domcontentloaded" }).catch(() => {});
-    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    // Require the cookie to be GONE, not merely empty: the navigation gate uses
+    // cookies.has(), which is TRUE for a present-but-empty cookie, so an
+    // "is it blank" assertion would pass a session that still gates as
+    // signed-in.
+    await expect
+      .poll(
+        async () => (await context.cookies()).some((c) => c.name === "__Host-fbx_web"),
+        { timeout: 15_000, message: "the session cookie must be removed by logout" }
+      )
+      .toBe(false);
+
+    // Assert the SERVER's decision, not the browser's final URL.
+    //
+    // Navigating and reading page.url() was flaky for reasons that have nothing
+    // to do with the gate: Chromium can satisfy a goto to the URL it is already
+    // on from cache, and the app's client-side router rewrites /app?_=N back to
+    // /app - so the observed URL says little about what the server decided. The
+    // security property is "does the server redirect an unauthenticated /app to
+    // login", and a manual-redirect fetch answers exactly that, deterministically.
+    const gate = await page.evaluate(async () => {
+      const r = await fetch(`/app?_=${Date.now()}`, {
+        credentials: "include",
+        redirect: "manual",
+        headers: { "cache-control": "no-cache" },
+      });
+      // A `manual` redirect surfaces as an opaqueredirect response, whose status
+      // is 0 by design - the browser refuses to expose cross-origin redirect
+      // details. `type` is what distinguishes it from a real 200.
+      return { type: r.type, status: r.status };
+    });
     expect(
-      /\/login|\/sign-in|auth0\.com/.test(page.url()),
-      `/app must be protected again, landed on ${page.url()}`
+      gate.type === "opaqueredirect" || (gate.status >= 300 && gate.status < 400),
+      `/app must be REDIRECTED for a logged-out session, got type=${gate.type} status=${gate.status}`
     ).toBeTruthy();
   });
 });

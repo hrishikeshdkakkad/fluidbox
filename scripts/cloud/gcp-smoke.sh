@@ -30,11 +30,33 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; [ $# -gt 1 ] && printf '      
 skip() { printf '  \033[33m–\033[0m %s (%s)\n' "$1" "${2:-skipped}"; SKIP=$((SKIP+1)); }
 say()  { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
+# Boot-time lines (RLS posture, netpol gate) are emitted ONCE at start, so a
+# --tail window can miss them entirely on a pod that has been logging since.
+# Read the whole log for the newest server pod instead, and cache it - three
+# checks below need it and each `kubectl logs` is a round trip.
+# Captured ONCE into a variable, and every check below reads it with a
+# here-string rather than a pipe.
+#
+# `server_log | grep -q …` looks natural and is wrong under `set -o pipefail`:
+# grep -q exits the moment it matches, closing the pipe; the producer then dies
+# on SIGPIPE, and pipefail propagates THAT as the pipeline's status. The
+# condition therefore reports failure precisely BECAUSE the pattern matched.
+# The earlier --tail=400 form hid it - the output was small enough that the
+# producer finished before grep exited.
+SERVER_LOG=""
+load_server_log() {
+  local pod
+  pod="$(kubectl -n "$NAMESPACE" get pod -l app.kubernetes.io/component=server \
+           --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | tail -1)"
+  [ -n "$pod" ] && SERVER_LOG="$(kubectl -n "$NAMESPACE" logs "$pod" 2>/dev/null)"
+}
+
 # ── 1. Workloads ────────────────────────────────────────────────────────────
 say "1. Cluster workloads"
 if [ "${SKIP_CLUSTER:-}" = "1" ] || ! command -v kubectl >/dev/null; then
   skip "kubectl checks" "no cluster access"
 else
+  load_server_log
   for d in "$RELEASE-server" "$RELEASE-litellm"; do
     if ! kubectl -n "$NAMESPACE" get deploy "$d" >/dev/null 2>&1; then
       skip "deployment $d" "not present"; continue
@@ -56,8 +78,7 @@ else
 
   # The fail-closed boot gates print this and then exit. A pod that is Ready
   # cannot have hit one, but a CrashLoopBackOff behind a stale ReplicaSet can.
-  if kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=server --tail=400 2>/dev/null \
-       | grep -q "REFUSING TO BOOT"; then
+  if grep -q "REFUSING TO BOOT" <<<"$SERVER_LOG"; then
     bad "a server pod logged REFUSING TO BOOT" "read the line - it names the exact gate"
   else
     ok "no boot refusals in recent server logs"
@@ -65,8 +86,8 @@ else
 
   # NetworkPolicy enforcement is a RUNTIME property the server proves at boot
   # by probing; runs are gated until it does.
-  if kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=server --tail=400 2>/dev/null \
-       | grep -qiE "netpol.*(enforced|verified)|network policy enforcement (verified|confirmed)"; then
+  # Anchor on the STRUCTURED FIELD (worker=netpol_gate) as well as the prose.
+  if grep -qiE '"worker":"netpol_gate"|NetworkPolicy enforcement verified' <<<"$SERVER_LOG"; then
     ok "CNI NetworkPolicy enforcement proven by the boot probe"
   else
     skip "netpol enforcement line" "not in the retained log window"
@@ -74,8 +95,8 @@ else
 
   # Tenant isolation's database floor is only real if the pool role cannot
   # bypass RLS. The server logs which case it is.
-  if kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=server --tail=400 2>/dev/null \
-       | grep -q "row-level security is ENFORCED"; then
+  # Structured field first; the prose is the fallback.
+  if grep -qE '"rls":"enforced"|row-level security is ENFORCED' <<<"$SERVER_LOG"; then
     ok "RLS is ENFORCED for the application pool (role has neither SUPERUSER nor BYPASSRLS)"
   else
     skip "RLS posture line" "not in the retained log window"
