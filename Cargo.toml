@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/fluidbox-obs",
     "crates/fluidbox-core",
     "crates/fluidbox-db",
     "crates/fluidbox-workspace",
@@ -22,6 +23,7 @@ license = "MIT"
 repository = "https://github.com/hrishikeshdkakkad/fluidbox"
 
 [workspace.dependencies]
+fluidbox-obs = { path = "crates/fluidbox-obs" }
 fluidbox-core = { path = "crates/fluidbox-core" }
 fluidbox-db = { path = "crates/fluidbox-db" }
 fluidbox-workspace = { path = "crates/fluidbox-workspace" }
@@ -43,6 +45,7 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["macros"] }
+http-body = "1"
 tower-http = { version = "0.7", features = ["trace"] }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",

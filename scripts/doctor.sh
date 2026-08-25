@@ -473,6 +473,186 @@ else
   fi
 fi
 
+say "logging"
+# The logging knobs are checked the way the server checks them, for the same
+# reason the queue knobs are: a bad value FAILS BOOT, and learning that here
+# beats learning it from a container that will not start.
+effective_env_get() {
+  if printenv "$1" >/dev/null 2>&1; then
+    printenv "$1"
+  else
+    env_get "$ENV" "$1"
+  fi
+}
+trim_log_value() {
+  local value=$1
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+log_value_is_blank() { [ -z "$(trim_log_value "$1")" ]; }
+
+# Rust's unsigned parsers accept surrounding whitespace and a leading `+`, but
+# reject overflow. Normalise to a decimal string so bounds can be compared
+# without overflowing the shell's signed arithmetic.
+normalise_log_uint() {
+  local value
+  value=$(trim_log_value "$1")
+  case "$value" in +*) value=${value#+};; esac
+  case "$value" in ''|*[!0-9]*) return 1;; esac
+  while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do
+    value=${value#0}
+  done
+  printf '%s' "$value"
+}
+log_uint_at_most() {
+  local value maximum
+  value=$(normalise_log_uint "$1") || return 1
+  maximum=$2
+  [ "${#value}" -lt "${#maximum}" ] \
+    || { [ "${#value}" -eq "${#maximum}" ] && [[ "$value" < "$maximum" || "$value" = "$maximum" ]]; }
+}
+log_uint_less_than() {
+  local left right
+  left=$(normalise_log_uint "$1") || return 1
+  right=$(normalise_log_uint "$2") || return 1
+  [ "${#left}" -lt "${#right}" ] \
+    || { [ "${#left}" -eq "${#right}" ] && [[ "$left" < "$right" ]]; }
+}
+check_log_bool() {
+  local name=$1 raw=$2 allow_auto=$3 value
+  log_value_is_blank "$raw" && return
+  if [ "$allow_auto" = 1 ] && [ "$raw" = auto ]; then
+    return
+  fi
+  value=$(trim_log_value "$raw" | tr '[:upper:]' '[:lower:]')
+  case "$value" in
+    1|true|yes|on|0|false|no|off) ;;
+    *) bad "$name is invalid" \
+         "known: 1/true/yes/on or 0/false/no/off${allow_auto:+; FLUIDBOX_LOG_COLOR also accepts exact 'auto'}. The server refuses to boot." ;;
+  esac
+}
+
+l_format=$(effective_env_get FLUIDBOX_LOG_FORMAT)
+l_level=$(effective_env_get FLUIDBOX_LOG_LEVEL)
+l_rust_log=$(effective_env_get RUST_LOG)
+l_throttle=$(effective_env_get FLUIDBOX_LOG_THROTTLE_PER_SEC)
+l_report=$(effective_env_get FLUIDBOX_LOG_THROTTLE_REPORT_SECS)
+l_field=$(effective_env_get FLUIDBOX_LOG_MAX_FIELD_BYTES)
+l_line=$(effective_env_get FLUIDBOX_LOG_MAX_LINE_BYTES)
+l_location=$(effective_env_get FLUIDBOX_LOG_LOCATION)
+l_color=$(effective_env_get FLUIDBOX_LOG_COLOR)
+l_threads=$(effective_env_get FLUIDBOX_LOG_THREAD_NAMES)
+
+log_value_is_blank "$l_format" && l_format=""
+
+case "$l_format" in
+  ""|auto) ok "log format: auto (text on a terminal, json off one)" ;;
+  json|text) ok "log format: $l_format" ;;
+  *) bad "FLUIDBOX_LOG_FORMAT='$l_format' is invalid" \
+        "known: json, text, auto. The server refuses to boot on anything else." ;;
+esac
+
+# RUST_LOG WINS when set, and an operator who set both and expects
+# FLUIDBOX_LOG_LEVEL to apply has a silently wrong mental model — which is
+# exactly the kind of thing that costs an hour mid-incident.
+log_value_is_blank "$l_level" && l_level=""
+log_value_is_blank "$l_rust_log" && l_rust_log=""
+if [ -n "$l_rust_log" ] && [ -n "$l_level" ]; then
+  warn "RUST_LOG and FLUIDBOX_LOG_LEVEL are both set" \
+    "RUST_LOG wins; FLUIDBOX_LOG_LEVEL will have no effect. Unset one."
+fi
+
+# Validate the effective filter with the exact parser the subscriber uses. A
+# shell regex would either reject supported span/field directives or accept
+# malformed syntax that aborts subscriber initialisation.
+log_filter=$l_level; log_filter_name=FLUIDBOX_LOG_LEVEL
+if [ -n "$l_rust_log" ]; then
+  log_filter=$l_rust_log; log_filter_name=RUST_LOG
+fi
+if [ -n "$log_filter" ] && command -v cargo >/dev/null 2>&1; then
+  cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p fluidbox-obs \
+    --example validate_filter -- "$log_filter" >/dev/null 2>&1
+  filter_status=$?
+  case "$filter_status" in
+    0) ok "$log_filter_name filter syntax valid" ;;
+    1) bad "$log_filter_name contains an invalid tracing filter" \
+         "use a level (trace/debug/info/warn/error) or valid EnvFilter directives such as info,fluidbox_server=debug" ;;
+    *) bad "could not run the exact $log_filter_name filter validation" \
+         "cargo could not build/run fluidbox-obs's validator; the server's logging initialisation is not proven ready" ;;
+  esac
+fi
+
+u32_max=4294967295
+u64_max=18446744073709551615
+usize_max=18446744073709551615
+
+throttle_valid=1
+if log_value_is_blank "$l_throttle"; then
+  l_throttle_effective=200
+elif log_uint_at_most "$l_throttle" "$u32_max"; then
+  l_throttle_effective=$(normalise_log_uint "$l_throttle")
+else
+  throttle_valid=0
+  bad "FLUIDBOX_LOG_THROTTLE_PER_SEC is not a valid u32" \
+    "use a non-negative integer <= $u32_max; the server refuses to boot on malformed or out-of-range values"
+fi
+
+if ! log_value_is_blank "$l_report" && ! log_uint_at_most "$l_report" "$u64_max"; then
+  bad "FLUIDBOX_LOG_THROTTLE_REPORT_SECS is not a valid u64" \
+    "use a non-negative integer <= $u64_max; the server refuses to boot on malformed or out-of-range values"
+fi
+
+field_valid=1
+if log_value_is_blank "$l_field"; then
+  l_field_effective=8192
+elif log_uint_at_most "$l_field" "$usize_max"; then
+  l_field_effective=$(normalise_log_uint "$l_field")
+else
+  field_valid=0
+  bad "FLUIDBOX_LOG_MAX_FIELD_BYTES is not a valid usize" \
+    "use a non-negative integer <= $usize_max; the server refuses to boot on malformed or out-of-range values"
+fi
+
+line_valid=1
+if log_value_is_blank "$l_line"; then
+  l_line_effective=65536
+elif log_uint_at_most "$l_line" "$usize_max"; then
+  l_line_effective=$(normalise_log_uint "$l_line")
+else
+  line_valid=0
+  bad "FLUIDBOX_LOG_MAX_LINE_BYTES is not a valid usize" \
+    "use a non-negative integer <= $usize_max; the server refuses to boot on malformed or out-of-range values"
+fi
+
+# Defaults participate in the comparison. Setting only line=4096, for example,
+# conflicts with the server's default field=8192 and is boot-fatal.
+if [ "$field_valid" = 1 ] && log_uint_less_than "$l_field_effective" 64; then
+  bad "FLUIDBOX_LOG_MAX_FIELD_BYTES=$l_field_effective is below the 64-byte floor" \
+    "a value that small truncates every field to its marker; the server refuses to boot."
+fi
+if [ "$field_valid" = 1 ] && [ "$line_valid" = 1 ] \
+   && log_uint_less_than "$l_line_effective" "$l_field_effective"; then
+  bad "FLUIDBOX_LOG_MAX_LINE_BYTES=$l_line_effective is below FLUIDBOX_LOG_MAX_FIELD_BYTES=$l_field_effective" \
+    "every record would be truncated; the server refuses to boot on this."
+fi
+
+check_log_bool FLUIDBOX_LOG_LOCATION "$l_location" ""
+check_log_bool FLUIDBOX_LOG_COLOR "$l_color" 1
+check_log_bool FLUIDBOX_LOG_THREAD_NAMES "$l_threads" ""
+
+if [ "$throttle_valid" = 1 ] && [ "$l_throttle_effective" = 0 ]; then
+  warn "FLUIDBOX_LOG_THROTTLE_PER_SEC=0 disables the per-callsite rate limiter" \
+    "a retry loop pointed at a persistent fault can then fill the disk. Nothing is lost with it ON — suppressions are counted and the callsites are named."
+fi
+
+if ! log_value_is_blank "$l_report" \
+   && log_uint_at_most "$l_report" "$u64_max" \
+   && [ "$(normalise_log_uint "$l_report")" = 0 ]; then
+  warn "FLUIDBOX_LOG_THROTTLE_REPORT_SECS=0 disables suppression reports" \
+    "suppressed totals remain in metrics, but the log stream will not name flooding callsites."
+fi
+
 say "control plane"
 if curl -fsS -m 2 "http://127.0.0.1:8787/v1/health" >/dev/null 2>&1; then
   ok "server responding on :8787 (note: just e2e needs this port free — stop just dev first)"

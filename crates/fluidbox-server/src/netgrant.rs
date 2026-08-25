@@ -22,6 +22,7 @@ use fluidbox_core::network::{
 };
 use fluidbox_db::network_grants::{NetworkGrantRow, NewNetworkGrant};
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use uuid::Uuid;
 
 /// The synthetic approval identity a parked grant uses. It rides the ordinary
@@ -356,7 +357,11 @@ pub async fn release_authorized_grant(state: &AppState, scope: TenantScope, sess
         Err(e) => {
             let attempts = state.netgrant_reverify_failures.bump(session_id);
             tracing::warn!(
-                "network grant re-verification for {session_id} failed (attempt {attempts}): {e}"
+                session_id = %session_id,
+                attempt = attempts,
+                error = %e,
+                error_kind = EK::DB,
+                "network grant re-verification failed"
             );
             if attempts >= REVERIFY_MAX_ATTEMPTS {
                 state.netgrant_reverify_failures.clear(session_id);
@@ -427,7 +432,9 @@ pub async fn release_authorized_grant(state: &AppState, scope: TenantScope, sess
         }
         // Another replica won, or the grant is no longer pending.
         Ok(None) => {}
-        Err(e) => tracing::warn!("activating network grant for {session_id} failed: {e}"),
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e, "activating the network grant failed")
+        }
     }
 }
 
@@ -546,7 +553,7 @@ pub async fn refuse_parked_grant(
                         .metrics
                         .network_grant_refusals
                         .inc("cas_reread_failed");
-                    tracing::warn!("re-reading the grant for {session_id} failed: {e}");
+                    tracing::warn!(session_id = %session_id, error = %e, error_kind = EK::DB, "re-reading the network grant failed");
                     return;
                 }
             }
@@ -555,7 +562,7 @@ pub async fn refuse_parked_grant(
             // A failed READ is different: we do not know the grant's state, so
             // leave the session alone and let the next tick retry rather than
             // finalizing a run that might still be releasable.
-            tracing::warn!("denying network grant for {session_id} failed: {e}");
+            tracing::warn!(session_id = %session_id, error = %e, "denying the network grant failed");
             return;
         }
     };
@@ -598,7 +605,7 @@ pub async fn revoke_enforcement(
     reason: &str,
 ) -> bool {
     if let Err(e) = state.provider.revoke_network_policy(session_id).await {
-        tracing::warn!("tearing down the network policy for {session_id} failed: {e}");
+        tracing::warn!(session_id = %session_id, error = %e, error_kind = EK::PROVIDER, "tearing down the network policy failed");
         return false;
     }
     revoke(state, scope, session_id, reason).await;
@@ -640,7 +647,9 @@ pub async fn revoke(state: &AppState, scope: TenantScope, session_id: Uuid, reas
         }
         // Already revoked (or never existed): nothing to do, and not an error.
         Ok(None) => {}
-        Err(e) => tracing::warn!("revoking network grant for {session_id} failed: {e}"),
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, error = %e, "revoking the network grant failed")
+        }
     }
 }
 

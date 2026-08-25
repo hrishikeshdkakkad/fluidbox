@@ -1,4 +1,10 @@
-//! Thin helper to append events through the redactor (the only door).
+//! Server-side ledger helper.
+//!
+//! Durability and the shared operational mirror live together in
+//! `fluidbox-db`: that layer owns the transaction commit boundary and therefore
+//! can cover both ordinary appends and approval events written inside larger
+//! transactions. This helper adds server-local operational metrics only after a
+//! successful append.
 
 use crate::state::AppState;
 use fluidbox_core::event::{Actor, EventBody, EventEnvelope};
@@ -16,40 +22,43 @@ pub async fn record(
     actor: Actor,
     body: EventBody,
 ) -> i64 {
-    // Operational metrics (Phase F, #34) are derived from the same canonical
-    // events they audit: this is the ONE funnel every ledger write passes
-    // through, so a decision/outcome cannot be counted twice or missed at a
-    // forgotten return path. Read from `&body` BEFORE it moves into the envelope.
-    observe_event(&state.metrics, &body);
+    let metrics_body = body.clone();
     let env = EventEnvelope::new(session, actor, body);
     let redacted = state.redactor.scrub(env);
     match fluidbox_db::append_event(&state.pool, scope, redacted).await {
         Ok(seq) => {
+            // Metrics must obey the same durable-event boundary as the mirror:
+            // a failed append is not an event and must not increment counters.
+            observe_event(&state.metrics, &metrics_body);
             state.metrics.ledger_events.inc();
             seq
         }
-        Err(e) => {
-            tracing::error!("failed to append event for {session}: {e}");
+        Err(error) => {
+            // `record` preserves its historical best-effort signature, so this
+            // line is the operational signal that the audit append was lost.
+            tracing::error!(
+                session_id = %session,
+                tenant_id = %scope.tenant_id(),
+                error = %error,
+                error_kind = fluidbox_obs::field::error_kind::DB,
+                "LEDGER APPEND FAILED — this event is absent from the audit trail"
+            );
             -1
         }
     }
 }
 
-/// Fold a canonical event into the operational-metrics registry. No ids, hosts,
-/// credentials or payloads are read — only the bounded classification fields
-/// (verdict, source, outcome, latency) the design's §Operational-metrics list
-/// asks for. A variant with no metric is deliberately a no-op. Takes `&Metrics`
-/// (not `&AppState`) so the whole event→metric mapping is unit-testable with no
-/// database — the derivation is where a wrong label or a missed arm would hide.
-fn observe_event(m: &crate::metrics::Metrics, body: &EventBody) {
+/// Fold a committed canonical event into the server's operational metrics.
+/// Only bounded classification fields are read; ids and content are excluded
+/// from metric labels to keep their cardinality bounded.
+fn observe_event(metrics: &crate::metrics::Metrics, body: &EventBody) {
     match body {
         EventBody::ToolDecision {
             verdict, source, ..
         } => {
-            m.gate_verdicts.inc(verdict);
-            // The deciding stage is only meaningful for a non-allow verdict.
+            metrics.gate_verdicts.inc(verdict);
             if verdict != "allow" {
-                m.gate_sources.inc(source);
+                metrics.gate_sources.inc(source);
             }
         }
         EventBody::BrokeredToolCall {
@@ -57,16 +66,13 @@ fn observe_event(m: &crate::metrics::Metrics, body: &EventBody) {
             outcome,
             ..
         } => {
-            m.broker_latency_ms.observe(*latency_ms as f64);
-            if let Some(o) = outcome {
-                m.brokered_outcomes.inc(o);
+            metrics.broker_latency_ms.observe(*latency_ms as f64);
+            if let Some(outcome) = outcome {
+                metrics.brokered_outcomes.inc(outcome);
             }
-            // NB: the upstream HTTP response class (401/404/429/5xx) is counted at
-            // the broker's own classification site, where the numeric status is in
-            // hand — NOT re-parsed out of this event's redacted error string.
         }
-        EventBody::CallbackDelivered { .. } => m.deliveries.inc("delivered"),
-        EventBody::CallbackFailed { .. } => m.deliveries.inc("failed"),
+        EventBody::CallbackDelivered { .. } => metrics.deliveries.inc("delivered"),
+        EventBody::CallbackFailed { .. } => metrics.deliveries.inc("failed"),
         _ => {}
     }
 }
@@ -89,23 +95,22 @@ mod tests {
 
     #[test]
     fn tool_decision_counts_verdict_always_and_source_only_when_not_allow() {
-        let m = Metrics::default();
-        observe_event(&m, &decision("allow", "policy"));
-        observe_event(&m, &decision("deny", "capability"));
-        observe_event(&m, &decision("require_approval", "policy"));
-        assert_eq!(m.gate_verdicts.get("allow"), 1);
-        assert_eq!(m.gate_verdicts.get("deny"), 1);
-        assert_eq!(m.gate_verdicts.get("require_approval"), 1);
-        // An allow must NOT touch the deny-source family; the two non-allows must.
-        assert_eq!(m.gate_sources.get("capability"), 1);
-        assert_eq!(m.gate_sources.get("policy"), 1);
+        let metrics = Metrics::default();
+        observe_event(&metrics, &decision("allow", "policy"));
+        observe_event(&metrics, &decision("deny", "capability"));
+        observe_event(&metrics, &decision("require_approval", "policy"));
+        assert_eq!(metrics.gate_verdicts.get("allow"), 1);
+        assert_eq!(metrics.gate_verdicts.get("deny"), 1);
+        assert_eq!(metrics.gate_verdicts.get("require_approval"), 1);
+        assert_eq!(metrics.gate_sources.get("capability"), 1);
+        assert_eq!(metrics.gate_sources.get("policy"), 1);
     }
 
     #[test]
     fn brokered_call_observes_latency_and_outcome() {
-        let m = Metrics::default();
+        let metrics = Metrics::default();
         observe_event(
-            &m,
+            &metrics,
             &EventBody::BrokeredToolCall {
                 tool_call_id: "t".into(),
                 tool: "mcp__x__y".into(),
@@ -118,31 +123,31 @@ mod tests {
                 outcome: Some("ambiguous".into()),
             },
         );
-        assert_eq!(m.broker_latency_ms.count(), 1);
-        assert_eq!(m.brokered_outcomes.get("ambiguous"), 1);
+        assert_eq!(metrics.broker_latency_ms.count(), 1);
+        assert_eq!(metrics.brokered_outcomes.get("ambiguous"), 1);
     }
 
     #[test]
     fn callback_events_count_delivery_outcomes() {
-        let m = Metrics::default();
+        let metrics = Metrics::default();
         observe_event(
-            &m,
+            &metrics,
             &EventBody::CallbackDelivered {
-                delivery_id: uuid::Uuid::nil(),
+                delivery_id: Uuid::nil(),
                 url: "https://x".into(),
                 attempt: 1,
             },
         );
         observe_event(
-            &m,
+            &metrics,
             &EventBody::CallbackFailed {
-                delivery_id: uuid::Uuid::nil(),
+                delivery_id: Uuid::nil(),
                 url: "https://x".into(),
                 attempts: 6,
                 error: "gone".into(),
             },
         );
-        assert_eq!(m.deliveries.get("delivered"), 1);
-        assert_eq!(m.deliveries.get("failed"), 1);
+        assert_eq!(metrics.deliveries.get("delivered"), 1);
+        assert_eq!(metrics.deliveries.get("failed"), 1);
     }
 }

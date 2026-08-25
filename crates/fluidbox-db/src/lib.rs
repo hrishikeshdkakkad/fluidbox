@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use fluidbox_core::event::{EventEnvelope, Redacted};
 use fluidbox_core::state::SessionStatus;
+use fluidbox_obs::field::error_kind as EK;
 use serde_json::Value;
 use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::{PgPool, Row};
@@ -18,6 +19,8 @@ pub mod network_grants;
 pub mod recipes;
 pub mod seed;
 pub mod system_worker;
+
+mod event_log;
 
 /// A verified tenant context. Constructible ONLY via [`TenantScope::assume`],
 /// which a caller may invoke only when it holds — or has just resolved — a
@@ -5202,9 +5205,37 @@ pub async fn append_event(
     event: Redacted<EventEnvelope>,
 ) -> sqlx::Result<i64> {
     let mut tx = scoped_tx(pool, scope).await?;
-    let seq = append_event_in_tx(&mut tx, scope, event).await?;
-    tx.commit().await?;
+    let seq = append_event_in_tx(&mut tx, scope, &event).await?;
+    commit_and_mirror_events(
+        tx,
+        scope,
+        std::slice::from_ref(&event),
+        std::slice::from_ref(&seq),
+    )
+    .await?;
     Ok(seq)
+}
+
+/// Commit a transaction and only then mirror the canonical events it made
+/// durable. Keeping the ordering in one helper prevents both phantom log
+/// records (an append that later rolls back) and forgotten transactional append
+/// paths (approval decisions append without calling the server's ledger helper).
+async fn commit_and_mirror_events(
+    tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: TenantScope,
+    events: &[Redacted<EventEnvelope>],
+    seqs: &[i64],
+) -> sqlx::Result<()> {
+    assert_eq!(
+        events.len(),
+        seqs.len(),
+        "every appended event must retain its committed sequence"
+    );
+    tx.commit().await?;
+    for (event, seq) in events.iter().zip(seqs) {
+        event_log::log_committed_event(scope.tenant_id(), event.get(), *seq);
+    }
+    Ok(())
 }
 
 /// The LISTEN/NOTIFY channel a committed approval DECISION announces itself on
@@ -5233,9 +5264,9 @@ pub const APPROVALS_CHANNEL: &str = "fluidbox_approvals";
 async fn append_event_in_tx(
     tx: &mut sqlx::PgConnection,
     scope: TenantScope,
-    event: Redacted<EventEnvelope>,
+    event: &Redacted<EventEnvelope>,
 ) -> sqlx::Result<i64> {
-    let env = event.into_inner();
+    let env = event.get();
     let payload = serde_json::to_value(&env.body).unwrap_or(Value::Null);
     let type_name = env.body.type_name();
     let row = sqlx::query(
@@ -5476,8 +5507,8 @@ pub async fn decide_approval_tx(
         tx.commit().await?;
         return Ok(None);
     };
-    emit_and_notify(&mut tx, scope, id, events).await?;
-    tx.commit().await?;
+    let seqs = emit_and_notify(&mut tx, scope, id, &events).await?;
+    commit_and_mirror_events(tx, scope, &events, &seqs).await?;
     Ok(Some(row))
 }
 
@@ -5509,8 +5540,8 @@ pub async fn expire_approval_tx(
         tx.commit().await?;
         return Ok(None);
     };
-    emit_and_notify(&mut tx, scope, id, events).await?;
-    tx.commit().await?;
+    let seqs = emit_and_notify(&mut tx, scope, id, &events).await?;
+    commit_and_mirror_events(tx, scope, &events, &seqs).await?;
     Ok(Some(row))
 }
 
@@ -5532,17 +5563,18 @@ async fn emit_and_notify(
     tx: &mut sqlx::PgConnection,
     scope: TenantScope,
     approval_id: Uuid,
-    events: Vec<Redacted<EventEnvelope>>,
-) -> sqlx::Result<()> {
+    events: &[Redacted<EventEnvelope>],
+) -> sqlx::Result<Vec<i64>> {
+    let mut seqs = Vec::with_capacity(events.len());
     for ev in events {
-        append_event_in_tx(&mut *tx, scope, ev).await?;
+        seqs.push(append_event_in_tx(&mut *tx, scope, ev).await?);
     }
     sqlx::query("select pg_notify($1, $2)")
         .bind(APPROVALS_CHANNEL)
         .bind(approval_id.to_string())
         .execute(&mut *tx)
         .await?;
-    Ok(())
+    Ok(seqs)
 }
 
 /// Claim the RIGHT to ledger the post-approval-wait terminality deny AND emit it,
@@ -5590,10 +5622,11 @@ pub async fn claim_terminal_deny_tx(
         tx.commit().await?;
         return Ok(false);
     }
-    for ev in events {
-        append_event_in_tx(&mut tx, scope, ev).await?;
+    let mut seqs = Vec::with_capacity(events.len());
+    for ev in &events {
+        seqs.push(append_event_in_tx(&mut tx, scope, ev).await?);
     }
-    tx.commit().await?;
+    commit_and_mirror_events(tx, scope, &events, &seqs).await?;
     Ok(true)
 }
 
@@ -7831,7 +7864,7 @@ where
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         continue;
                     }
-                    tracing::info!("pg listener connected ({channel})");
+                    tracing::info!(channel = %channel, "postgres listener connected");
                     loop {
                         match listener.recv().await {
                             Ok(n) => {
@@ -7841,7 +7874,11 @@ where
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "pg listener ({channel}) dropped: {e}; reconnecting"
+                                    channel = %channel,
+                                    error = %e,
+                                    error_kind = EK::DB,
+                                    retrying = true,
+                                    "postgres listener dropped; reconnecting"
                                 );
                                 break;
                             }
@@ -7849,7 +7886,7 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("pg listener ({channel}) connect failed: {e}; retrying");
+                    tracing::warn!(channel = %channel, error = %e, error_kind = EK::DB, retrying = true, "postgres listener connect failed");
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -17318,6 +17355,99 @@ mod tests {
                 },
             )),
         ]
+    }
+
+    /// The operational mirror follows COMMIT, not append intent, and every
+    /// transactional approval event crosses the same seam. This catches both
+    /// regressions from PR #181: phantom records for failed appends and missing
+    /// records for events appended inside approval transactions.
+    #[tokio::test]
+    async fn event_mirror_is_commit_accurate_and_covers_approval_transactions() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = test_connect(&url).await.expect("connect");
+        let (tenant, session_id) = seed_tenant_session(&pool).await;
+        let scope = TenantScope::assume(tenant);
+        let approval = seed_pending_approval(&pool, scope, session_id, "tc-decide", 600).await;
+
+        let failed = EventEnvelope::new(
+            session_id,
+            Actor::System,
+            EventBody::RunError {
+                message: "must stay tenant-scoped".into(),
+            },
+        );
+        let failed_id = failed.event_id;
+        let committed = EventEnvelope::new(
+            session_id,
+            Actor::System,
+            EventBody::QuiesceRequested { deadline_secs: 30 },
+        );
+        let committed_id = committed.event_id;
+        let approval_events =
+            decision_events(session_id, approval.id, "approved_once", "mirror-test");
+        let approval_ids: Vec<_> = approval_events
+            .iter()
+            .map(|event| event.get().event_id)
+            .collect();
+
+        let writer = fluidbox_obs::capture::CaptureWriter::new();
+        let config = fluidbox_obs::LogConfig {
+            format: fluidbox_obs::Format::Json,
+            filter: "trace".into(),
+            throttle_per_sec: 0,
+            ..Default::default()
+        };
+        let (subscriber, _handle) =
+            fluidbox_obs::subscriber_with_writer(&config, writer.clone()).unwrap();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let wrong_scope = TenantScope::assume(Uuid::now_v7());
+        assert!(
+            append_event(&pool, wrong_scope, Redactor::default().scrub(failed))
+                .await
+                .is_err(),
+            "a cross-tenant append must fail"
+        );
+        append_event(&pool, scope, Redactor::default().scrub(committed))
+            .await
+            .unwrap();
+        decide_approval_tx(
+            &pool,
+            scope,
+            approval.id,
+            "approved_once",
+            "mirror-test",
+            approval_events,
+        )
+        .await
+        .unwrap()
+        .expect("fresh approval decision wins");
+        drop(guard);
+
+        let records = writer.json();
+        let count = |event_id: Uuid| {
+            records
+                .iter()
+                .filter(|record| record["event_id"] == event_id.to_string())
+                .count()
+        };
+        assert_eq!(
+            count(failed_id),
+            0,
+            "a failed append produced a phantom log"
+        );
+        assert_eq!(count(committed_id), 1, "ordinary committed event missing");
+        for event_id in approval_ids {
+            assert_eq!(
+                count(event_id),
+                1,
+                "transactional approval event missing or duplicated"
+            );
+        }
+        cleanup_sw_tenant(&pool, tenant).await;
     }
 
     /// **THE load-bearing Gap-13 test.** A decided approval ledgers EXACTLY ONE

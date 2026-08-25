@@ -17,6 +17,9 @@ import {
   EXIT_UNGOVERNED_TOOL,
   ungovernedToolDiagnostic,
 } from "/opt/fluidbox-runner/lib/contract.mjs";
+import { createLogger } from "/opt/fluidbox-runner/lib/log.mjs";
+
+const log = createLogger({ target: "sandbox-runner" });
 
 const env = loadRunnerEnv();
 const client = new RunnerClient(env);
@@ -111,7 +114,7 @@ function mcpServersConfig() {
 /// terminalizes the exited run exactly as it does for any runner crash.
 async function abortUngoverned(tool, toolCallId) {
   const diag = ungovernedToolDiagnostic(tool, toolCallId);
-  console.error(diag);
+  log.error(diag);
   await client.emit("harness", {
     type: "run.error",
     data: { message: diag, tool, tool_call_id: toolCallId },
@@ -258,7 +261,7 @@ async function main() {
       // failure. Fall through to the quiesce exit below.
     } else {
       hadError = e;
-      console.error("fluidbox-runner: query failed:", e);
+      log.error("agent query failed", { error: e });
       await client.emit("harness", { type: "run.error", data: { message: String(e?.message || e) } });
     }
   } finally {
@@ -269,7 +272,7 @@ async function main() {
   // Quiesced (cancelled): exit WITHOUT posting /result — the control plane's
   // cancel finalizer records the terminal outcome and collects the diff.
   if (quiesced) {
-    console.error("fluidbox-runner: quiesced on cancel — exiting without /result");
+    log.info("quiesced on cancel — exiting without posting /result");
     process.exit(0);
   }
 
@@ -279,13 +282,13 @@ async function main() {
       hadError ? String(hadError?.message || hadError) : finalText,
     );
   } catch (e) {
-    console.error("fluidbox-runner: failed to post result:", e.message);
+    log.error("posting the run result failed", { error: e.message });
     process.exit(1);
   }
   process.exit(hadError ? 1 : 0);
 }
 
 main().catch((e) => {
-  console.error("fluidbox-runner: fatal:", e);
+  log.error("fatal", { error: e });
   process.exit(1);
 });

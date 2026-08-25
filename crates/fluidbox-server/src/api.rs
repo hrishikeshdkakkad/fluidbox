@@ -1479,6 +1479,7 @@ pub async fn create_session(
             )))
         }
     };
+    fluidbox_obs::span::record_subject_run(&session.id.to_string());
     Ok(Json(json!({ "session": session })))
 }
 
@@ -1513,6 +1514,7 @@ pub async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    fluidbox_obs::span::record_subject_run(&id.to_string());
     let scope = principal.scope();
     let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?
@@ -1544,6 +1546,7 @@ pub async fn cancel_session(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     use orchestrator::FinalizeStart;
+    fluidbox_obs::span::record_subject_run(&id.to_string());
     // Prove tenant ownership, then CANCELLATION authority — a mutation, so
     // deliberately stricter than run visibility (`runs.read_all` lets an
     // approver judge approvals, not control every tenant run).
@@ -1583,6 +1586,7 @@ pub async fn get_events(
     Path(id): Path<Uuid>,
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<Value>> {
+    fluidbox_obs::span::record_subject_run(&id.to_string());
     let scope = principal.scope();
     let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?
@@ -1615,6 +1619,7 @@ pub async fn session_approvals(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    fluidbox_obs::span::record_subject_run(&id.to_string());
     let scope = principal.scope();
     let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?
@@ -1647,6 +1652,7 @@ pub async fn decide_approval(
     let approval = fluidbox_db::get_approval(&state.pool, scope, id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    fluidbox_obs::span::record_subject_run(&approval.session_id.to_string());
     let session = fluidbox_db::get_session(&state.pool, scope, approval.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -1809,6 +1815,7 @@ pub async fn session_deliveries(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    fluidbox_obs::span::record_subject_run(&id.to_string());
     let scope = principal.scope();
     let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?
@@ -1825,6 +1832,7 @@ pub async fn list_artifacts(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    fluidbox_obs::span::record_subject_run(&id.to_string());
     let scope = principal.scope();
     let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?
@@ -1839,6 +1847,7 @@ pub async fn get_artifact(
     State(state): State<AppState>,
     Path((sid, aid)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Value>> {
+    fluidbox_obs::span::record_subject_run(&sid.to_string());
     let scope = principal.scope();
     let session = fluidbox_db::get_session(&state.pool, scope, sid)
         .await?
@@ -1860,6 +1869,7 @@ pub async fn get_cost(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    fluidbox_obs::span::record_subject_run(&id.to_string());
     let scope = principal.scope();
     let session = fluidbox_db::get_session(&state.pool, scope, id)
         .await?

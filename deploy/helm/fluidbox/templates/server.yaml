@@ -44,12 +44,12 @@
 {{- $fullname := include "fluidbox.fullname" . -}}
 {{- $sandboxNs := .Values.sandbox.namespace -}}
 {{- $nodeLocalArchive := ne .Values.server.archiveStore "s3" -}}
-{{- /* Trailing `}}` WITHOUT the dash, deliberately. `-}}` here trims the
-       whitespace that follows, which is the newline AND the 12-space indent of
-       the first env entry - so the first entry would render flush against
-       `env:` while every later one kept its indentation. That produced a YAML
-       "mapping values are not allowed in this context" error pointing at a line
-       200 further down. */}}
+{{- /* Trailing `}}` WITHOUT the dash on the LAST local, deliberately. `-}}`
+       there trims the whitespace that follows - which is the newline AND the
+       12-space indent of the first env entry - so the first entry would render
+       flush against `env:` while every later one kept its indentation. That
+       produced a YAML "mapping values are not allowed in this context" error
+       pointing at a line 200 further down. */}}
 {{- $queueOn := and (not (kindIs "invalid" .Values.server.maxConcurrentRuns))
                     (ne (toString .Values.server.maxConcurrentRuns) "") }}
             - { name: FLUIDBOX_BIND, value: "0.0.0.0:8787" }
@@ -229,6 +229,28 @@
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- /* Logging. Rendered through an explicit is-it-set test rather
+                   than `with`, because a deliberate "0" (disable the throttle,
+                   disable the suppression report) is a MEANINGFUL value that
+                   `with` treats as empty and would silently drop. */}}
+            {{- range $name, $value := dict
+                  "FLUIDBOX_LOG_FORMAT"                .Values.server.logFormat
+                  "FLUIDBOX_LOG_LEVEL"                 .Values.server.logLevel
+                  "FLUIDBOX_LOG_THROTTLE_PER_SEC"      .Values.server.logThrottlePerSec
+                  "FLUIDBOX_LOG_THROTTLE_REPORT_SECS"  .Values.server.logThrottleReportSecs }}
+            {{- if not (kindIs "invalid" $value) }}
+            {{- if ne (toString $value) "" }}
+            - { name: {{ $name }}, value: {{ $value | quote }} }
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            # The replica identity on every log record. Without it two replicas'
+            # logs are indistinguishable exactly where their behaviour differs —
+            # the orchestrator lease, the MCP session registry and the in-memory
+            # rate tier are all replica-local. `HOSTNAME` is the pod name here, but
+            # it is set by the kubelet rather than by us, so bind it explicitly.
+            - name: FLUIDBOX_LOG_INSTANCE
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
             {{- if .Values.server.allowRlsBypass }}
             # Review M2 escape hatch: accept a pool role that bypasses RLS even in
             # multi-user mode. Local/single-user only — a hosted install must instead

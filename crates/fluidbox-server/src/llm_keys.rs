@@ -43,6 +43,7 @@ use crate::seal::{SealCtx, SealFamily};
 use crate::state::AppState;
 use chrono::Utc;
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -504,11 +505,14 @@ async fn retire_alias_at_litellm(state: &AppState, alias: &str) {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => tracing::warn!(
             alias,
-            "litellm /key/delete (by alias) returned {} — either nothing was minted under this \
-             alias, or an orphaned virtual key remains at LiteLLM",
-            r.status()
+            upstream_status = r.status().as_u16(),
+            error_kind = EK::UPSTREAM,
+            "llm key delete-by-alias was not accepted — either nothing was minted under this \
+             alias, or an orphaned virtual key remains upstream"
         ),
-        Err(e) => tracing::warn!(alias, "litellm /key/delete (by alias) request failed: {e}"),
+        Err(e) => {
+            tracing::warn!(alias, error = %e, error_kind = EK::UPSTREAM, "llm key delete-by-alias request failed")
+        }
     }
 }
 
@@ -538,10 +542,13 @@ async fn delete_at_litellm(state: &AppState, key: &str) {
     {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => tracing::warn!(
-            "litellm /key/delete returned {} — an orphaned virtual key remains at LiteLLM",
-            r.status()
+            upstream_status = r.status().as_u16(),
+            error_kind = EK::UPSTREAM,
+            "llm key delete was not accepted — an orphaned virtual key remains upstream"
         ),
-        Err(e) => tracing::warn!("litellm /key/delete request failed: {e}"),
+        Err(e) => {
+            tracing::warn!(error = %e, error_kind = EK::UPSTREAM, "llm key delete request failed")
+        }
     }
 }
 

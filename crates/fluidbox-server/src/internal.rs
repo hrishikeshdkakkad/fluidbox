@@ -22,9 +22,11 @@ use fluidbox_core::policy::{EvaluationOutcome, Policy, ToolCallRequest, Verdict}
 use fluidbox_core::spec::RunSpec;
 use fluidbox_core::state::SessionStatus;
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
+use tracing::Instrument as _;
 
 /// Outcome of the shared gate. `message` carries the deny reason (or the
 /// approval note) for the caller's wire shape.
@@ -199,9 +201,41 @@ async fn decide_tool_call(
     tool: &str,
     input: &Value,
 ) -> ApiResult<GateDecision> {
-    let mut decision = gate_tool_call(state, session, run_spec, tool_call_id, tool, input).await?;
-    decision.input_digest = digest_json(input);
-    Ok(decision)
+    // A span, not a record. The VERDICT is already logged — canonically, once,
+    // from the ledger funnel — and duplicating it here would put two statements
+    // of one fact in the stream. What the span adds is context for everything
+    // the gate emits on the way to that verdict: a binding recheck that failed,
+    // a schema compilation error, a database timeout. Without it those records
+    // say "recheck failed" with no way to tell which tool call they belong to.
+    let span = fluidbox_obs::span::gate(tool, tool_call_id);
+    let sw = fluidbox_obs::Stopwatch::start();
+    let result = async {
+        let mut decision =
+            gate_tool_call(state, session, run_spec, tool_call_id, tool, input).await?;
+        decision.input_digest = digest_json(input);
+        Ok(decision)
+    }
+    .instrument(span.clone())
+    .await;
+    // The gate's own LATENCY is the one thing the ledger's decision event does
+    // not carry, and it is a real production question: this path does schema
+    // validation, a binding recheck, and up to three database round-trips
+    // before a model turn can continue. DEBUG because it is a profiling
+    // signal — the verdict itself is at the level its consequence deserves.
+    let _g = span.enter();
+    match &result {
+        Ok(d) => tracing::debug!(
+            duration_ms = sw.ms_f64(),
+            allowed = d.allowed,
+            "gate decided"
+        ),
+        Err(e) => tracing::warn!(
+            duration_ms = sw.ms_f64(),
+            error = %e,
+            "gate could not decide — the call is refused rather than guessed at"
+        ),
+    }
+    result
 }
 
 /// The heart of the system: one decision per tool call, made server-side
@@ -349,7 +383,9 @@ async fn gate_tool_call(
                         }
                     }
                     tracing::error!(
-                        "tool-call budget finalize for {session_id} did not persist after retries"
+                        session_id = %session_id,
+                        error_kind = EK::DB,
+                        "tool-call budget finalize did not persist after retries"
                     );
                 });
                 return Ok(GateDecision::deny("tool-call budget exceeded"));
@@ -1267,9 +1303,10 @@ async fn execute_with_claim(
                 // read above) and no writes at all.
                 if row.attempt >= MAX_EXECUTION_ATTEMPTS {
                     tracing::debug!(
-                        "session {session_id}: tool call {tool_call_id} re-presented after \
-                         {} pre-send failures — refusing (attempts exhausted)",
-                        row.attempt
+                        session_id = %session_id,
+                        tool_call_id = %tool_call_id,
+                        attempt = row.attempt,
+                        "tool call re-presented after its permitted pre-send failures — refusing"
                     );
                     return Ok(Json(attempts_exhausted_response(row.attempt)));
                 }
@@ -1367,8 +1404,13 @@ async fn finish_won_claim(
         settle.settled() && comp.state == "failed_before_send" && attempt >= MAX_EXECUTION_ATTEMPTS;
     if exhausted {
         tracing::warn!(
-            "session {session_id}: brokered call {tool_call_id} ({tool}) failed before \
-             send on all {attempt} permitted attempts — not retrying"
+            session_id = %session_id,
+            tool_call_id = %tool_call_id,
+            tool = %tool,
+            attempt = attempt,
+            retrying = false,
+            error_kind = EK::UPSTREAM,
+            "brokered call failed before send on every permitted attempt"
         );
     }
     // Ledger ONLY when this dispatcher actually settled the claim. When the CAS
@@ -1916,7 +1958,7 @@ pub async fn workspace_archive(
         // rather than mistaken for "this run has no archive".
         Err(fluidbox_workspace::StoreError::NotFound) => return Err(ApiError::NotFound),
         Err(e) => {
-            tracing::warn!("workspace archive for {} unavailable: {e}", auth.session_id);
+            tracing::warn!(session_id = %auth.session_id, error = %e, "workspace archive unavailable");
             return Err(ApiError::Upstream("workspace archive unavailable".into()));
         }
     };
@@ -1981,6 +2023,12 @@ pub async fn result(
     let sess_auth = fluidbox_db::session_for_token_incl_revoked(&state.pool, &token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
+    fluidbox_obs::span::record_caller(
+        fluidbox_obs::field::principal::RUNNER,
+        &sess_auth.tenant_id.to_string(),
+        None,
+    );
+    fluidbox_obs::span::record_subject_run(&sess_auth.session_id.to_string());
     // Gap 6 (Phase F), and the SAME ordering argument as the audience check below:
     // this route's revoked-token leniency exists so a lost-response retry can ack
     // idempotently, NOT as a hole for a credential presented from the wrong place.
