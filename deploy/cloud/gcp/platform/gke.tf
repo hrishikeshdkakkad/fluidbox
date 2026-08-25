@@ -170,7 +170,13 @@ resource "google_container_node_pool" "system" {
   location = var.zone
   cluster  = google_container_cluster.fluidbox.name
 
-  node_count = null
+  # initial_node_count, NOT node_count. With node_count = null and autoscaling
+  # alone, the pool is created EMPTY and nothing brings it to the floor: the
+  # cluster autoscaler scales in response to pending pods, and the pods that
+  # would trigger it cannot schedule because there is no node. The instance
+  # group sits at targetSize 0 while the pool reports RUNNING, and `kubectl get
+  # nodes` is simply empty - observed on the cilium_mode rebuild.
+  initial_node_count = var.system_min_nodes
 
   autoscaling {
     min_node_count = var.system_min_nodes
@@ -249,7 +255,10 @@ resource "google_container_node_pool" "system" {
   }
 
   lifecycle {
-    ignore_changes = [node_config[0].kubelet_config, version]
+    # initial_node_count is a CREATE-time value; the autoscaler and manual
+    # resizes move the real count. Without ignoring it, any drift would force
+    # the pool to be replaced.
+    ignore_changes = [node_config[0].kubelet_config, version, initial_node_count]
   }
 }
 
@@ -267,7 +276,9 @@ resource "google_container_node_pool" "sandbox" {
   location = var.zone
   cluster  = google_container_cluster.fluidbox.name
 
-  node_count = null
+  # Zero is the intended floor here, so an empty pool at creation is correct -
+  # unlike the system pool, nothing needs to be running for the cluster to work.
+  initial_node_count = var.sandbox_min_nodes
 
   autoscaling {
     min_node_count = var.sandbox_min_nodes
@@ -335,6 +346,9 @@ resource "google_container_node_pool" "sandbox" {
   }
 
   lifecycle {
-    ignore_changes = [node_config[0].kubelet_config, version]
+    # initial_node_count is a CREATE-time value; the autoscaler and manual
+    # resizes move the real count. Without ignoring it, any drift would force
+    # the pool to be replaced.
+    ignore_changes = [node_config[0].kubelet_config, version, initial_node_count]
   }
 }
