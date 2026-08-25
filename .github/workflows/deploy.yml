@@ -393,16 +393,58 @@ jobs:
           EXPECT_SERVER_DIGEST: ${{ needs.deploy.outputs.revision && '' || '' }}
         run: bash scripts/cloud/gcp-smoke.sh
 
+  # ── Browser journeys ─────────────────────────────────────────────────────
+  #
+  # A real Chromium against the real deployment. These prove things curl
+  # cannot: that the Auth0 round trip completes, that the session cookie the
+  # browser receives actually carries Secure/HttpOnly/Path=/ (a __Host- cookie
+  # missing any of them is SILENTLY DISCARDED, which looks like "login did
+  # nothing"), and that Vercel's Attack Challenge Mode - which 429s every
+  # non-JS client - does not block the login path.
+  browser:
+    needs: [deploy, smoke]
+    if: always() && needs.smoke.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: install chromium
+        working-directory: tests/browser
+        run: npm install --no-audit --no-fund && npx playwright install --with-deps chromium
+      - name: run journeys
+        working-directory: tests/browser
+        env:
+          BASE_URL: https://${{ vars.DASHBOARD_HOST }}
+          API_URL: https://${{ vars.CONTROL_PLANE_HOST }}
+          ORG_SLUG: ${{ vars.ORG_SLUG }}
+          # Absent credentials SKIP the authenticated journeys rather than
+          # failing them: a missing test account is not a broken deployment,
+          # and a suite that fails for the wrong reason trains people to ignore
+          # it. The unauthenticated and negative-auth journeys always run.
+          TEST_EMAIL: ${{ secrets.E2E_TEST_EMAIL }}
+          TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+        run: npx playwright test
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report
+          path: tests/browser/playwright-report
+          retention-days: 14
+
   # ── Rollback ─────────────────────────────────────────────────────────────
   #
   # Two entry points. `helm upgrade --atomic` already reverts a release that
   # never became ready; this covers the other case - a release that DID become
   # ready and then failed its smoke tests - plus the manual `rollback_to` path.
   rollback:
-    needs: [deploy, smoke]
+    needs: [deploy, smoke, browser]
     if: |
       always() && (
-        (needs.deploy.result == 'success' && needs.smoke.result == 'failure')
+        (needs.deploy.result == 'success'
+          && (needs.smoke.result == 'failure' || needs.browser.result == 'failure'))
         || inputs.rollback_to != ''
       )
     runs-on: ubuntu-latest
@@ -442,7 +484,7 @@ jobs:
 
   # ── Dashboard (Vercel) ───────────────────────────────────────────────────
   vercel:
-    needs: [changes, smoke]
+    needs: [changes, smoke, browser]
     if: |
       always() && github.event_name == 'push' && inputs.rollback_to == ''
       && needs.changes.outputs.web == 'true'
