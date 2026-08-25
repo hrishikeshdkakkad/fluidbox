@@ -85,7 +85,7 @@ resource "google_service_account_iam_member" "deployer_wif" {
 resource "google_service_account_iam_member" "deployer_wif_env" {
   service_account_id = google_service_account.deployer.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.environment/production"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.environment/${var.deploy_environment}"
 }
 
 # ── Project roles ────────────────────────────────────────────────────────────

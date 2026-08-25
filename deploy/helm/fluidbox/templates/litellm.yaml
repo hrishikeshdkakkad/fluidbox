@@ -71,6 +71,16 @@ spec:
       containers:
         - name: litellm
           image: {{ .Values.litellm.image | quote }}
+          {{- /* Container-level baseline. The pod-level securityContext above
+                 sets runAsNonRoot/uid/seccomp, but Pod Security Admission's
+                 `restricted` profile ALSO requires these two PER CONTAINER -
+                 without them a namespace labelled
+                 pod-security.kubernetes.io/enforce=restricted refuses the pod,
+                 and the only clue is an admission warning on the Deployment
+                 rather than an error on anything you would think to look at. */}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           args: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "1"]
           ports:
             - { name: http, containerPort: 4000 }

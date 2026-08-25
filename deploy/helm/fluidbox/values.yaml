@@ -600,6 +600,18 @@ gke:
 # platform's app stack, not by this chart).
 externalSecrets:
   enabled: false
+  # The External Secrets CRD group/version to emit.
+  #
+  # A THIRD-PARTY CRD version does not belong hardcoded in this chart: the
+  # operator promoted v1beta1 to v1 mid-life, so a hardcoded value makes the
+  # chart refuse to install against perfectly healthy clusters running the
+  # other one - with "ensure CRDs are installed first", which points at the
+  # wrong problem entirely. v1beta1 is the broadly-compatible default; set
+  # "external-secrets.io/v1" on operators new enough to serve it.
+  #
+  #   kubectl get crd externalsecrets.external-secrets.io \
+  #     -o jsonpath='{range .spec.versions[*]}{.name}{"\n"}{end}'
+  apiVersion: external-secrets.io/v1beta1
   # gcpsm | awssm | azurekv — only gcpsm is wired today.
   provider: gcpsm
   # GCP project holding the secrets.
@@ -622,6 +634,12 @@ externalSecrets:
 # run at pod boot). Turn it on wherever a pipeline promotes automatically - that
 # is the case where "the gate failed, so promotion stopped" has to be true.
 migrationJob:
+  # REQUIRES a server image that knows FLUIDBOX_MIGRATE_ONLY. An older image
+  # ignores the variable, starts a full server, and never exits - the gate
+  # becomes a hang that surfaces as "Job in progress / context deadline
+  # exceeded" long afterwards. The pipeline builds image and chart from the
+  # same commit, so this only bites a deployment pinning an older
+  # images.server.
   enabled: false
   # A few retries absorb transient database unavailability (a Cloud SQL
   # maintenance failover, a cold connection). It does NOT paper over a broken
