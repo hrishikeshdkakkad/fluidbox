@@ -154,7 +154,7 @@ policy allows :53 ONLY to it.
 This is safe for the control path because nothing in it needs cluster DNS: the
 runner dials a raw ClusterIP resolved at boot, and the archive fetch, facade,
 and collector all ride that same address.
-*/ -}}
+*/}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -213,6 +213,14 @@ spec:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 65532
+            # Pod Security Admission `restricted` requires seccompProfile on the
+            # pod OR every container. Without it a namespace labelled
+            # enforce=restricted refuses the pod outright, and the only symptom
+            # is a ReplicaSet FailedCreate event - the Deployment simply reports
+            # "Progress deadline exceeded" and `helm --wait` times out with no
+            # hint that admission, not scheduling, was the problem.
+            seccompProfile:
+              type: RuntimeDefault
             capabilities:
               drop: ["ALL"]
               # NET_BIND_SERVICE is REQUIRED, not hardening slack. The resolver
@@ -273,7 +281,7 @@ NEVER the security boundary — the L3/L4 policy above is. The Phase 0 spike
 confirmed data traffic still transits the gateway on both the plain L3/L4 and
 the toFQDNs (DNS-proxy) paths, but the design does not depend on that: if the
 gateway were bypassed, the policy still decides what may be reached.
-*/ -}}
+*/}}
 apiVersion: cilium.io/v2
 kind: CiliumEgressGatewayPolicy
 metadata:

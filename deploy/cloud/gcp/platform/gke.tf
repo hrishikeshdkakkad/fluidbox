@@ -31,6 +31,11 @@ resource "google_container_cluster" "fluidbox" {
   networking_mode   = "VPC_NATIVE"
   datapath_provider = "ADVANCED_DATAPATH"
 
+  # Turns on the CiliumClusterwideNetworkPolicy CRD. Dataplane V2 does not
+  # expose Cilium's POLICY CRDs unless asked - see the variable's comment for
+  # why the absence is easy to misread as a platform limitation.
+  enable_cilium_clusterwide_network_policy = var.enable_cilium_clusterwide_network_policy
+
   # A cluster is not a cattle resource: deleting it destroys every PVC and
   # every running sandbox. Removal is a reviewed act - flip this deliberately.
   deletion_protection = true
