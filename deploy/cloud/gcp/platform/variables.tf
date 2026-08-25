@@ -165,6 +165,26 @@ variable "sql_backup_retention_days" {
 
 # ── Edge ─────────────────────────────────────────────────────────────────────
 
+variable "enable_cilium_clusterwide_network_policy" {
+  description = <<-EOT
+    Expose the CiliumClusterwideNetworkPolicy CRD on GKE Dataplane V2, which is
+    what the chart's governed sandbox egress (networkGrants) renders.
+
+    NOT ON BY DEFAULT IN GKE, and the failure mode is misleading: the CRD is
+    simply absent, so `kubectl get crd | grep cilium` shows Cilium's STATE CRDs
+    (endpoints, identities, nodes) and none of its POLICY CRDs - which reads as
+    "Google withholds Cilium policy on DPv2" rather than "this is an opt-in
+    flag". It is an opt-in flag, available since GKE 1.28.6-gke.1095000 /
+    1.29.1-gke.1016000, and it applies IN PLACE to an existing cluster.
+
+    Without it the control plane refuses any grant above `offline` with
+    422 "this deployment cannot enforce network grants" - correctly, since it
+    cannot enforce what the CRD would express.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "enable_gcs_archive_store" {
   description = <<-EOT
     Provision the GCS bucket + HMAC key for the chart's archiveStore "s3"

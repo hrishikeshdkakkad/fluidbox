@@ -91,6 +91,15 @@
             - { name: FLUIDBOX_REQUIRE_ENFORCED_NETPOL, value: {{ .Values.netpol.requireEnforced | quote }} }
             - { name: FLUIDBOX_NETPOL_PROBE_IMAGE, value: {{ .Values.netpol.probeImage | quote }} }
 {{- if .Values.networkGrants.enabled }}
+            {{- if not (has .Values.networkGrants.enforcer (list "none" "cilium" "auto")) }}
+            {{- fail (printf "networkGrants.enforcer must be one of none|cilium|auto, got %q" .Values.networkGrants.enforcer) }}
+            {{- end }}
+            {{- /* WITHOUT THIS the whole block is inert. The server defaults
+                   FLUIDBOX_NETWORK_ENFORCER to `none`, so the Cilium policies
+                   and the controlled resolver below would be created and never
+                   consulted, and every grant above `offline` would still be
+                   refused with 422 — a feature that looks installed and is not. */}}
+            - { name: FLUIDBOX_NETWORK_ENFORCER, value: {{ .Values.networkGrants.enforcer | quote }} }
             # The CONTROLLED resolver lives in the RELEASE namespace, which is
             # not the sandbox namespace — the per-run policy's DNS rule selects
             # on it, and getting it wrong makes every FQDN grant fail to resolve
