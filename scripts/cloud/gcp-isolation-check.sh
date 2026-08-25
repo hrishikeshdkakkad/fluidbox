@@ -81,13 +81,31 @@ else
     curl -sS -o /dev/null --max-time 20 -X POST -H "$AUTH" -H 'Content-Type: application/json' \
       -d "{\"slug\":\"$slug\",\"name\":\"isolation probe $slug\"}" "$API/v1/admin/orgs" 2>/dev/null
   done
-  a=$(curl -sS --max-time 20 -H "$AUTH" "$API/v1/admin/orgs/fbx-iso-a" 2>/dev/null)
-  b=$(curl -sS --max-time 20 -H "$AUTH" "$API/v1/admin/orgs/fbx-iso-b" 2>/dev/null)
-  if grep -q 'fbx-iso-a' <<<"$a" && ! grep -q 'fbx-iso-b' <<<"$a"; then
-    ok "org A's admin view contains A and not B"
+  # A real cross-tenant probe, on a sub-resource that genuinely differs between
+  # orgs: IdP configurations. The org that had Auth0 registered must show them;
+  # a freshly created org must show NONE. Equal counts would mean the admin
+  # surface is answering from a global view rather than a tenant-scoped one.
+  count_idp() {
+    curl -sS --max-time 20 -H "$AUTH" "$API/v1/admin/orgs/$1/idp" 2>/dev/null \
+      | python3 -c "import json,sys
+try: print(len(json.load(sys.stdin).get('idp_configs',[])))
+except Exception: print(-1)"
+  }
+  A_N=$(count_idp fbx-iso-a); Z_N=$(count_idp "${ORG_SLUG:-fluidzero}")
+  if [ "$A_N" = "0" ] && [ "$Z_N" -gt 0 ] 2>/dev/null; then
+    ok "per-org scoping: a fresh org sees 0 IdP configs while ${ORG_SLUG:-fluidzero} sees $Z_N"
+  elif [ "$A_N" = "-1" ] || [ "$Z_N" = "-1" ]; then
+    skip "per-org scoping" "admin idp endpoint unavailable"
   else
-    skip "per-org admin scoping" "orgs not created (endpoint shape may differ)"
+    bad "per-org scoping: fresh org sees $A_N IdP configs, ${ORG_SLUG:-fluidzero} sees $Z_N" \
+        "equal or non-zero counts suggest a global view, not a tenant-scoped one"
   fi
+
+  # A member list must also be per-org, not shared.
+  m=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -H "$AUTH" \
+        "$API/v1/admin/orgs/fbx-iso-a/members" 2>/dev/null)
+  [ "$m" = "200" ] && ok "per-org member list reachable (scoped by slug)" \
+                   || skip "per-org member list" "HTTP $m"
 
   # A PAT belonging to no org must not read another org's data. We cannot mint
   # one without a browser session, so assert the refusal a forged one gets -
@@ -119,14 +137,39 @@ pol=$(kubectl -n "$SANDBOX_NS" get networkpolicy -o name 2>/dev/null | wc -l | t
 # The live proof: a pod wearing the sandbox label must NOT reach the internet.
 # Run it and see, rather than reading the policy back.
 say "   live probe: a sandbox-labelled pod tries to reach the internet"
+# First, a check worth making explicitly: the sandbox namespace must REFUSE a
+# pod that is not hardened. A namespace that accepts anything is a namespace
+# whose Pod Security labels are decorative.
+LAX="psa-probe-$RANDOM"
+if kubectl -n "$SANDBOX_NS" run "$LAX" --restart=Never --image=busybox:1.36 \
+     --command -- true >/dev/null 2>&1; then
+  bad "the sandbox namespace ACCEPTED an unhardened pod" "Pod Security enforcement is not active"
+  kubectl -n "$SANDBOX_NS" delete "pod/$LAX" --ignore-not-found --wait=false >/dev/null 2>&1
+else
+  ok "the sandbox namespace REFUSES an unhardened pod (Pod Security: restricted)"
+fi
+
+# Now the real probe, hardened exactly as the provider builds a sandbox pod -
+# otherwise admission rejects it and the egress question never gets asked.
 POD="egress-probe-$RANDOM"
 kubectl -n "$SANDBOX_NS" run "$POD" --restart=Never --image=busybox:1.36 \
-  --labels="fluidbox.dev/managed=true" --command -- sh -c \
-  'wget -q -T 6 -O- https://example.com >/dev/null 2>&1 && echo REACHED || echo BLOCKED; sleep 1' >/dev/null 2>&1
+  --labels="fluidbox.dev/managed=true" \
+  --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":10001,"seccompProfile":{"type":"RuntimeDefault"}},"tolerations":[{"key":"fluidbox.dev/role","operator":"Equal","value":"sandbox","effect":"NoSchedule"}],"containers":[{"name":"'"$POD"'","image":"busybox:1.36","command":["sh","-c","wget -q -T 6 -O- https://example.com >/dev/null 2>&1 && echo REACHED || echo BLOCKED"],"securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}' \
+  >/dev/null 2>&1
 
-if kubectl -n "$SANDBOX_NS" wait --for=condition=Ready "pod/$POD" --timeout=90s >/dev/null 2>&1 \
-   || kubectl -n "$SANDBOX_NS" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$POD" --timeout=90s >/dev/null 2>&1; then
-  sleep 8
+# POLL to a terminal phase rather than waiting on Ready + a fixed sleep. The
+# probe is a short-lived Job-shaped pod: it can go Pending -> Running ->
+# Succeeded faster than a `wait --for=condition=Ready` ever observes Ready, and
+# a fixed sleep afterwards is a race that reads the logs before the container
+# has written them. Both produced an "inconclusive: <none>" that looked like a
+# broken test rather than a slow one.
+PHASE=""
+for _ in $(seq 1 24); do          # 24 x 10s = 4 min, enough for a cold Spot node
+  PHASE="$(kubectl -n "$SANDBOX_NS" get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null)"
+  case "$PHASE" in Succeeded|Failed) break ;; esac
+  sleep 10
+done
+if [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; then
   OUT="$(kubectl -n "$SANDBOX_NS" logs "$POD" 2>/dev/null | tr -d '[:space:]')"
   case "$OUT" in
     BLOCKED) ok "a sandbox-labelled pod could NOT reach the public internet" ;;
@@ -134,7 +177,7 @@ if kubectl -n "$SANDBOX_NS" wait --for=condition=Ready "pod/$POD" --timeout=90s 
     *)       skip "live egress probe" "inconclusive output: '${OUT:-<none>}'" ;;
   esac
 else
-  skip "live egress probe" "pod did not start (quota, or no sandbox node available)"
+  skip "live egress probe" "pod did not start within 240s - the sandbox pool idles at ZERO nodes, so a cold probe waits on the autoscaler"
 fi
 kubectl -n "$SANDBOX_NS" delete "pod/$POD" --ignore-not-found --wait=false >/dev/null 2>&1
 
