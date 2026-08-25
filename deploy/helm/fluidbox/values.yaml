@@ -481,6 +481,24 @@ netpol:
 # `just doctor` and the server's boot log both say so if it is missing.
 networkGrants:
   enabled: false
+  # Which enforcer the CONTROL PLANE believes it has
+  # (FLUIDBOX_NETWORK_ENFORCER). This is not decoration: the server defaults to
+  # `none`, so without it `enabled: true` renders the Cilium policies and the
+  # controlled resolver and the server still refuses every grant above
+  # `offline` with 422 - the feature installed and inert, with nothing saying so.
+  #
+  #   cilium  explicit. REFUSES TO BOOT on a cluster without the Cilium CRDs,
+  #           rather than admitting grants nothing can deliver. The right
+  #           default here: enabling this block is an explicit request for
+  #           governed egress, and failing loudly beats degrading silently.
+  #   auto    probe for cilium.io/v2 at boot and decide. Portable, but a
+  #           cluster that loses the CRDs degrades to offline-only quietly.
+  #   none    force offline-only even with the policies rendered.
+  #
+  # On GKE the CRDs require Dataplane V2 PLUS
+  # --enable-cilium-clusterwide-network-policy (GKE >= 1.28.6-gke.1095000);
+  # DPv2 alone ships Cilium's state CRDs and none of its policy CRDs.
+  enforcer: cilium
   # The cluster's OWN pod / service / node ranges. They go in the deny wall
   # (reaching another tenant's pod by address is lateral movement, not egress)
   # and are excluded from the egress gateway. CIDR selectors never bind
