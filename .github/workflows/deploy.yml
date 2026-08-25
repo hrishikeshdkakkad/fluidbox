@@ -249,9 +249,34 @@ jobs:
       - name: registry login
         run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
       - uses: docker/setup-buildx-action@v4
+      - name: is there already an image for this commit?
+        id: probe
+        run: |
+          set -euo pipefail
+          AR="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/fluidbox"
+          for img in fluidbox-server fluidbox-workspaced; do
+            if gcloud artifacts docker images describe "$AR/$img:${{ github.sha }}" >/dev/null 2>&1; then
+              echo "${img#fluidbox-}_present=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "${img#fluidbox-}_present=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
       - name: build + push server
         id: server
-        if: needs.changes.outputs.server == 'true'
+        # BUILD IF ABSENT for this commit - not "only when sources changed".
+        #
+        # The changed-paths version was wrong in a way that bit immediately: a
+        # commit touching only CI produced no image, so helm fell back to
+        # whatever the chart's default tag pointed at. That is not reproducible
+        # ("what is deployed" stops being derivable from the commit), and it
+        # broke the migration gate outright - the fallback image predated
+        # FLUIDBOX_MIGRATE_ONLY, so the pre-upgrade Job started a full server
+        # and never exited.
+        #
+        # Building if absent keeps every deploy pinned to a digest built FROM
+        # THE COMMIT BEING DEPLOYED. The buildx GHA cache makes a no-source-change
+        # rebuild cheap.
+        if: steps.probe.outputs.server_present != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -265,7 +290,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=deploy-server
       - name: build + push workspaced
         id: workspaced
-        if: needs.changes.outputs.workspaced == 'true'
+        if: steps.probe.outputs.workspaced_present != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -283,19 +308,15 @@ jobs:
           # A TAG can be moved; a digest cannot. Everything downstream deploys
           # the digest, so "what is running" is answerable without trusting that
           # nobody re-pushed the tag.
-          resolve() {
-            gcloud artifacts docker images describe "$AR/$1:${{ github.sha }}" \
-              --format='value(image_summary.digest)' 2>/dev/null || true
-          }
           for img in server workspaced; do
-            d="$(resolve "fluidbox-$img")"
-            if [ -z "$d" ]; then
-              # Unchanged this commit: keep whatever the live release runs.
-              echo "$img=" >> "$GITHUB_OUTPUT"
-            else
-              echo "$img=$d" >> "$GITHUB_OUTPUT"
-              echo "fluidbox-$img -> $d"
-            fi
+            d="$(gcloud artifacts docker images describe "$AR/fluidbox-$img:${{ github.sha }}" \
+                   --format='value(image_summary.digest)' 2>/dev/null || true)"
+            # No silent fallback. If this commit has no image, the deploy would
+            # ship an image nobody chose - so fail here, where the cause is
+            # obvious, rather than downstream where it is not.
+            [ -n "$d" ] || { echo "::error::no image for fluidbox-$img at ${{ github.sha }}"; exit 1; }
+            echo "$img=$d" >> "$GITHUB_OUTPUT"
+            echo "fluidbox-$img -> $d"
           done
 
   # ── Helm release ─────────────────────────────────────────────────────────
@@ -336,18 +357,12 @@ jobs:
         run: |
           set -euo pipefail
           AR="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/fluidbox"
-          ARGS=()
-          # Pin by digest when this commit produced one. When it did not, pass
-          # nothing and let the live release keep the image it already runs -
-          # re-pinning to a stale digest would be a silent rollback of a
-          # component this commit never touched.
-          if [ -n "${{ needs.images.outputs.server }}" ]; then
-            ARGS+=(--set images.server.repository="$AR/fluidbox-server"
-                   --set images.server.digest="${{ needs.images.outputs.server }}")
-          fi
-          if [ -n "${{ needs.images.outputs.workspaced }}" ]; then
-            ARGS+=(--set images.collector="$AR/fluidbox-workspaced@${{ needs.images.outputs.workspaced }}")
-          fi
+          # Always digest-pinned, always to an image built from THIS commit.
+          ARGS=(
+            --set images.server.repository="$AR/fluidbox-server"
+            --set images.server.digest="${{ needs.images.outputs.server }}"
+            --set images.collector="$AR/fluidbox-workspaced@${{ needs.images.outputs.workspaced }}"
+          )
           helm upgrade --install fluidbox deploy/helm/fluidbox \
             --namespace fluidbox \
             -f deploy/helm/fluidbox/values/gke.yaml \
