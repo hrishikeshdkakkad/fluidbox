@@ -30,8 +30,12 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files. `.env*` would also swallow .env.example, which is DOCUMENTATION,
+# not a secret - the root .gitignore deliberately un-ignores it and this file
+# was silently overriding that. The result: the web app's environment contract
+# was invisible to anyone cloning the repo.
 .env*
+!.env.example
 
 # vercel
 .vercel
