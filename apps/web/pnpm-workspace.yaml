@@ -1,3 +1,23 @@
-ignoredBuiltDependencies:
+# Dependency build-script approval.
+#
+# pnpm 10+ refuses to run a dependency's install scripts unless they are
+# approved here, and pnpm 11 FAILS THE INSTALL outright when the approval is
+# unresolved. This file previously carried the generator's literal placeholder
+# ("set this to true or false"), which pnpm read as unresolved - so
+# `pnpm install` exited 1 with ERR_PNPM_IGNORED_BUILDS and a `vercel build`
+# died on a bare `Command "pnpm install" exited with 1`.
+#
+# Both packages need their scripts and both are first-party to the toolchain:
+#   sharp          Next.js image optimisation - without its native binary,
+#                  next/image falls back or fails at build time.
+#   unrs-resolver  the native resolver behind eslint-import-resolver.
+#
+# Two spellings on purpose: `allowBuilds` is pnpm 11's name, and
+# `onlyBuiltDependencies` is what pnpm 10 reads. Vercel's builders and this
+# repo do not always agree on the version.
+allowBuilds:
+  sharp: true
+  unrs-resolver: true
+onlyBuiltDependencies:
   - sharp
   - unrs-resolver
