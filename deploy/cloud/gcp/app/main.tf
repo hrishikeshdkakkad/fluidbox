@@ -1,3 +1,70 @@
+# ── Self-managed Cilium (cilium_mode = "upstream" only) ─────────────────────
+#
+# Installed here rather than by the fluidbox chart because it is CLUSTER
+# infrastructure: it owns the CNI, every other workload depends on it, and the
+# nodes stay tainted `node.cilium.io/agent-not-ready` until it removes the taint.
+# Nothing else can schedule before this succeeds.
+#
+# Why at all: GKE Dataplane V2 exposes only CiliumClusterwideNetworkPolicy,
+# while fluidbox's per-run enforcer writes NAMESPACED CiliumNetworkPolicy.
+# Upstream Cilium provides both. Verified on a probe cluster before adoption -
+# a namespaced CNP carrying toFQDNs was accepted with Valid=True.
+#
+# The GKE-specific values are not optional decoration:
+#   nodeinit.*        prepares each node - mounts the eBPF filesystem, puts
+#                     kubelet in CNI mode, removes Google's cbr0 bridge. GKE
+#                     re-instates the stock CNI on upgrade/reboot, so this runs
+#                     for the life of the cluster, not just at install.
+#   cni.binPath       GKE keeps CNI binaries in /home/kubernetes/bin, not the
+#                     usual /opt/cni/bin.
+#   ipam.mode         `kubernetes` uses the per-node PodCIDRs GKE already
+#                     allocates from the VPC-native secondary range.
+resource "helm_release" "cilium" {
+  count = var.cilium_mode == "upstream" ? 1 : 0
+
+  name       = "cilium"
+  repository = "https://helm.cilium.io/"
+  chart      = "cilium"
+  version    = var.cilium_chart_version
+  namespace  = "kube-system"
+
+  set {
+    name  = "nodeinit.enabled"
+    value = "true"
+  }
+  set {
+    name  = "nodeinit.reconfigureKubelet"
+    value = "true"
+  }
+  set {
+    name  = "nodeinit.removeCbrBridge"
+    value = "true"
+  }
+  set {
+    name  = "cni.binPath"
+    value = "/home/kubernetes/bin"
+  }
+  set {
+    name  = "gke.enabled"
+    value = "true"
+  }
+  set {
+    name  = "ipam.mode"
+    value = "kubernetes"
+  }
+  set {
+    name  = "ipv4NativeRoutingCIDR"
+    value = var.pods_cidr
+  }
+
+  # NOT atomic: a rollback here would uninstall the CNI from a running cluster,
+  # which is far worse than a half-installed one an operator can inspect.
+  atomic          = false
+  cleanup_on_fail = false
+  wait            = true
+  timeout         = 900
+}
+
 # ── Priority: the control plane outranks the work it governs ────────────────
 #
 # Without this, the scheduler treats a sandbox pod and the control plane as
@@ -39,6 +106,8 @@ resource "kubernetes_priority_class_v1" "sandbox" {
 # the six fluidbox secrets and nothing else.
 
 resource "kubernetes_namespace_v1" "external_secrets" {
+  depends_on = [helm_release.cilium]
+
   metadata {
     name = "external-secrets"
     labels = {
@@ -97,6 +166,8 @@ resource "helm_release" "external_secrets" {
 # not added as a side effect of one.
 
 resource "kubernetes_namespace_v1" "fluidbox" {
+  depends_on = [helm_release.cilium]
+
   metadata {
     name = var.namespace
     labels = {
