@@ -497,7 +497,10 @@ jobs:
         with:
           node-version: 24
       - name: deploy to Vercel production
-        working-directory: apps/web
+        # REPO ROOT, not apps/web. The Vercel project's rootDirectory is
+        # already "apps/web", so running the CLI from inside that directory
+        # makes it look for apps/web/apps/web and fail with a bare ENOENT on a
+        # package.json path that does not exist.
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
