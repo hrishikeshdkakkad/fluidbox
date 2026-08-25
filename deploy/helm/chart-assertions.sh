@@ -110,6 +110,11 @@ grep -qF 'add: ["NET_BIND_SERVICE"]' <<<"$dns" \
   || fail "sandbox-dns lost NET_BIND_SERVICE — the resolver will fail to exec"
 grep -qF 'allowPrivilegeEscalation: false' <<<"$dns" \
   || fail "sandbox-dns must keep allowPrivilegeEscalation: false"
+# PSA `restricted` also demands seccompProfile. Its absence is invisible in the
+# manifest and surfaces only as a ReplicaSet FailedCreate, with the Deployment
+# reporting "Progress deadline exceeded" - which reads as a scheduling problem.
+grep -qF 'type: RuntimeDefault' <<<"$dns" \
+  || fail "sandbox-dns must set seccompProfile RuntimeDefault (PSA restricted refuses it otherwise)"
 
 # ---------------------------------------------------------------------------
 # Every preset must lint and render.
@@ -260,5 +265,26 @@ grep -qF 'capabilities: { drop: ["ALL"] }' <<<"$psa" \
 migsa="$(render --set migrationJob.enabled=true -s templates/migrate-job.yaml)"
 grep -qF 'serviceAccountName: fluidbox-fluidbox-server' <<<"$migsa" \
   || fail "the migration Job must use the server ServiceAccount, not default"
+
+# networkGrants without FLUIDBOX_NETWORK_ENFORCER is a feature that renders and
+# does nothing: the server defaults the enforcer to `none`, so the Cilium
+# policies and the controlled resolver get created and never consulted, and every
+# grant above `offline` is still refused with 422.
+ng="$(render --set networkGrants.enabled=true --set networkGrants.dnsClusterIP=10.24.15.53 \
+  -s templates/server.yaml)"
+grep -qF '{ name: FLUIDBOX_NETWORK_ENFORCER, value: "cilium" }' <<<"$ng" \
+  || fail "networkGrants.enabled must set FLUIDBOX_NETWORK_ENFORCER, or the whole block is inert"
+guard "an unknown networkGrants.enforcer must fail" \
+  --set networkGrants.enabled=true --set networkGrants.dnsClusterIP=10.24.15.53 \
+  --set networkGrants.enforcer=bogus
+
+# LINT (not just render) the networkGrants path. `helm template` re-serialises
+# its output and silently repairs a collapsed document separator; `helm lint`
+# parses the raw render and does not. netgrant.yaml had `---` followed by a
+# comment that chomped BOTH ways, collapsing into `---apiVersion: v1`, and no
+# preset enables networkGrants - so every existing lint missed it.
+helm lint "$CHART" --set networkGrants.enabled=true \
+  --set networkGrants.dnsClusterIP=10.24.15.53 >/dev/null \
+  || fail "helm lint fails with networkGrants enabled (check netgrant.yaml document separators)"
 
 echo "chart assertions: OK"

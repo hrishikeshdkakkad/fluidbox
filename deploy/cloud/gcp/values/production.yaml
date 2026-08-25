@@ -268,3 +268,43 @@ netpol:
   # observe an unprogrammed network. This is a deadline on observations, not a
   # delay - it ends at the first successful one.
   waitSeconds: 90
+
+# ── Governed sandbox egress ─────────────────────────────────────────────────
+#
+# Requires the CiliumClusterwideNetworkPolicy CRD, which on GKE needs Dataplane
+# V2 PLUS --enable-cilium-clusterwide-network-policy (the platform stack sets
+# enable_cilium_clusterwide_network_policy). Dataplane V2 ALONE exposes only
+# Cilium's state CRDs, and the resulting absence reads like a platform
+# limitation rather than an unset flag.
+#
+# With this on, an agent may declare `approved` or `public` instead of being
+# limited to `offline`. Without it the control plane refuses those at create
+# time with 422 - correctly, since it cannot enforce what it cannot express.
+networkGrants:
+  enabled: true
+  # Explicit, not `auto`: enabling this block is a deliberate request for
+  # governed egress, so a cluster missing the CRDs should REFUSE TO BOOT rather
+  # than quietly fall back to offline-only.
+  enforcer: cilium
+
+  # Sandbox pods use dnsPolicy: None, whose nameservers must be IP ADDRESSES -
+  # a Service DNS name is not valid there. Pinned to a free address in the
+  # services range (10.24.0.0/20) so it is stable and known before any sandbox
+  # starts.
+  dnsClusterIP: 10.24.15.53
+
+  # THIS DEPLOYMENT'S OWN public addresses. A `public` grant is 0.0.0.0/0, which
+  # would otherwise let a sandbox reach the control plane's own API by
+  # hairpinning through the load balancer - re-opening from the inside exactly
+  # what zeroEgress closes. The chart cannot discover these.
+  deploymentPublicCIDRs:
+    - 34.117.119.9/32     # GCLB frontend (api.platform.fluidzero.ai)
+    - 34.133.73.223/32    # Cloud NAT egress address
+
+  # The cluster's own ranges go in the deny wall: reaching another tenant's pod
+  # by address is lateral movement, not egress. Ours are all inside 10.0.0.0/8
+  # (nodes 10.10/20, pods 10.20/14, services 10.24/20, Cloud SQL peering 10.30/16).
+  clusterCIDRs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16

@@ -165,6 +165,35 @@ variable "sql_backup_retention_days" {
 
 # ── Edge ─────────────────────────────────────────────────────────────────────
 
+variable "enable_cilium_clusterwide_network_policy" {
+  description = <<-EOT
+    Expose the CiliumClusterwideNetworkPolicy CRD on GKE Dataplane V2, which is
+    what the chart's governed sandbox egress (networkGrants) renders.
+
+    NOT ON BY DEFAULT IN GKE, and the failure mode is misleading: the CRD is
+    simply absent, so `kubectl get crd | grep cilium` shows Cilium's STATE CRDs
+    (endpoints, identities, nodes) and none of its POLICY CRDs - which reads as
+    "Google withholds Cilium policy on DPv2" rather than "this is an opt-in
+    flag". It is an opt-in flag, available since GKE 1.28.6-gke.1095000 /
+    1.29.1-gke.1016000, and it applies IN PLACE to an existing cluster.
+
+    NECESSARY BUT NOT SUFFICIENT for fluidbox's governed egress. This flag
+    grants the CLUSTERWIDE CRD only. Fluidbox's PER-RUN enforcer writes
+    NAMESPACED `CiliumNetworkPolicy` objects
+    (crates/fluidbox-provider-k8s/src/enforcer.rs, `cnp_resource()`), and GKE
+    ships no namespaced variant and offers no flag for one - so
+    FLUIDBOX_NETWORK_ENFORCER=cilium still refuses to boot with "this cluster
+    does not serve cilium.io/v2".
+
+    Left ON: it is harmless, it matches the live cluster, the chart's deny-wall
+    baseline CCNP does apply through it, and it is the prerequisite for any
+    future move to clusterwide-only per-run policies. It does NOT make
+    networkGrants usable on GKE today - see docs/hosted/gcp-architecture.md.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "enable_gcs_archive_store" {
   description = <<-EOT
     Provision the GCS bucket + HMAC key for the chart's archiveStore "s3"
