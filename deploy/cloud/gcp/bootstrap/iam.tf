@@ -43,8 +43,21 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   attribute_condition = "assertion.repository == \"${var.github_repository}\""
 
   oidc {
-    issuer_uri        = "https://token.actions.githubusercontent.com"
-    allowed_audiences = ["https://github.com/${split("/", var.github_repository)[0]}"]
+    issuer_uri = "https://token.actions.githubusercontent.com"
+
+    # allowed_audiences is deliberately OMITTED.
+    #
+    # Left unset, the provider accepts the DEFAULT audience
+    # "https://iam.googleapis.com/{provider_resource_name}" - which is exactly
+    # what google-github-actions/auth requests. Setting it to anything else
+    # (the org URL is the tempting choice) makes every token fail with
+    #   invalid_grant: The audience in ID Token [...] does not match the
+    #   expected audience
+    # naming an audience that LOOKS correct, because the message echoes the
+    # token's audience rather than the configured one.
+    #
+    # Restricting the repository is the job of attribute_condition above, which
+    # already pins it. Audience adds nothing here.
   }
 }
 
