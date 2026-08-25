@@ -155,3 +155,54 @@ own registry at admin-gated `GET /v1/admin/metrics`.
   properly is an outstanding chore.
 - `docs/reviews/2026-08-25-cloud-m1-auth0-idp/` holds the IdP registration
   evidence.
+
+## 8. Verification record — 2026-08-25
+
+Every line below is a runtime observation, not a configuration reading.
+
+**Commit-to-production**
+`https://github.com/hrishikeshdkakkad/fluidbox/actions/runs/32825697429` —
+commit `fcbd6277`, result **success**. Jobs: `changes → verify → images →
+deploy → smoke → browser` all green, with `plan`/`apply` correctly skipped (no
+infrastructure change in that commit) and `rollback` skipped (nothing failed).
+The pipeline resolved `fluidbox-server -> sha256:9564f2fe…` and the running
+Deployment carries exactly that digest.
+
+**Rollback**
+`.../actions/runs/32826332436` with `rollback_to=12` — `rollback: success`,
+every other job short-circuited, Helm revision 14 recorded "Rollback to 12", and
+the running image provably changed from `sha256:9564f2fe…` to
+`sha256:ae463e3c…`. Rolled forward again through the normal path
+(`.../actions/runs/32826598466`, green end to end).
+
+**Migration gate** — the pre-upgrade Job completed rather than hanging, ending:
+
+> `FLUIDBOX_MIGRATE_ONLY=1: migrations applied and RLS posture verified — exiting 0 without serving`
+
+with **zero** `listening` lines, having first reported `rls=enforced` under
+`runtime_role=fluidbox_runtime`.
+
+**Suites** — smoke **23 passed / 0 failed / 1 skipped** (the skip is correct: a
+PodDisruptionBudget is only rendered above one replica); isolation and governed
+egress **11 / 0 / 0**; browser journeys **12 / 12**.
+
+**Security properties proven at runtime, not asserted:**
+
+| Property | Evidence |
+|---|---|
+| RLS is enforced, not inert | boot log `"rls":"enforced"` under `runtime_role=fluidbox_runtime` |
+| CNI actually drops traffic | boot probe `"worker":"netpol_gate"`, `+:8788 -:8787` |
+| Sandboxes cannot reach the internet | a live sandbox-labelled pod returned `BLOCKED` |
+| The sandbox namespace refuses weak pods | an unhardened pod was rejected by Pod Security |
+| Admin token confined under REQUIRE_SSO | `401` on `/v1/sessions`, `200` on `/v1/admin/orgs` |
+| Per-org data is scoped | a fresh org sees 0 IdP configs; `fluidzero` sees 2 |
+| SSE survives the edge | backend `TIMEOUT_SEC 3600` vs the default backend's `30` |
+| TLS is real | `CN=api.platform.fluidzero.ai`, valid to 2026-11-23 |
+| Auth0 login works | a real browser completed the round trip and received a `__Host-fbx_web` cookie with Secure/HttpOnly/Path=/ |
+| Logout works | `204`, cookie removed, and the server then REDIRECTS `/app` |
+| Autoscaling from zero | the sandbox pool scaled 0→1 to schedule the egress probe |
+
+**Deployed addresses:** `https://platform.fluidzero.ai` (Vercel) and
+`https://api.platform.fluidzero.ai` (GKE, `34.117.119.9`) both answer `200`,
+and the dashboard origin proxies `/v1/health` — the rewrite that makes
+`__Host-` cookies possible.

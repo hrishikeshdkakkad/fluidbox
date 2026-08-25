@@ -540,7 +540,7 @@ jobs:
   vercel:
     needs: [changes, smoke, browser]
     if: |
-      always() && github.event_name == 'push' && inputs.rollback_to == ''
+      always() && inputs.rollback_to == ''
       && needs.changes.outputs.web == 'true'
       && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped')
     runs-on: ubuntu-latest
