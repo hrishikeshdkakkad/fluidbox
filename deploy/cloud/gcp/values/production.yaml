@@ -162,9 +162,21 @@ llm:
 # ── Edge ────────────────────────────────────────────────────────────────────
 ingress:
   enabled: true
-  className: gce
+  # NOT `className: gce`.
+  #
+  # spec.ingressClassName must name an IngressClass OBJECT, and this GKE
+  # version does not create one - `kubectl get ingressclass` is empty even with
+  # the HTTP load balancing addon enabled and l7-default-backend running. An
+  # ingressClassName pointing at a non-existent class means NO controller claims
+  # the Ingress: it sits with no ADDRESS forever, emitting no events, and
+  # nothing anywhere says why.
+  #
+  # The legacy annotation below is honoured by GKE's controller regardless of
+  # whether the IngressClass object exists, which makes it the portable choice.
+  className: ""
   host: api.platform.fluidzero.ai
   annotations:
+    kubernetes.io/ingress.class: "gce"
     # The reserved address from Terraform. Without this the controller
     # allocates an ephemeral one, and the Route 53 record (in a different
     # cloud) would silently point at nothing after any Ingress recreation.
