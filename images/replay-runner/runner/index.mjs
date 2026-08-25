@@ -16,6 +16,10 @@ import { executeStep } from "./steps.mjs";
 // image uses the same path the sandbox runner bakes.
 const LIB = process.env.FLUIDBOX_RUNNER_LIB || "/opt/fluidbox-runner/lib/contract.mjs";
 const { loadRunnerEnv, RunnerClient, sleep } = await import(pathToFileURL(LIB));
+// The logger lives beside the contract, so it is resolved the same way rather
+// than by a second hard-coded path that could drift from it.
+const { createLogger } = await import(pathToFileURL(LIB.replace(/contract\.mjs$/, "log.mjs")));
+const log = createLogger({ target: "replay-runner" });
 
 const env = loadRunnerEnv();
 const client = new RunnerClient(env);
@@ -119,7 +123,7 @@ async function main() {
 }
 
 main().catch(async (e) => {
-  console.error("fluidbox-replay-runner: fatal:", e?.stack || e);
+  log.error("fatal", { error: e });
   try {
     await client.emit("harness", {
       type: "run.error",

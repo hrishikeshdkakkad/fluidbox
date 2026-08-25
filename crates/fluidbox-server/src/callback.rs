@@ -28,7 +28,13 @@ pub async fn litellm_usage(
     if !ok {
         return Ok(Json(json!({ "ignored": "unauthenticated" })));
     }
-    tracing::debug!("litellm usage callback: {payload}");
+    tracing::debug!(
+        // The payload SHAPE only. A usage callback body is upstream-controlled
+        // and can carry model text; the numbers we act on are extracted below
+        // and logged there, from the ledger, per tenant.
+        bytes = payload.to_string().len(),
+        "llm usage callback received"
+    );
     // Parsing left as a seam; the facade tee is the primary meter in M1.
     Ok(Json(json!({ "ok": true })))
 }

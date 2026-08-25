@@ -19,13 +19,14 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { log } from "./log.mjs";
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export function requireEnv(k) {
   const v = process.env[k];
   if (!v) {
-    console.error(`fluidbox-runner: missing required env ${k}`);
+    log.error("missing required env", { env_var: k });
     process.exit(2);
   }
   return v;
@@ -172,7 +173,7 @@ export function resolveControlToken() {
   }
   const res = readControlTokenFromFd(fdSpec);
   if (!res.ok) {
-    console.error(tokenHandoffDiagnostic(res.reason));
+    log.error(tokenHandoffDiagnostic(res.reason), { reason: res.reason });
     process.exit(EXIT_TOKEN_HANDOFF);
   }
   return res.token;
@@ -217,7 +218,7 @@ export function loadRunnerEnv() {
       const parsed = JSON.parse(raw);
       return { servers: Array.isArray(parsed?.servers) ? parsed.servers : [] };
     } catch (e) {
-      console.error("fluidbox-runner: bad FLUIDBOX_CAPABILITIES (ignoring):", e.message);
+      log.warn("FLUIDBOX_CAPABILITIES is unparseable; ignoring it", { error: e.message });
       return { servers: [] };
     }
   })();
@@ -346,11 +347,11 @@ export class RunnerClient {
   onQuiesce(cb) {
     this.quiesceCb = cb;
     if (this.quiesced && cb) {
-      console.error("fluidbox-runner: replaying quiesce received before handler registration");
+      log.info("replaying a quiesce that arrived before handler registration");
       try {
         cb();
       } catch (e) {
-        console.error("fluidbox-runner: quiesce callback threw:", e?.message || e);
+        log.error("quiesce callback threw", { error: e?.message || e });
       }
     }
   }
@@ -360,15 +361,15 @@ export class RunnerClient {
     // Latching without a handler would swallow the cancel permanently: the
     // next heartbeat re-delivers, and onQuiesce replays if we latch later.
     this.quiesced = true;
-    console.error("fluidbox-runner: control plane requested quiesce — stopping agent");
+    log.info("control plane requested quiesce — stopping the agent");
     if (!this.quiesceCb) {
-      console.error("fluidbox-runner: quiesce before handler registration; will replay on registration");
+      log.info("quiesce arrived before handler registration; it will replay on registration");
       return;
     }
     try {
       this.quiesceCb?.();
     } catch (e) {
-      console.error("fluidbox-runner: quiesce callback threw:", e?.message || e);
+      log.error("quiesce callback threw", { error: e?.message || e });
     }
   }
 
@@ -427,7 +428,7 @@ export class RunnerClient {
     try {
       await this.#post(`${this.sessionBase()}/events`, { actor, body }, { retries: 3 });
     } catch (e) {
-      console.error("fluidbox-runner: emit failed (continuing):", e.message);
+      log.warn("posting a timeline event failed; continuing", { error: e.message });
     }
   }
 
@@ -453,10 +454,10 @@ export class RunnerClient {
         // #post aborts the process on that body code, precisely so a credential
         // misconfiguration is not laundered into a governance verdict.
         if (e.status === 401 || e.status === 403) {
-          console.error("fluidbox-runner: permission rejected (session terminal) — deny");
+          log.info("permission request rejected: the session is terminal — denying");
           return { decision: "deny", message: "session is not active" };
         }
-        console.error(`fluidbox-runner: permission attempt ${attempt} failed:`, e.message);
+        log.warn("permission request failed", { attempt, error: e.message, retrying: true });
         await sleep(Math.min(2000 * (attempt + 1), 10000));
       }
     }
@@ -499,7 +500,7 @@ export class RunnerClient {
           this.stopTokenRenew();
           return;
         }
-        console.error("fluidbox-runner: token renew failed (retrying soon):", e.message);
+        log.warn("token renew failed", { error: e.message, retrying: true });
         schedule(this.renewRetryMs);
       }
     };

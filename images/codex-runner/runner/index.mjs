@@ -30,6 +30,9 @@ import {
   brokerShimEnv,
   gateShimEnv,
 } from "/opt/fluidbox-codex/lib/contract.mjs";
+import { createLogger } from "/opt/fluidbox-codex/lib/log.mjs";
+
+const log = createLogger({ target: "codex-runner" });
 
 const env = loadRunnerEnv();
 const client = new RunnerClient(env);
@@ -171,7 +174,7 @@ function handleLine(line) {
   }
   if (msg.id !== undefined && msg.method) {
     handleServerRequest(msg).catch((e) =>
-      console.error("fluidbox-codex: approval handler error:", e?.message || e),
+      log.error("approval handler error", { error: e?.message || e }),
     );
   } else if (msg.method) {
     handleNotification(msg);
@@ -578,20 +581,20 @@ async function finishRun() {
   // Quiesced (cancelled): exit WITHOUT posting /result — the cancel finalizer
   // records the terminal outcome and collects the diff.
   if (quiesced) {
-    console.error("fluidbox-codex: quiesced on cancel — exiting without /result");
+    log.info("quiesced on cancel — exiting without posting /result");
     process.exit(0);
   }
   try {
     await client.postResult(hadError ? "failed" : "completed", hadError ? String(hadError.message || hadError) : finalText);
   } catch (e) {
-    console.error("fluidbox-codex: failed to post result:", e.message);
+    log.error("posting the run result failed", { error: e.message });
     process.exit(1);
   }
   process.exit(hadError ? 1 : 0);
 }
 
 main().catch(async (e) => {
-  console.error("fluidbox-codex: fatal:", e);
+  log.error("fatal", { error: e });
   hadError = e;
   await finishRun();
 });

@@ -128,6 +128,11 @@ impl FromRequestParts<AppState> for Admin {
         let expected = fluidbox_db::sha256_hex(&state.cfg.admin_token);
         let got = fluidbox_db::sha256_hex(&token);
         if got == expected {
+            fluidbox_obs::span::record_caller(
+                fluidbox_obs::field::principal::OPERATOR,
+                &state.tenant_id.to_string(),
+                None,
+            );
             Ok(Admin)
         } else {
             Err(ApiError::Unauthorized)
@@ -212,6 +217,40 @@ impl Principal {
     }
 }
 
+impl Principal {
+    /// The credential CLASS, for logs and audit. A closed, low-cardinality set —
+    /// it is what an operator groups by when asking "which kind of caller is
+    /// failing authorization", so it must not become free text.
+    pub fn log_kind(&self) -> &'static str {
+        use fluidbox_obs::field::principal as p;
+        match self {
+            Principal::Operator { .. } => p::OPERATOR,
+            Principal::User(u) => match u.auth {
+                AuthContext::BrowserSession { .. } => p::USER,
+                AuthContext::Pat { .. } => p::PAT,
+            },
+        }
+    }
+
+    /// Stamp this caller onto the enclosing request span.
+    ///
+    /// Called once, at the moment authentication succeeds. From here on every
+    /// record the request emits — the authorization check, the state
+    /// transition, the completion record — carries who asked. That is the
+    /// difference between "a 403 happened" and "this tenant's PAT is failing
+    /// authorization on this route", and it is why the request span declares
+    /// these fields empty rather than the handler passing ids down by hand.
+    ///
+    /// Ids only. Never a token, never a token digest: a digest is a stable
+    /// identifier for a live credential, and a log store is not where one
+    /// belongs.
+    fn stamp_on_span(&self) {
+        let tenant = self.scope().tenant_id().to_string();
+        let user = self.user_id().map(|u| u.to_string());
+        fluidbox_obs::span::record_caller(self.log_kind(), &tenant, user.as_deref());
+    }
+}
+
 impl FromRequestParts<AppState> for Principal {
     type Rejection = ApiError;
 
@@ -221,21 +260,52 @@ impl FromRequestParts<AppState> for Principal {
     ) -> Result<Self, Self::Rejection> {
         let bearer = bearer_from_headers(&parts.headers);
         let cookies = web_cookie_values(&parts.headers);
-        // Dual-credential rejection (design lines 599-601 / invariant 5).
-        if bearer.is_some() && !cookies.is_empty() {
-            return Err(ApiError::BadRequest(
-                "present a session cookie or an Authorization bearer, not both".into(),
-            ));
+        // Which credential SHAPE arrived, for the refusal log below. The shape
+        // is safe to record and is most of the diagnostic: "a cookie was
+        // presented and rejected" and "nothing was presented" are the same 401
+        // to the caller and completely different problems to an operator.
+        let presented = match (bearer.is_some(), cookies.len()) {
+            (true, 0) => "bearer",
+            (false, 1) => "cookie",
+            (false, 0) => "none",
+            (true, _) => "both",
+            (false, _) => "multiple_cookies",
+        };
+        let resolved = async {
+            // Dual-credential rejection (design lines 599-601 / invariant 5).
+            if bearer.is_some() && !cookies.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "present a session cookie or an Authorization bearer, not both".into(),
+                ));
+            }
+            if let Some(token) = bearer {
+                return principal_from_bearer(state, &token).await;
+            }
+            match cookies.as_slice() {
+                [] => Err(ApiError::Unauthorized),
+                [token] => principal_from_cookie(&parts.method, &parts.headers, state, token).await,
+                // The cookie name appears more than once: ambiguous → refuse.
+                _ => Err(ApiError::Unauthorized),
+            }
         }
-        if let Some(token) = bearer {
-            return principal_from_bearer(state, &token).await;
+        .await;
+        match &resolved {
+            Ok(p) => p.stamp_on_span(),
+            Err(e) => {
+                // INFO, not WARN: a 401 is ordinary traffic on a public API —
+                // an expired browser session, a rotated PAT, a scanner. Logging
+                // it at WARN would train operators to ignore warnings, and the
+                // signal worth alerting on is the RATE, which the metrics and
+                // the auth audit log already carry. The per-callsite limiter
+                // caps a scanner's contribution to this line.
+                tracing::info!(
+                    credential_kind = presented,
+                    error = %e,
+                    "authentication refused"
+                );
+            }
         }
-        match cookies.as_slice() {
-            [] => Err(ApiError::Unauthorized),
-            [token] => principal_from_cookie(&parts.method, &parts.headers, state, token).await,
-            // The cookie name appears more than once: ambiguous → refuse.
-            _ => Err(ApiError::Unauthorized),
-        }
+        resolved
     }
 }
 
@@ -344,6 +414,20 @@ impl FromRequestParts<AppState> for TriggerAuth {
         let auth = fluidbox_db::subscription_for_token(&state.pool, &token)
             .await?
             .ok_or(ApiError::Unauthorized)?;
+        fluidbox_obs::span::record_caller(
+            fluidbox_obs::field::principal::TRIGGER,
+            &auth.tenant_id.to_string(),
+            None,
+        );
+        tracing::debug!(
+            subscription_id = %auth.subscription_id,
+            // The token ROW id, not the token and not its digest: a digest is a
+            // stable identifier for a live credential and does not belong in a
+            // log store. The row id is what rotation changes and what an audit
+            // query joins on.
+            token_id = %auth.token_id,
+            "trigger credential accepted"
+        );
         Ok(TriggerAuth {
             token_id: auth.token_id,
             subscription_id: auth.subscription_id,
@@ -759,6 +843,19 @@ impl SessionAuth {
         if audience_allows(required, &self.audience) {
             Ok(())
         } else {
+            // WARN, unlike an ordinary 401. This is not a caller who forgot to
+            // log in: it is a credential being presented on a route it was
+            // never minted for — the exact thing the four-token split exists to
+            // stop. In a correct deployment it never fires, so if it does, it
+            // is either a runner-image/server version skew or a leaked token
+            // being probed, and both want a human.
+            tracing::warn!(
+                session_id = %self.session_id,
+                token_audience = %self.audience,
+                required_audience = required,
+                error_kind = fluidbox_obs::field::error_kind::FORBIDDEN,
+                "session credential refused: wrong audience for this route"
+            );
             Err(ApiError::Forbidden("wrong_audience".into()))
         }
     }
@@ -782,6 +879,15 @@ impl FromRequestParts<AppState> for SessionAuth {
         let auth = fluidbox_db::session_for_token(&state.pool, &token)
             .await?
             .ok_or(ApiError::Unauthorized)?;
+        // Resolution has already established these ids. Stamp them before any
+        // refusal that follows so workload mismatches and wrong-audience probes
+        // remain attributable without exposing credential material.
+        fluidbox_obs::span::record_caller(
+            fluidbox_obs::field::principal::RUNNER,
+            &auth.tenant_id.to_string(),
+            None,
+        );
+        fluidbox_obs::span::record_subject_run(&auth.session_id.to_string());
         // Gap 6 (Phase F): bind the credential to the workload it was issued to.
         // Here rather than per-handler because this extractor is the FIRST thing
         // six of the seven internal routes run — including `/events`, the one route
@@ -796,6 +902,10 @@ impl FromRequestParts<AppState> for SessionAuth {
             peer_addr(parts),
             parts.uri.path(),
         )?;
+        tracing::debug!(
+            token_audience = %auth.audience,
+            "runner credential accepted"
+        );
         Ok(SessionAuth {
             session_id: auth.session_id,
             token,
@@ -1446,6 +1556,41 @@ mod tests {
         let orch = include_str!("orchestrator.rs");
         assert!(orch.contains("crate::auth::workload_addrs_from_handle(&handle)"));
         assert!(orch.contains("fluidbox_db::set_workload_addrs("));
+    }
+
+    #[test]
+    fn resolved_runner_identity_is_stamped_before_refusal_guards() {
+        let auth = production_src();
+        let start = auth
+            .find("impl FromRequestParts<AppState> for SessionAuth")
+            .expect("SessionAuth extractor");
+        let body = &auth[start..];
+        let stamp = body
+            .find("fluidbox_obs::span::record_caller(")
+            .expect("runner caller stamp");
+        let workload = body
+            .find("enforce_workload_identity(")
+            .expect("workload guard");
+        assert!(
+            stamp < workload,
+            "verified runner ids must be recorded before workload/audience refusal paths"
+        );
+
+        let facade = include_str!("facade.rs");
+        let resolved = facade
+            .find("let sess_auth = fluidbox_db::session_for_token")
+            .expect("facade token resolution");
+        let facade = &facade[resolved..];
+        let stamp = facade
+            .find("fluidbox_obs::span::record_caller(")
+            .expect("facade runner stamp");
+        let workload = facade
+            .find("crate::auth::enforce_workload_identity(")
+            .expect("facade workload guard");
+        assert!(
+            stamp < workload,
+            "facade stamp must precede its refusal guards"
+        );
     }
 
     /// THE SILENT-DEATH GUARD. Every credential resolution reads the recorded

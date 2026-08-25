@@ -1435,6 +1435,7 @@ pub async fn invoke(
             let session = fluidbox_db::get_session(&state.pool, scope, session_id)
                 .await?
                 .ok_or(ApiError::NotFound)?;
+            fluidbox_obs::span::record_subject_run(&session.id.to_string());
             return Ok(Json(json!({
                 "session_id": session.id,
                 "status": session.status,
@@ -1507,12 +1508,15 @@ pub async fn invoke(
     .await;
 
     match created {
-        Ok(crate::run_service::RunCreation::Created(session)) => Ok(Json(json!({
-            "session_id": session.id,
-            "status": session.status,
-            "replay": false,
-            "poll_url": format!("/v1/triggers/{}/runs/{}", sub.id, session.id),
-        }))),
+        Ok(crate::run_service::RunCreation::Created(session)) => {
+            fluidbox_obs::span::record_subject_run(&session.id.to_string());
+            Ok(Json(json!({
+                "session_id": session.id,
+                "status": session.status,
+                "replay": false,
+                "poll_url": format!("/v1/triggers/{}/runs/{}", sub.id, session.id),
+            })))
+        }
         Ok(crate::run_service::RunCreation::SkippedOverlap { running_session_id }) => {
             // The skip is the terminal outcome of this key — recorded, not
             // retried; the caller uses a new key once the run finishes.
@@ -1667,10 +1671,13 @@ pub async fn run_now(
     .await;
 
     match created {
-        Ok(crate::run_service::RunCreation::Created(session)) => Ok(Json(json!({
-            "session_id": session.id,
-            "status": session.status,
-        }))),
+        Ok(crate::run_service::RunCreation::Created(session)) => {
+            fluidbox_obs::span::record_subject_run(&session.id.to_string());
+            Ok(Json(json!({
+                "session_id": session.id,
+                "status": session.status,
+            })))
+        }
         Ok(crate::run_service::RunCreation::SkippedOverlap { running_session_id }) => {
             // Terminal outcome of this key — recorded, not retried.
             fluidbox_db::mark_invocation_skipped(&state.pool, scope, invocation_id, "overlap")
@@ -1708,6 +1715,7 @@ pub async fn poll_run(
     State(state): State<AppState>,
     Path((id, sid)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Value>> {
+    fluidbox_obs::span::record_subject_run(&sid.to_string());
     if auth.subscription_id != id {
         return Err(ApiError::Unauthorized);
     }

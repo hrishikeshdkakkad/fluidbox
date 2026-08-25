@@ -33,6 +33,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
+use fluidbox_obs::field::error_kind as EK;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -1287,7 +1288,7 @@ pub async fn go(State(state): State<AppState>, Query(q): Query<GoParams>) -> Res
             )
         }
         Err(e) => {
-            tracing::error!("oauth go: flow lookup failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::DB, "oauth go: flow lookup failed");
             return page(
                 StatusCode::BAD_REQUEST,
                 "Connection failed",
@@ -1313,7 +1314,7 @@ pub async fn go(State(state): State<AppState>, Query(q): Query<GoParams>) -> Res
                 Ok(Some(s)) => s == "revoked",
                 Ok(None) => true,
                 Err(e) => {
-                    tracing::error!("oauth go: connection lookup failed: {e}");
+                    tracing::error!(error = %e, error_kind = EK::DB, "oauth go: connection lookup failed");
                     return page(
                         StatusCode::BAD_REQUEST,
                         "Connection failed",
@@ -1324,7 +1325,7 @@ pub async fn go(State(state): State<AppState>, Query(q): Query<GoParams>) -> Res
             }
         }
         Err(e) => {
-            tracing::error!("oauth go: connection lookup failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::DB, "oauth go: connection lookup failed");
             return page(
                 StatusCode::BAD_REQUEST,
                 "Connection failed",
@@ -1536,7 +1537,7 @@ pub async fn callback(
             };
         }
         Err(e) => {
-            tracing::error!("oauth callback: flow claim failed: {e}");
+            tracing::error!(error = %e, error_kind = EK::DB, "oauth callback: flow claim failed");
             return page(
                 StatusCode::BAD_REQUEST,
                 "Connection failed",

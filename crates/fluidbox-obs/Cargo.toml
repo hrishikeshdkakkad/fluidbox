@@ -1,0 +1,27 @@
+[package]
+name = "fluidbox-obs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Structured, redacted, correlated logging for the fluidbox control plane."
+
+# DELIBERATELY a leaf crate: it depends on nothing else in the workspace, so
+# every other crate — including `fluidbox-core`, which sits at the bottom of the
+# dependency order — can log through it without a cycle. The cost is that the
+# secret-pattern list here is independent of `fluidbox-core::event::Redactor`'s;
+# that independence is load-bearing (see `redact.rs`) and is held honest by a
+# cross-crate parity test in `fluidbox-core`.
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+regex.workspace = true
+chrono.workspace = true
+# Request ids are UUIDv7 (time-ordered, so a log store sorts them naturally) and
+# the W3C trace id is that same id rendered as 32 hex chars — one identifier,
+# two encodings, nothing to reconcile.
+uuid.workspace = true
+# Used ONLY for correct JSON string escaping in the formatter. Hand-rolling
+# escaping is where log formatters grow injection bugs (a lone `"` or a control
+# byte in a tool name splits the line into two records); serde_json is already
+# in tree, and `escape_str` is the smallest correct thing available.
+serde_json.workspace = true

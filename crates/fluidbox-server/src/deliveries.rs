@@ -7,6 +7,7 @@ use crate::state::AppState;
 use fluidbox_core::event::{Actor, EventBody};
 use fluidbox_core::spec::{ResultDestination, RunSpec};
 use fluidbox_db::{SessionRow, TenantScope};
+use fluidbox_obs::field::error_kind as EK;
 use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
@@ -75,7 +76,7 @@ pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
             Ok(true) => continue,
             Ok(false) => {}
             Err(e) => {
-                tracing::error!("delivery existence check for {session_id} failed: {e}");
+                tracing::error!(session_id = %session_id, error = %e, error_kind = EK::DB, "delivery existence check failed");
                 all_present = false;
                 continue;
             }
@@ -89,9 +90,11 @@ pub async fn enqueue_for_session(state: &AppState, session_id: Uuid) -> bool {
         )
         .await
         {
-            Ok(d) => tracing::info!("enqueued result delivery {} for {session_id}", d.id),
+            Ok(d) => {
+                tracing::info!(delivery_id = %d.id, session_id = %session_id, "result delivery enqueued")
+            }
             Err(e) => {
-                tracing::error!("enqueue delivery for {session_id} failed: {e}");
+                tracing::error!(session_id = %session_id, error = %e, error_kind = EK::DB, "enqueueing a result delivery failed");
                 all_present = false;
             }
         }
@@ -183,7 +186,7 @@ pub fn spawn_worker(state: AppState) {
             {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("delivery claim poll failed: {e}");
+                    tracing::warn!(error = %e, error_kind = EK::DB, worker = "deliveries", "claim poll failed");
                     continue;
                 }
             };
@@ -204,10 +207,9 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow, owner: Uu
         fluidbox_db::system_worker::get_session(&state.pool, d.session_id).await
     else {
         tracing::warn!(
-            "delivery {}: session {} not found; skipping (the row stays claimed \
-             until its TTL lapses)",
-            d.id,
-            d.session_id
+            delivery_id = %d.id,
+            session_id = %d.session_id,
+            "delivery skipped: its session was not found (the row stays claimed until its TTL lapses)"
         );
         return;
     };
@@ -234,14 +236,14 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow, owner: Uu
             // `claimed_until` is in the future and `claimed_by` is not us, so this
             // replica will not re-pick it until that claim lapses.
             tracing::warn!(
-                "delivery {}: claim lost before the attempt (owner {owner} no longer \
-                 holds it); skipping — its current owner will deliver it",
-                d.id
+                delivery_id = %d.id,
+                owner = %owner,
+                "delivery skipped: the claim was lost before the attempt — its current owner will deliver it"
             );
             return;
         }
         Err(e) => {
-            tracing::warn!("delivery {}: claim re-stamp failed: {e}; skipping", d.id);
+            tracing::warn!(delivery_id = %d.id, error = %e, error_kind = EK::DB, "delivery skipped: claim re-stamp failed");
             return;
         }
     }
@@ -277,17 +279,16 @@ async fn attempt(state: &AppState, d: &fluidbox_db::ResultDeliveryRow, owner: Uu
         // 120 s-TTL overrun invisible; it must never be silent again.
         Ok(None) => {
             tracing::warn!(
-                "delivery {}: claim lost DURING the attempt (it outran the {}s claim \
-                 TTL); the attempt and its backoff were NOT recorded — the current \
-                 owner's attempt will record instead. delivered={}",
-                d.id,
-                DELIVERY_CLAIM_TTL_SECS,
-                ok
+                delivery_id = %d.id,
+                claim_ttl_secs = DELIVERY_CLAIM_TTL_SECS,
+                delivered = ok,
+                "delivery claim lost DURING the attempt (it outran the claim TTL) — this attempt \
+                 and its backoff were NOT recorded; the current owner records instead"
             );
             return;
         }
         Err(e) => {
-            tracing::error!("delivery {}: recording the attempt failed: {e}", d.id);
+            tracing::error!(delivery_id = %d.id, error = %e, error_kind = EK::DB, "recording a delivery attempt failed");
             return;
         }
     };

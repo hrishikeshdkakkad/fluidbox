@@ -10,6 +10,7 @@
 //!   -:8787) before any run is admitted. FAILS CLOSED.
 
 use crate::config::K8sConfig;
+use fluidbox_obs::field::error_kind as EK;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, DeleteParams, LogParams, PostParams};
 use kube::Client;
@@ -208,7 +209,10 @@ pub async fn verify_netpol(
                         // tail rather than a bare exit code.
                         let tail = probe_log_tail(&pods, name).await;
                         tracing::warn!(
-                            "netpol probe failed (exit={code:?}); last observations:\n{tail}"
+                            exit_code = ?code,
+                            observations = %tail,
+                            error_kind = EK::PROVIDER,
+                            "netpol enforcement probe failed"
                         );
                         break match code {
                             Some(3) => NetpolResult::NotEnforced,
