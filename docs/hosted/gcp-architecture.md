@@ -239,19 +239,40 @@ on concurrent runs.
   cluster**, and the reason is worth stating precisely because it is easy to
   get wrong:
 
-  GKE Dataplane V2 *is* Cilium, but Google manages the Cilium control plane and
-  exposes only its STATE CRDs - `ciliumendpoints`, `ciliumidentities`,
-  `ciliumnodes`, `ciliumendpointslices`, `ciliumlocalredirectpolicies`. The
-  POLICY CRDs the chart's `netgrant.yaml` renders -
-  `CiliumClusterwideNetworkPolicy` and `CiliumEgressGatewayPolicy` - are
-  **absent**, and there is no GKE-native `FQDNNetworkPolicy` on this version
-  either. Verify on any cluster before assuming otherwise:
+  The reason is narrower than "GKE has no Cilium policy", and the narrowness is
+  the whole point:
 
-      kubectl get crd ciliumclusterwidenetworkpolicies.cilium.io
+  * GKE DPv2 does expose `CiliumClusterwideNetworkPolicy`, but only behind
+    `--enable-cilium-clusterwide-network-policy` (GKE >= 1.28.6-gke.1095000).
+    The platform stack sets it, and the chart's deny-wall baseline CCNP does
+    apply successfully.
+  * **Fluidbox's per-run enforcer writes NAMESPACED `CiliumNetworkPolicy`**
+    (`crates/fluidbox-provider-k8s/src/enforcer.rs`, `cnp_resource()`) - one per
+    run, in the sandbox namespace. GKE ships **no namespaced variant** and
+    offers no flag for one.
 
-  (An earlier revision of this document claimed the feature was "available now
-  that the CNI is Cilium". That was inferred from "Dataplane V2 is Cilium"
-  without checking the CRDs, and it was wrong - corrected 2026-08-25.)
+  So the cluster-wide deny wall is expressible and the per-run grants are not,
+  and `FLUIDBOX_NETWORK_ENFORCER=cilium` refuses to boot: *"this cluster does
+  not serve cilium.io/v2"*. That refusal is correct - it is better than booting
+  and failing at provision time.
+
+  Verify on any cluster before assuming either way:
+
+      kubectl get crd ciliumnetworkpolicies.cilium.io            # per-run grants
+      kubectl get crd ciliumclusterwidenetworkpolicies.cilium.io # deny wall
+
+  (This document has been wrong twice here. It first claimed the feature was
+  "available now that the CNI is Cilium" - inferred from "DPv2 is Cilium"
+  without checking CRDs. It was then corrected to "GKE withholds Cilium policy",
+  which is also wrong: GKE offers the clusterwide CRD behind a flag. The actual
+  blocker is the NAMESPACED CRD, established by reading the enforcer and
+  confirming against the live cluster - 2026-08-25.)
+
+  Two ways forward, neither a values change:
+  * a cluster WITHOUT Dataplane V2 plus self-managed upstream Cilium, which
+    provides both CRDs; or
+  * a core change making the per-run enforcer emit `CiliumClusterwideNetworkPolicy`
+    instead, which GKE does provide.
 
   Standard `NetworkPolicy` is unaffected and DOES work: it is what enforces
   sandbox containment, and the boot probe proves it at runtime.
