@@ -177,9 +177,18 @@ variable "enable_cilium_clusterwide_network_policy" {
     flag". It is an opt-in flag, available since GKE 1.28.6-gke.1095000 /
     1.29.1-gke.1016000, and it applies IN PLACE to an existing cluster.
 
-    Without it the control plane refuses any grant above `offline` with
-    422 "this deployment cannot enforce network grants" - correctly, since it
-    cannot enforce what the CRD would express.
+    NECESSARY BUT NOT SUFFICIENT for fluidbox's governed egress. This flag
+    grants the CLUSTERWIDE CRD only. Fluidbox's PER-RUN enforcer writes
+    NAMESPACED `CiliumNetworkPolicy` objects
+    (crates/fluidbox-provider-k8s/src/enforcer.rs, `cnp_resource()`), and GKE
+    ships no namespaced variant and offers no flag for one - so
+    FLUIDBOX_NETWORK_ENFORCER=cilium still refuses to boot with "this cluster
+    does not serve cilium.io/v2".
+
+    Left ON: it is harmless, it matches the live cluster, the chart's deny-wall
+    baseline CCNP does apply through it, and it is the prerequisite for any
+    future move to clusterwide-only per-run policies. It does NOT make
+    networkGrants usable on GKE today - see docs/hosted/gcp-architecture.md.
   EOT
   type        = bool
   default     = true
