@@ -67,4 +67,10 @@ resource "google_service_account_iam_member" "external_secrets_workload_identity
   service_account_id = google_service_account.external_secrets.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[external-secrets/external-secrets]"
+
+  # The identity pool "<project>.svc.id.goog" does not exist until a cluster in
+  # this project enables Workload Identity. Without this the binding races the
+  # cluster and fails with "Identity Pool does not exist", which reads like a
+  # configuration error rather than an ordering one.
+  depends_on = [google_container_cluster.fluidbox]
 }
