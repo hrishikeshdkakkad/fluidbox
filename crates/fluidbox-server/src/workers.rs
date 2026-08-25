@@ -7,6 +7,7 @@ use crate::state::AppState;
 use fluidbox_core::spec::RunSpec;
 use fluidbox_core::traits::SandboxHandle;
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
 
@@ -60,34 +61,37 @@ pub async fn boot_orphan_sweep(state: AppState) {
                 // parse (a status written by a NEWER deploy is not proof of
                 // death — a rollback restart must not kill its live pods),
                 // and a DB error skips rather than terminates.
-                let terminal =
-                    match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
-                        Ok(None) => true, // unknown session → orphan
-                        Ok(Some(s)) => {
-                            match fluidbox_core::state::SessionStatus::parse(&s.status) {
-                                Some(st) => st.is_terminal(),
-                                None => {
-                                    tracing::warn!(
-                                        "boot sweep: session {session_id} has unknown status '{}' \
-                                     (newer deploy?); leaving its sandbox alone",
-                                        s.status
-                                    );
-                                    false
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("boot sweep: session lookup {session_id} failed: {e}");
+                let terminal = match fluidbox_db::system_worker::get_session(
+                    &state.pool,
+                    session_id,
+                )
+                .await
+                {
+                    Ok(None) => true, // unknown session → orphan
+                    Ok(Some(s)) => match fluidbox_core::state::SessionStatus::parse(&s.status) {
+                        Some(st) => st.is_terminal(),
+                        None => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                status = %s.status,
+                                worker = "boot_sweep",
+                                "unknown session status (newer deploy?); leaving its sandbox alone"
+                            );
                             false
                         }
-                    };
+                    },
+                    Err(e) => {
+                        tracing::warn!(session_id = %session_id, error = %e, error_kind = EK::DB, worker = "boot_sweep", "session lookup failed");
+                        false
+                    }
+                };
                 if terminal {
-                    tracing::info!("boot sweep: reaping orphan sandbox for {session_id}");
+                    tracing::info!(session_id = %session_id, worker = "boot_sweep", "reaping an orphan sandbox");
                     let _ = state.provider.terminate(&handle).await;
                 }
             }
         }
-        Err(e) => tracing::warn!("boot orphan sweep failed: {e}"),
+        Err(e) => tracing::warn!(error = %e, worker = "boot_sweep", "orphan sweep failed"),
     }
 }
 
@@ -98,7 +102,7 @@ async fn recover_finalizations(state: &AppState) {
     match fluidbox_db::system_worker::pending_finalizations(&state.pool).await {
         Ok(ids) => {
             for id in ids {
-                tracing::info!("resuming interrupted finalization for {id}");
+                tracing::info!(session_id = %id, worker = "finalize_driver", "resuming an interrupted finalization");
                 // Bounded so one hung drive cannot starve the rest of the
                 // backlog (this worker is serial). An abandoned drive's
                 // claim goes stale and is retried; 300 s comfortably covers
@@ -112,11 +116,13 @@ async fn recover_finalizations(state: &AppState) {
                 .await
                 .is_err()
                 {
-                    tracing::warn!("finalization drive for {id} timed out; will retry");
+                    tracing::warn!(session_id = %id, error_kind = EK::TIMEOUT, retrying = true, worker = "finalize_driver", "finalization drive timed out");
                 }
             }
         }
-        Err(e) => tracing::warn!("finalization recovery query failed: {e}"),
+        Err(e) => {
+            tracing::warn!(error = %e, error_kind = EK::DB, worker = "finalize_driver", "recovery query failed")
+        }
     }
 }
 
@@ -203,22 +209,23 @@ async fn reconcile_managed(state: AppState) {
         let managed = match state.provider.list_managed().await {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("reconcile: list_managed failed: {e}");
+                tracing::warn!(error = %e, error_kind = EK::PROVIDER, worker = "reconcile", "listing managed sandboxes failed");
                 continue;
             }
         };
         for (session_id, handle) in managed {
-            let session =
-                match fluidbox_db::system_worker::get_session(&state.pool, session_id).await {
-                    Ok(s) => s,
-                    // A transient DB error is NOT proof the session is unknown —
-                    // unlike the boot sweep, a periodic worker must never kill a
-                    // possibly-live sandbox on a blip. Next tick retries.
-                    Err(e) => {
-                        tracing::warn!("reconcile: session lookup {session_id} failed: {e}");
-                        continue;
-                    }
-                };
+            let session = match fluidbox_db::system_worker::get_session(&state.pool, session_id)
+                .await
+            {
+                Ok(s) => s,
+                // A transient DB error is NOT proof the session is unknown —
+                // unlike the boot sweep, a periodic worker must never kill a
+                // possibly-live sandbox on a blip. Next tick retries.
+                Err(e) => {
+                    tracing::warn!(session_id = %session_id, error = %e, error_kind = EK::DB, worker = "reconcile", "session lookup failed");
+                    continue;
+                }
+            };
             // STRICT status parse — never status_enum(), whose unparseable→
             // Failed fallback would read a newer deploy's status as terminal.
             let lookup = match &session {
@@ -227,9 +234,10 @@ async fn reconcile_managed(state: AppState) {
                     Some(st) => SessionLookup::Known(st),
                     None => {
                         tracing::warn!(
-                            "reconcile: session {session_id} has unknown status '{}' \
-                             (newer deploy?); leaving its sandbox alone",
-                            s.status
+                            session_id = %session_id,
+                            status = %s.status,
+                            worker = "reconcile",
+                            "unknown session status (newer deploy?); leaving its sandbox alone"
                         );
                         SessionLookup::Unparseable
                     }
@@ -247,8 +255,11 @@ async fn reconcile_managed(state: AppState) {
                 ReconcileAction::Leave => {}
                 ReconcileAction::Terminate => {
                     tracing::info!(
-                        "reconcile: terminating sandbox {} (session {session_id}: {label})",
-                        handle.external_id,
+                        session_id = %session_id,
+                        sandbox = %handle.external_id,
+                        reason = %label,
+                        worker = "reconcile",
+                        "terminating a sandbox"
                     );
                     let _ = state.provider.terminate(&handle).await;
                 }
@@ -273,8 +284,10 @@ async fn reconcile_managed(state: AppState) {
                     {
                         Ok(true) => {
                             tracing::warn!(
-                                "reconcile: adopted sandbox {} for handle-less session {session_id}",
-                                handle.external_id,
+                                session_id = %session_id,
+                                sandbox = %handle.external_id,
+                                worker = "reconcile",
+                                "adopted a sandbox for a session that had no stored handle"
                             );
                             crate::ledger::record(
                                 &state,
@@ -293,7 +306,7 @@ async fn reconcile_managed(state: AppState) {
                         }
                         Ok(false) => {} // Lost the race to run()/cancel — correct.
                         Err(e) => {
-                            tracing::warn!("reconcile: adoption of {session_id} failed: {e}")
+                            tracing::warn!(session_id = %session_id, error = %e, worker = "reconcile", "sandbox adoption failed")
                         }
                     }
                 }
@@ -314,7 +327,9 @@ async fn archive_ttl_sweep(state: AppState) {
     let ttl = Duration::from_secs(configured.max(ARCHIVE_TTL_FLOOR_SECS));
     if configured < ARCHIVE_TTL_FLOOR_SECS {
         tracing::warn!(
-            "FLUIDBOX_ARCHIVE_TTL_SECS={configured} is below the {ARCHIVE_TTL_FLOOR_SECS}s floor; using the floor"
+            configured = configured,
+            floor = ARCHIVE_TTL_FLOOR_SECS,
+            "FLUIDBOX_ARCHIVE_TTL_SECS is below the floor; using the floor"
         );
     }
     let mut tick = periodic(Duration::from_secs(3600));
@@ -343,7 +358,7 @@ async fn archive_ttl_sweep(state: AppState) {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("archive TTL sweep: session lookup failed: {e}");
+                            tracing::warn!(error = %e, error_kind = EK::DB, worker = "archive_ttl", "session lookup failed");
                             false
                         }
                     }
@@ -351,22 +366,28 @@ async fn archive_ttl_sweep(state: AppState) {
             };
             if !deletable {
                 tracing::warn!(
-                    "archive TTL sweep: {key} outlived the TTL but its session is still live; keeping"
+                    archive = %key,
+                    worker = "archive_ttl",
+                    "archive outlived the TTL but its session is still live; keeping it"
                 );
                 continue;
             }
             match store.delete_key(&key).await {
                 Ok(()) => {
-                    tracing::info!("archive TTL sweep removed {key}");
+                    tracing::info!(archive = %key, worker = "archive_ttl", "removed a stale archive");
                     removed += 1;
                 }
-                Err(e) => tracing::warn!("archive TTL sweep failed on {key}: {e}"),
+                Err(e) => {
+                    tracing::warn!(archive = %key, error = %e, worker = "archive_ttl", "archive removal failed")
+                }
             }
         }
         if removed > 0 {
             tracing::info!(
-                "archive TTL sweep reclaimed {removed} stale archive(s) from the {} store",
-                store.backend()
+                removed = removed,
+                store = %store.backend(),
+                worker = "archive_ttl",
+                "reclaimed stale archives"
             );
         }
     }
@@ -401,7 +422,7 @@ async fn watchdog(state: AppState) {
         {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("watchdog query failed: {e}");
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "heartbeat_watchdog", "query failed");
                 continue;
             }
         };
@@ -413,7 +434,7 @@ async fn watchdog(state: AppState) {
                     if (now - hb).num_seconds() > 60 {
                         // Confirm the sandbox is actually gone before failing.
                         if sandbox_dead(&state, &s.sandbox_handle).await {
-                            tracing::warn!("watchdog: {} heartbeat stale + sandbox dead", s.id);
+                            tracing::warn!(session_id = %s.id, worker = "heartbeat_watchdog", "heartbeat stale AND the sandbox is dead — failing the run");
                             // A DbError start is retried by the next tick.
                             let _ =
                                 orchestrator::fail(&state, s.id, "sandbox died (stale heartbeat)")
@@ -431,10 +452,11 @@ async fn watchdog(state: AppState) {
             Ok(stale) => {
                 for s in stale {
                     tracing::warn!(
-                        "watchdog: {} stalled in '{}' for >{}m — failing",
-                        s.id,
-                        s.status,
-                        stale_launch_mins
+                        session_id = %s.id,
+                        status = %s.status,
+                        stale_minutes = stale_launch_mins,
+                        worker = "stale_launch",
+                        "run stalled in a launch state past the bound — failing it"
                     );
                     // A DbError start is retried by the next tick.
                     let _ = orchestrator::fail(
@@ -445,7 +467,9 @@ async fn watchdog(state: AppState) {
                     .await;
                 }
             }
-            Err(e) => tracing::warn!("stale-launch sweep failed: {e}"),
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "stale_launch", "sweep failed")
+            }
         }
     }
 }
@@ -512,7 +536,9 @@ async fn budget_sweeper(state: AppState) {
                     .await;
                 }
             }
-            Err(e) => tracing::warn!("stale execution-claim sweep failed: {e}"),
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "claim_sweep", "stale execution-claim sweep failed")
+            }
         }
 
         // Phase E (#33; Gap 14): reconcile expired LLM budget reservations on the
@@ -552,7 +578,9 @@ async fn budget_sweeper(state: AppState) {
                     .await;
                 }
             }
-            Err(e) => tracing::warn!("expired LLM-reservation sweep failed: {e}"),
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "reservation_sweep", "expired LLM-reservation sweep failed")
+            }
         }
 
         // Phase F (Task 3): retire `mcp_upstream_sessions` rows whose run has been
@@ -580,12 +608,15 @@ async fn budget_sweeper(state: AppState) {
         .await
         {
             Ok(swept) if !swept.is_empty() => tracing::info!(
-                "retired {} orphaned upstream MCP session row(s) without an upstream DELETE \
-                 (their sessions expire on the upstream's own schedule)",
-                swept.len()
+                retired = swept.len(),
+                worker = "mcp_session_sweep",
+                "retired orphaned upstream MCP session rows without an upstream DELETE \
+                 (those sessions expire on the upstream's own schedule)"
             ),
             Ok(_) => {}
-            Err(e) => tracing::warn!("orphaned upstream MCP session sweep failed: {e}"),
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "mcp_session_sweep", "sweep failed")
+            }
         }
 
         let active = match fluidbox_db::system_worker::sessions_in_status(
@@ -737,14 +768,15 @@ async fn approval_expiry(state: AppState) {
     let mut tick = periodic(Duration::from_secs(5));
     loop {
         tick.tick().await;
-        let due =
-            match fluidbox_db::system_worker::expired_pending_approvals(&state.pool, 200).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("approval expiry scan failed: {e}");
-                    continue;
-                }
-            };
+        let due = match fluidbox_db::system_worker::expired_pending_approvals(&state.pool, 200)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "approval_expiry", "scan failed");
+                continue;
+            }
+        };
         for a in due {
             let scope = TenantScope::assume(a.tenant_id);
             let events = crate::internal::approval_decision_events(
@@ -761,7 +793,9 @@ async fn approval_expiry(state: AppState) {
                 // first) — that winner ledgered and notified; nothing owed here.
                 Ok(None) => {}
                 Ok(Some(_)) => state.approvals.wake(a.id).await,
-                Err(e) => tracing::warn!("approval {} expiry failed: {e}", a.id),
+                Err(e) => {
+                    tracing::warn!(approval_id = %a.id, error = %e, worker = "approval_expiry", "expiring an approval failed")
+                }
             }
         }
     }
@@ -792,7 +826,7 @@ async fn network_grant_expiry(state: AppState) {
         {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!("expired network grant scan failed: {e}");
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "netgrant_expiry", "scan failed");
                 continue;
             }
         };
@@ -827,7 +861,9 @@ async fn network_grant_expiry(state: AppState) {
                     .await;
                 }
             }
-            Err(e) => tracing::warn!("stale-schema grant scan failed: {e}"),
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "netgrant_schema", "scan failed")
+            }
         }
 
         for g in due {
@@ -865,27 +901,29 @@ async fn network_policy_reconcile(state: AppState) {
             Ok(p) if !p.is_empty() => p,
             Ok(_) => continue,
             Err(e) => {
-                tracing::warn!("listing programmed network policies failed: {e}");
+                tracing::warn!(error = %e, error_kind = EK::PROVIDER, worker = "netpol_reconcile", "listing programmed network policies failed");
                 continue;
             }
         };
-        let orphans =
-            match fluidbox_db::system_worker::runs_without_live_grants(&state.pool, &programmed)
-                .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!("reconciling network policies failed: {e}");
-                    continue;
-                }
-            };
+        let orphans = match fluidbox_db::system_worker::runs_without_live_grants(
+            &state.pool,
+            &programmed,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, worker = "netpol_reconcile", "reconciling network policies failed");
+                continue;
+            }
+        };
         for run_id in orphans {
             tracing::warn!(
                 run_id = %run_id,
                 "a network policy exists for a run with no grant in force; deleting it"
             );
             if let Err(e) = state.provider.revoke_network_policy(run_id).await {
-                tracing::warn!("deleting the orphaned network policy for {run_id} failed: {e}");
+                tracing::warn!(session_id = %run_id, error = %e, worker = "netpol_reconcile", "deleting an orphaned network policy failed");
             }
         }
     }
@@ -906,15 +944,18 @@ async fn network_grant_gate(state: AppState) {
     let mut tick = periodic(Duration::from_secs(2));
     loop {
         tick.tick().await;
-        let parked =
-            match fluidbox_db::system_worker::parked_network_grants(&state.pool, SWEEP_BATCH).await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("parked network grant scan failed: {e}");
-                    continue;
-                }
-            };
+        let parked = match fluidbox_db::system_worker::parked_network_grants(
+            &state.pool,
+            SWEEP_BATCH,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "netgrant_park", "scan failed");
+                continue;
+            }
+        };
         for p in parked {
             let scope = TenantScope::assume(p.tenant_id);
             // Crash window: the grant was already activated but the run was
@@ -995,7 +1036,11 @@ pub fn spawn_approval_wakeups(state: AppState) {
             match rx.recv().await {
                 Ok(id) => state.approvals.wake(id).await,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("approval wakeup relay lagged {n} notifications; waiters fall back to the poll floor");
+                    tracing::warn!(
+                        lagged = n,
+                        worker = "approval_wakeups",
+                        "wakeup relay lagged; waiters fall back to the poll floor"
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
@@ -1012,7 +1057,8 @@ pub fn spawn_netpol_gate(state: AppState) {
         // The public service pairs with the internal one by Helm naming.
         let Some(internal_svc) = state.cfg.internal_service.clone() else {
             tracing::warn!(
-                "netpol gate: no internal Service configured; cannot verify — runs stay gated"
+                worker = "netpol_gate",
+                "no internal Service configured; enforcement cannot be verified — runs stay gated"
             );
             return;
         };
@@ -1068,11 +1114,12 @@ pub fn spawn_netpol_gate(state: AppState) {
                     state.netpol_verified.store(ok, Ordering::SeqCst);
                     if ok {
                         tracing::info!(
-                            "netpol gate: enforcement verified (+:8788 -:8787, observed within {}s)",
-                            state.cfg.netpol_wait_secs
+                            within_secs = state.cfg.netpol_wait_secs,
+                            worker = "netpol_gate",
+                            "NetworkPolicy enforcement verified (+:8788 -:8787) — runs admitted"
                         );
                     } else {
-                        tracing::warn!("netpol gate: NOT verified ({r:?}) — runs blocked");
+                        tracing::warn!(result = ?r, worker = "netpol_gate", "NetworkPolicy enforcement NOT verified — runs blocked");
                     }
                 }
                 _ => {
@@ -1081,7 +1128,8 @@ pub fn spawn_netpol_gate(state: AppState) {
                     // previously-true gate must not coast on stale evidence.
                     state.netpol_verified.store(false, Ordering::SeqCst);
                     tracing::warn!(
-                        "netpol gate: could not resolve Service ClusterIPs; runs stay gated"
+                        worker = "netpol_gate",
+                        "could not resolve Service ClusterIPs; runs stay gated"
                     );
                 }
             }
@@ -1105,6 +1153,65 @@ async fn finalize_worker(state: AppState) {
         tick.tick().await;
         recover_finalizations(&state).await;
     }
+}
+
+/// Report log records the throttle suppressed, once per interval.
+///
+/// The per-callsite rate limit in `fluidbox-obs` protects the disk and the log
+/// bill from a retry loop pointed at a persistent fault. Suppression without
+/// accounting would be worse than the flood, though: an operator reading a quiet
+/// log would conclude the system is quiet. This worker turns a flood into ONE
+/// line per interval naming the offending callsites and their counts, which is
+/// both actionable and bounded.
+///
+/// Deliberately silent when nothing was suppressed — a healthy deployment never
+/// sees this line, so seeing it means something.
+///
+/// It is spawned before configuration is read (it needs only the log handle) and
+/// therefore lives here rather than in `spawn_all`, whose workers all take
+/// `AppState`.
+pub fn spawn_log_throttle_reporter(log: fluidbox_obs::LogHandle) {
+    let period = log.config().throttle_report_secs;
+    if period == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(period));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let report = log.throttle_report();
+            if report.is_empty() {
+                continue;
+            }
+            let total: u64 = report.iter().map(|(_, n)| n).sum();
+            // Name the worst offenders explicitly and cap the list: this line
+            // exists because something is already too loud, and it must not
+            // become the next thing that is.
+            let worst = report
+                .iter()
+                .take(5)
+                .map(|(k, n)| {
+                    format!(
+                        "{}@{}:{} ×{n}",
+                        k.target,
+                        k.file.unwrap_or("?"),
+                        k.line.unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                suppressed = total,
+                callsites = report.len(),
+                window_secs = period,
+                worst = %worst,
+                "log records were suppressed by the per-callsite rate limit — this log is \
+                 INCOMPLETE for the callsites named (raise FLUIDBOX_LOG_THROTTLE_PER_SEC, or \
+                 fix the loop)"
+            );
+        }
+    });
 }
 
 #[cfg(test)]

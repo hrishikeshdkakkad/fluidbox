@@ -99,7 +99,11 @@ pub async fn run(
             None,
         )
         .await?;
-        tracing::info!("seeded agent claude-fixer rev 1");
+        tracing::info!(
+            agent = "claude-fixer",
+            revision = 1,
+            "seeded the default agent"
+        );
     }
 
     Ok(SeedOutcome {

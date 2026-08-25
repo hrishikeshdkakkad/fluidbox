@@ -33,6 +33,7 @@
 
 use crate::netgrant::{self, LABEL_SESSION};
 use fluidbox_core::traits::{GrantedNetwork, NetworkPolicyError, NetworkPolicyProvider};
+use fluidbox_obs::field::error_kind as EK;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject};
 use kube::Client;
@@ -117,20 +118,25 @@ impl CiliumNetworkEnforcer {
         match cnps.list(&kube::api::ListParams::default().limit(1)).await {
             Ok(_) => true,
             Err(kube::Error::Api(e)) if e.code == 404 => {
-                tracing::debug!("cilium.io/v2 CiliumNetworkPolicy is not served by this cluster");
+                tracing::debug!(
+                    api_group = "cilium.io/v2",
+                    "CiliumNetworkPolicy is not served by this cluster"
+                );
                 false
             }
             Err(kube::Error::Api(e)) if e.code == 403 => {
                 tracing::warn!(
+                    api_group = "cilium.io/v2",
+                    error = %e.message,
+                    error_kind = EK::FORBIDDEN,
                     "cilium.io/v2 exists but this ServiceAccount may not list \
-                     CiliumNetworkPolicy ({}). The chart grants it when \
-                     networkGrants.enabled=true — without it the deployment is offline-only.",
-                    e.message
+                     CiliumNetworkPolicy. The chart grants it when networkGrants.enabled=true — \
+                     without it the deployment is offline-only"
                 );
                 false
             }
             Err(e) => {
-                tracing::warn!("probing for CiliumNetworkPolicy failed: {e}");
+                tracing::warn!(error = %e, error_kind = EK::PROVIDER, "probing for CiliumNetworkPolicy failed");
                 false
             }
         }

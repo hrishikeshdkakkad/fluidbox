@@ -117,6 +117,7 @@
 use crate::config::Config;
 use fluidbox_db::governance::{self, AdmitRequest, DurableAdmission, DurableLimits};
 use fluidbox_db::TenantScope;
+use fluidbox_obs::field::error_kind as EK;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -793,8 +794,11 @@ impl EgressGovernor {
                 self.degraded.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     target: "governor",
-                    "durable egress governance unavailable — admitting on the per-replica \
-                     verdict alone (cross-replica ceiling NOT enforced): {e}"
+                    error = %e,
+                    error_kind = EK::DB,
+                    degraded = true,
+                    "durable egress governance unavailable — admitting on the per-replica verdict \
+                     alone (the cross-replica ceiling is NOT enforced for this dial)"
                 );
                 Ok(None)
             }
@@ -862,22 +866,25 @@ impl EgressGovernor {
         match governance::preflight(pool, scope).await {
             Ok(()) => tracing::info!(
                 target: "governor",
-                "durable egress governance preflight OK — the cross-replica tier is \
-                 readable and writable by this process"
+                durable_tier = "usable",
+                "durable egress governance preflight OK — the cross-replica tier is readable and \
+                 writable by this process"
             ),
             Err(e) => {
                 self.preflight_failed.store(true, Ordering::Relaxed);
                 tracing::error!(
                     target: "governor",
-                    "DURABLE EGRESS GOVERNANCE IS NOT USABLE — the cross-replica \
-                     ceiling is NOT in force and every dial will fall back to \
-                     per-replica limiting (N replicas ⇒ N× the configured rate). \
-                     This is a PERMANENT misconfiguration, not a transient outage. \
-                     Most likely cause: migration 0023's DML grants were skipped \
-                     because the runtime role did not exist yet — grant \
-                     select/insert/update/delete on egress_rate_windows and \
-                     egress_breakers to it, or set FLUIDBOX_EGRESS_DURABLE=0 to stop \
-                     paying for a tier you are not getting. Probe error: {e}"
+                    error = %e,
+                    error_kind = EK::DB,
+                    durable_tier = "unusable",
+                    remediation = "grant select/insert/update/delete on egress_rate_windows and \
+                                   egress_breakers to the runtime role, or set \
+                                   FLUIDBOX_EGRESS_DURABLE=0",
+                    "DURABLE EGRESS GOVERNANCE IS NOT USABLE — the cross-replica ceiling is NOT in \
+                     force and every dial falls back to per-replica limiting (N replicas ⇒ N× the \
+                     configured rate). This is a PERMANENT misconfiguration, not a transient \
+                     outage; the most likely cause is that migration 0023's DML grants were \
+                     skipped because the runtime role did not exist yet"
                 );
             }
         }
@@ -961,16 +968,18 @@ impl EgressGovernor {
         if degraded > 0 {
             tracing::warn!(
                 target: "governor",
-                "durable egress governance has degraded {degraded} time(s) on this replica \
-                 since boot — those dials were admitted on the per-replica verdict alone"
+                degraded_count = degraded,
+                "durable egress governance has degraded since boot — those dials were admitted on \
+                 the per-replica verdict alone"
             );
         }
         if self.preflight_failed.load(Ordering::Relaxed) {
             tracing::error!(
                 target: "governor",
-                "durable egress governance is still UNUSABLE by this process (the boot \
-                 probe failed) — the cross-replica ceiling has not been in force at any \
-                 point since boot; see the preflight error for the remediation"
+                durable_tier = "unusable",
+                "durable egress governance is still UNUSABLE by this process (the boot probe \
+                 failed) — the cross-replica ceiling has not been in force at any point since \
+                 boot; see the preflight record for the remediation"
             );
         }
         for tenant in self.sweep_batch(scope.tenant_id()) {
@@ -984,7 +993,10 @@ impl EgressGovernor {
             {
                 tracing::warn!(
                     target: "governor",
-                    "durable egress governance sweep failed (retrying next cycle): {e}"
+                    error = %e,
+                    error_kind = EK::DB,
+                    retrying = true,
+                    "durable egress governance sweep failed"
                 );
             }
         }
@@ -1068,9 +1080,11 @@ impl EgressGovernor {
             self.degraded.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 target: "governor",
-                "durable breaker report lost (upstream {} health not recorded \
-                 deployment-wide): {e}",
-                permit.digest
+                upstream = %permit.digest,
+                error = %e,
+                error_kind = EK::DB,
+                "durable breaker report lost — this upstream's health is not recorded \
+                 deployment-wide"
             );
         }
     }

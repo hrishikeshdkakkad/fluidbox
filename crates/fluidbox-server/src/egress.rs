@@ -29,6 +29,7 @@
 //! (https public URL) deployment auto-closes the loopback allowance.
 
 use crate::config::Config;
+use fluidbox_obs::field::error_kind as EK;
 use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -252,8 +253,10 @@ fn with_proxy(mut b: reqwest::ClientBuilder, policy: &EgressPolicy) -> reqwest::
             Ok(proxy) => b = b.proxy(proxy),
             Err(e) => {
                 tracing::error!(
-                    "FLUIDBOX_EGRESS_PROXY rejected at client build \
-                     (should have failed boot in config::parse_egress_proxy): {e}"
+                    error = %e,
+                    error_kind = EK::INTERNAL,
+                    "FLUIDBOX_EGRESS_PROXY was rejected at client build — it should have failed \
+                     boot in config::parse_egress_proxy"
                 );
                 // A rejected value must NOT silently fall back to the ambient
                 // environment's proxy — fail closed onto a direct client.

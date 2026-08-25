@@ -15,6 +15,12 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
+import { createLogger } from "./log.mjs";
+
+// The shims are SEPARATE PROCESSES from the runner, so they log under their own
+// target — otherwise their records are indistinguishable from the harness's in
+// a collector, and "which process refused" is the question being asked.
+const log = createLogger({ target: "broker-shim" });
 import {
   audienceMismatchDiagnostic,
   isWrongAudienceRefusal,
@@ -24,7 +30,7 @@ import {
 function requireEnv(k) {
   const v = process.env[k];
   if (!v) {
-    console.error(`fluidbox-broker-shim: missing required env ${k}`);
+    log.error("missing required env", { env_var: k });
     process.exit(2);
   }
   return v;
@@ -142,7 +148,7 @@ function interpret(res, text) {
     // TOOL-INTENT credential is not the one this control plane's route
     // guards expect. Exiting takes the stdio MCP server down loudly instead
     // of serving denials for the rest of the run.
-    console.error(audienceMismatchDiagnostic(`${SERVER_NAME} tools/call`));
+    log.error(audienceMismatchDiagnostic(`${SERVER_NAME} tools/call`), { where: "tools/call" });
     process.exit(EXIT_AUDIENCE_MISMATCH);
   }
   const body = (() => {

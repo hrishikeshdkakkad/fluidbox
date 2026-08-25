@@ -65,6 +65,7 @@ pub async fn stream(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
+    fluidbox_obs::span::record_subject_run(&id.to_string());
     // The handshake enforces run.read like any GET on the session's timeline;
     // the CSRF/Origin gate ran in the `Principal` extractor.
     let scope = principal.scope();

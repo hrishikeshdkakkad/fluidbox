@@ -51,7 +51,11 @@ impl NullProvider {
             .unwrap_or(0);
         // Say it at boot: a test double whose injection knob silently read as
         // zero would make a bounce test pass for the wrong reason.
-        tracing::info!("null provider: {n} injected capacity denial(s) armed");
+        tracing::info!(
+            provider = "null",
+            injected_denials = n,
+            "test provider armed with injected capacity denials"
+        );
         Self {
             deny_remaining: AtomicUsize::new(n),
         }
