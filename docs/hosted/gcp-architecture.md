@@ -235,9 +235,37 @@ on concurrent runs.
   variable and a RollingUpdate would briefly run two generations with two
   different "deployment-wide" caps. That is a visible outage on every deploy.
   The sandbox `ResourceQuota` remains the capacity backstop.
-- **`networkGrants`** (governed sandbox egress). Available now that the CNI is
-  Cilium; enabling it is a deliberate posture change and needs a
-  `dnsClusterIP` allocated from the services range.
+- **`networkGrants`** (governed sandbox egress). **NOT POSSIBLE on this
+  cluster**, and the reason is worth stating precisely because it is easy to
+  get wrong:
+
+  GKE Dataplane V2 *is* Cilium, but Google manages the Cilium control plane and
+  exposes only its STATE CRDs - `ciliumendpoints`, `ciliumidentities`,
+  `ciliumnodes`, `ciliumendpointslices`, `ciliumlocalredirectpolicies`. The
+  POLICY CRDs the chart's `netgrant.yaml` renders -
+  `CiliumClusterwideNetworkPolicy` and `CiliumEgressGatewayPolicy` - are
+  **absent**, and there is no GKE-native `FQDNNetworkPolicy` on this version
+  either. Verify on any cluster before assuming otherwise:
+
+      kubectl get crd ciliumclusterwidenetworkpolicies.cilium.io
+
+  (An earlier revision of this document claimed the feature was "available now
+  that the CNI is Cilium". That was inferred from "Dataplane V2 is Cilium"
+  without checking the CRDs, and it was wrong - corrected 2026-08-25.)
+
+  Standard `NetworkPolicy` is unaffected and DOES work: it is what enforces
+  sandbox containment, and the boot probe proves it at runtime.
+
+  Consequence: every sandbox is **offline-only**. `NetworkGrantMode::Offline`
+  resolves on any deployment ("the absence of authority needs no enforcer"),
+  while `approved` and `public` are refused at create time with
+  `422 this deployment cannot enforce network grants`. That refusal is the
+  fail-closed design working - it declines to ACCEPT a grant it cannot ENFORCE,
+  rather than silently handing the sandbox open egress.
+
+  To actually get governed egress you need Cilium's policy CRDs, which on GKE
+  means a cluster built WITHOUT Dataplane V2 plus self-managed upstream Cilium.
+  That is a cluster rebuild and a self-managed CNI, not a values change.
 - **gVisor** on the sandbox pool. `values/gke.yaml` documents the
   `runtimeClassName: gvisor` switch; it needs a GKE Sandbox node pool and
   carries syscall-compatibility risk with the Node-based runner images.
