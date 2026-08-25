@@ -1,0 +1,84 @@
+{{- /*
+HorizontalPodAutoscalers.
+
+The server HPA is REFUSED unless archiveStore is "s3". This is not defensive
+style — with the node-local archive backend the Deployment mounts one
+ReadWriteOnce PVC, so replica 2 can never attach the volume, and the server's own
+FLUIDBOX_REPLICAS boot guard refuses a fs-backed deployment above one replica
+anyway. An HPA there would scale into pods that never become ready, and the HPA
+would then read "0/70% (unknown)" forever.
+
+Rendering nothing and saying nothing would leave an operator believing the
+control plane autoscales when it structurally cannot.
+*/ -}}
+{{- if .Values.autoscaling.server.enabled }}
+{{- if not (eq .Values.server.archiveStore "s3") }}
+{{- fail "autoscaling.server.enabled requires server.archiveStore=\"s3\": the node-local archive backend mounts a single ReadWriteOnce PVC, so additional replicas cannot start (and the server's FLUIDBOX_REPLICAS guard refuses them). Set archiveStore=\"s3\" with archiveS3.* configured, or leave server autoscaling off." }}
+{{- end }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "fluidbox.serverName" . }}
+  minReplicas: {{ .Values.autoscaling.server.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.server.maxReplicas }}
+  metrics:
+    {{- with .Values.autoscaling.server.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ . }} }
+    {{- end }}
+    {{- with .Values.autoscaling.server.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target: { type: Utilization, averageUtilization: {{ . }} }
+    {{- end }}
+  behavior:
+    scaleDown:
+      # Long window on purpose: every removed replica drops the SSE streams it
+      # was serving. Browsers resume via Last-Event-ID, but flapping the fleet
+      # against a noisy CPU signal is pure churn.
+      stabilizationWindowSeconds: {{ .Values.autoscaling.server.scaleDownStabilizationWindowSeconds }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+{{- end }}
+{{- if and .Values.web.enabled .Values.autoscaling.web.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "fluidbox.webName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "fluidbox.webName" . }}
+  minReplicas: {{ .Values.autoscaling.web.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.web.maxReplicas }}
+  metrics:
+    {{- with .Values.autoscaling.web.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ . }} }
+    {{- end }}
+    {{- with .Values.autoscaling.web.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target: { type: Utilization, averageUtilization: {{ . }} }
+    {{- end }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: {{ .Values.autoscaling.web.scaleDownStabilizationWindowSeconds }}
+{{- end }}

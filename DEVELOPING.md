@@ -31,6 +31,44 @@ cargo run -p fluidbox-cli -- run --task "…" --repo /path # drive a run from th
 
 The `fluidbox-db` and workspace-wide test runs hit the **local container Postgres** (`just db-up` first) — `set -a; source .env; set +a` so `DATABASE_URL` is present, otherwise the DB test self-skips. These no longer touch a hosted database, so they are cheap and safe to run: the full workspace suite is 850 tests in seconds.
 
+## Hosted deployment (GCP / GKE) — project `fluidbox-506603`
+
+The live hosted deployment runs on **GKE** with the dashboard on **Vercel** and
+DNS in **Route 53**. Kit: `deploy/cloud/gcp/` (three Terraform stacks + the
+production values overlay); architecture and cost:
+`docs/hosted/gcp-architecture.md`; runbook: `docs/hosted/gcp-operations.md`.
+The older `deploy/cloud/terraform/` tree is the **AWS/EKS M1 kit**, whose
+estate was torn down 2026-08-15 — it is kept for reference, not for deploys.
+
+Four things about it are load-bearing and easy to get wrong:
+
+- **`platform.fluidzero.ai` is Vercel; `api.platform.fluidzero.ai` is GKE.**
+  `next.config.ts` rewrites `/v1/*` to the control plane *only* when
+  `FLUIDBOX_WEB_MODE=sso`, because `__Host-` cookies are origin-locked and the
+  OIDC callback must land on the dashboard's own origin. So
+  `server.publicUrl` is the **Vercel** origin, and `FLUIDBOX_API_URL` must be
+  set on Vercel at **build** time (Next bakes rewrites at build).
+- **`FLUIDBOX_REQUIRE_SSO=1` forces `llm.keyMode: tenant`.** With the default
+  `shared` the facade answers `503 tenant_llm_keys_required` on *every* model
+  call. Tenant keys are a Postgres-backed LiteLLM feature, so it also forces
+  `litellm.database.enabled` and the `litellm-database` image variant. The
+  chart now REFUSES to render any combination that is missing one.
+- **`FLUIDBOX_MIGRATE_ONLY=1`** (new) applies migrations, verifies the RLS
+  posture and exits 0 without serving. The chart runs it as a `pre-upgrade`
+  hook, so a bad migration *or a bad config* fails the release before any pod
+  rolls. Only the exact string `"1"` enables it.
+- **Sealing is `FLUIDBOX_KMS_MODE=static`** with the KEK in Secret Manager under
+  a CMEK Cloud KMS key — there is no native GCP KMS backend, so this is the
+  only mode giving v2 envelope sealing on GCP. Disclosed residual: the KEK
+  plaintext is in the pod env (unlike the `aws` backend). See
+  `docs/hosted/gcp-architecture.md#sealing`.
+
+Deploys are automatic on push to `main` (`.github/workflows/deploy.yml`):
+plan on PRs as a read-only identity, apply + release on main through a
+protected environment, with a destroy gate, the migration gate, `--atomic`, and
+`helm rollback` on smoke/browser failure. **No long-lived cloud credential
+exists** — GitHub OIDC is exchanged through Workload Identity Federation.
+
 ## Environment & setup gotchas (these cost real debugging time)
 
 - **`FLUIDBOX_BIND` must be `0.0.0.0:8787`, not loopback.** Sandboxes reach the control plane via `host.docker.internal`, which resolves to the host's gateway IP — a `127.0.0.1` bind is unreachable from a container.
