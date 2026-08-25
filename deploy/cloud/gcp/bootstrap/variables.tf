@@ -32,6 +32,22 @@ variable "deploy_branch" {
   default     = "main"
 }
 
+variable "deploy_environment" {
+  description = <<-EOT
+    The GitHub Environment whose OIDC claim gates the deployer identity.
+
+    CASE MATTERS and is not obvious: GitHub environment NAMES are
+    case-insensitive for creation - asking for "production" when "Production"
+    exists silently returns the existing one - but the `environment` claim in
+    the OIDC token carries the STORED casing. A principalSet bound to
+    "production" therefore never matches a repository whose environment is
+    stored as "Production", and the failure looks like a permissions problem
+    rather than a spelling one.
+  EOT
+  type        = string
+  default     = "Production"
+}
+
 variable "billing_account" {
   description = "Billing account id (XXXXXX-XXXXXX-XXXXXX) that owns this project, used for the budget. Empty disables the budget resources - useful when the caller lacks billing.budgets permissions, which are granted on the BILLING ACCOUNT and not the project."
   type        = string

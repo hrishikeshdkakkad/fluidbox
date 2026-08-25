@@ -36,6 +36,18 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: {{ .Values.migrationJob.backoffLimit }}
+  {{- /* VERSION COUPLING - the sharp edge of this gate.
+
+         FLUIDBOX_MIGRATE_ONLY is honoured only by a server binary that knows
+         the variable. An OLDER image ignores it, starts a full server, binds
+         :8787 and NEVER EXITS - so the "gate" becomes a hang, and the deploy
+         fails much later with "Job in progress / context deadline exceeded",
+         which names the symptom and not the cause.
+
+         activeDeadlineSeconds bounds that to a loud, finite failure rather
+         than an indefinite one. Keep migrationJob.enabled aligned with the
+         image: the pipeline always builds both from the same commit, so this
+         only bites a deployment that pins an older images.server. */}}
   activeDeadlineSeconds: {{ .Values.migrationJob.activeDeadlineSeconds }}
   template:
     metadata:
@@ -44,6 +56,12 @@ spec:
         app.kubernetes.io/component: migrate
     spec:
       restartPolicy: Never
+      {{- /* The SERVER's ServiceAccount, not `default`. The Job shares the
+             server's environment, so it also shares its expectations - and a
+             `default` SA produced a stream of "pods is forbidden" warnings that
+             looked like a broken deployment when it was just the wrong
+             identity. */}}
+      serviceAccountName: {{ include "fluidbox.serverName" . }}
       {{- /* Same placement as the control plane: a migration killed halfway by
              a reclaimed Spot node is the one job that must not run on
              preemptible capacity. */}}

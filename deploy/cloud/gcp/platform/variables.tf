@@ -165,6 +165,33 @@ variable "sql_backup_retention_days" {
 
 # ── Edge ─────────────────────────────────────────────────────────────────────
 
+variable "enable_gcs_archive_store" {
+  description = <<-EOT
+    Provision the GCS bucket + HMAC key for the chart's archiveStore "s3"
+    backend. DEFAULT OFF, and the default is not caution - it is a policy
+    constraint.
+
+    That backend needs a STATIC HMAC key: the chart supports neither workload
+    identity nor STS for it, because the point of the backend is that MinIO and
+    R2 behave identically. Creating one is refused by the org policy
+    `constraints/iam.disableServiceAccountKeyCreation`, which is ENFORCED on
+    this project (inherited - Google's secure-by-default for projects with no
+    organization). That policy exists precisely to stop long-lived static
+    credentials, so the right response is to do without one, not to seek an
+    exception.
+
+    With this off the control plane uses the node-local archive PVC, which
+    needs no credential at all. The cost is real and is documented in
+    docs/hosted/gcp-architecture.md: one ReadWriteOnce volume means ONE server
+    replica, which means `strategy: Recreate` (a brief outage on every upgrade)
+    and no meaningful PodDisruptionBudget or HPA.
+
+    Turn this on ONLY if the constraint is deliberately lifted for this project.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "control_plane_host" {
   description = "Public hostname for the GKE control-plane origin. The dashboard on platform.fluidzero.ai rewrites /v1/* here, so this needs its own certificate and its own DNS record."
   type        = string

@@ -116,7 +116,18 @@ resource "google_logging_metric" "boot_refusal" {
   }
 }
 
+# A log-based metric is not queryable the moment it is created - Monitoring
+# reports "Cannot find metric(s) that match type ...  it could take up to 10
+# minutes to become available". The alert policy below references it by type, so
+# it must wait. This is indexing latency, not a missing resource.
+resource "time_sleep" "boot_refusal_metric" {
+  depends_on      = [google_logging_metric.boot_refusal]
+  create_duration = "120s"
+}
+
 resource "google_monitoring_alert_policy" "boot_refusal" {
+  depends_on = [time_sleep.boot_refusal_metric]
+
   project      = var.project_id
   display_name = "fluidbox: control plane REFUSED TO BOOT"
   combiner     = "OR"
