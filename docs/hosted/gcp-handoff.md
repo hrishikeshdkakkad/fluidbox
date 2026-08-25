@@ -137,10 +137,19 @@ own registry at admin-gated `GET /v1/admin/metrics`.
 5. **Auth0 is the `hrishi-test` tenant, JP region.** Standards-conformant and
    working, but dev-named. Moving to a production tenant is a dashboard action
    plus a re-run of `scripts/cloud/gcp-auth0.sh`.
-6. **The run queue is off.** Enabling `server.maxConcurrentRuns` switches the
+6. **Sandboxes are OFFLINE-ONLY; governed network grants are impossible here.**
+   GKE Dataplane V2 exposes Cilium's state CRDs but not its POLICY CRDs
+   (`CiliumClusterwideNetworkPolicy`, `CiliumEgressGatewayPolicy`), so
+   `networkGrants` cannot be enabled. Agents declaring `approved` or `public`
+   are refused with `422 this deployment cannot enforce network grants` - the
+   fail-closed design declining a grant it cannot enforce. Agents that declare
+   no network (or `offline`) work normally. Getting real governed egress means
+   a cluster without Dataplane V2 plus self-managed upstream Cilium.
+   See gcp-architecture.md §10.
+7. **The run queue is off.** Enabling `server.maxConcurrentRuns` switches the
    Deployment to `Recreate`; the sandbox `ResourceQuota` (12 pods) is the
    capacity backstop meanwhile.
-7. **`FLUIDBOX_TRUST_FORWARDED_FOR` is off**, so audit rows record the load
+8. **`FLUIDBOX_TRUST_FORWARDED_FOR` is off**, so audit rows record the load
    balancer's address rather than the client's. Trusting it on a publicly
    reachable Ingress would let an attacker choose the identity that per-IP
    limiting records.
