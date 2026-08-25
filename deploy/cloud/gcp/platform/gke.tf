@@ -28,17 +28,23 @@ resource "google_container_cluster" "fluidbox" {
   network    = google_compute_network.vpc.id
   subnetwork = google_compute_subnetwork.gke.id
 
-  networking_mode   = "VPC_NATIVE"
-  datapath_provider = "ADVANCED_DATAPATH"
+  networking_mode = "VPC_NATIVE"
 
-  # Turns on the CiliumClusterwideNetworkPolicy CRD. Dataplane V2 does not
-  # expose Cilium's POLICY CRDs unless asked - see the variable's comment for
-  # why the absence is easy to misread as a platform limitation.
-  enable_cilium_clusterwide_network_policy = var.enable_cilium_clusterwide_network_policy
+  # IMMUTABLE. Changing this REPLACES the cluster - see var.cilium_mode.
+  #   dataplane_v2 -> GKE's managed Cilium (ADVANCED_DATAPATH)
+  #   upstream     -> legacy datapath, so self-managed Cilium owns the CNI
+  datapath_provider = var.cilium_mode == "dataplane_v2" ? "ADVANCED_DATAPATH" : "LEGACY_DATAPATH"
+
+  # Dataplane-V2-only knob: it exposes the CiliumClusterwideNetworkPolicy CRD.
+  # Meaningless (and rejected) on the legacy datapath, where upstream Cilium
+  # brings its own CRDs - both of them.
+  enable_cilium_clusterwide_network_policy = (
+    var.cilium_mode == "dataplane_v2" ? var.enable_cilium_clusterwide_network_policy : null
+  )
 
   # A cluster is not a cattle resource: deleting it destroys every PVC and
-  # every running sandbox. Removal is a reviewed act - flip this deliberately.
-  deletion_protection = true
+  # every running sandbox. Removal is a reviewed act - see the variable.
+  deletion_protection = var.cluster_deletion_protection
 
   release_channel {
     channel = var.gke_release_channel
@@ -164,7 +170,13 @@ resource "google_container_node_pool" "system" {
   location = var.zone
   cluster  = google_container_cluster.fluidbox.name
 
-  node_count = null
+  # initial_node_count, NOT node_count. With node_count = null and autoscaling
+  # alone, the pool is created EMPTY and nothing brings it to the floor: the
+  # cluster autoscaler scales in response to pending pods, and the pods that
+  # would trigger it cannot schedule because there is no node. The instance
+  # group sits at targetSize 0 while the pool reports RUNNING, and `kubectl get
+  # nodes` is simply empty - observed on the cilium_mode rebuild.
+  initial_node_count = var.system_min_nodes
 
   autoscaling {
     min_node_count = var.system_min_nodes
@@ -221,6 +233,20 @@ resource "google_container_node_pool" "system" {
       "fluidbox.dev/role" = "system"
     })
 
+    # Self-managed Cilium only. Holds every pod off a node until Cilium has
+    # prepared it and removed the taint. Without it, pods start on whatever CNI
+    # is present at boot and stay UNMANAGED - and because a GKE node upgrade or
+    # reboot re-applies the stock CNI config, this is not just a first-boot
+    # concern. It is the mechanism that makes a self-managed CNI survivable here.
+    dynamic "taint" {
+      for_each = var.cilium_mode == "upstream" ? [1] : []
+      content {
+        key    = "node.cilium.io/agent-not-ready"
+        value  = "true"
+        effect = "NO_EXECUTE"
+      }
+    }
+
     tags = ["fluidbox-node", "fluidbox-system"]
 
     metadata = {
@@ -229,7 +255,10 @@ resource "google_container_node_pool" "system" {
   }
 
   lifecycle {
-    ignore_changes = [node_config[0].kubelet_config, version]
+    # initial_node_count is a CREATE-time value; the autoscaler and manual
+    # resizes move the real count. Without ignoring it, any drift would force
+    # the pool to be replaced.
+    ignore_changes = [node_config[0].kubelet_config, version, initial_node_count]
   }
 }
 
@@ -247,7 +276,9 @@ resource "google_container_node_pool" "sandbox" {
   location = var.zone
   cluster  = google_container_cluster.fluidbox.name
 
-  node_count = null
+  # Zero is the intended floor here, so an empty pool at creation is correct -
+  # unlike the system pool, nothing needs to be running for the cluster to work.
+  initial_node_count = var.sandbox_min_nodes
 
   autoscaling {
     min_node_count = var.sandbox_min_nodes
@@ -298,6 +329,15 @@ resource "google_container_node_pool" "sandbox" {
       effect = "NO_SCHEDULE"
     }
 
+    dynamic "taint" {
+      for_each = var.cilium_mode == "upstream" ? [1] : []
+      content {
+        key    = "node.cilium.io/agent-not-ready"
+        value  = "true"
+        effect = "NO_EXECUTE"
+      }
+    }
+
     tags = ["fluidbox-node", "fluidbox-sandbox"]
 
     metadata = {
@@ -306,6 +346,9 @@ resource "google_container_node_pool" "sandbox" {
   }
 
   lifecycle {
-    ignore_changes = [node_config[0].kubelet_config, version]
+    # initial_node_count is a CREATE-time value; the autoscaler and manual
+    # resizes move the real count. Without ignoring it, any drift would force
+    # the pool to be replaced.
+    ignore_changes = [node_config[0].kubelet_config, version, initial_node_count]
   }
 }

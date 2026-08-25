@@ -39,3 +39,26 @@ variable "external_secrets_chart_version" {
   type        = string
   default     = "0.12.1"
 }
+
+variable "cilium_mode" {
+  description = "Must match the platform stack. `upstream` installs self-managed Cilium here; `dataplane_v2` installs nothing (GKE manages it)."
+  type        = string
+  default     = "dataplane_v2"
+
+  validation {
+    condition     = contains(["dataplane_v2", "upstream"], var.cilium_mode)
+    error_message = "cilium_mode must be dataplane_v2 or upstream."
+  }
+}
+
+variable "pods_cidr" {
+  description = "The cluster's Pod CIDR, passed to Cilium as ipv4NativeRoutingCIDR. Must match the platform stack's pods_cidr, or Cilium masquerades traffic it should route natively."
+  type        = string
+  default     = "10.20.0.0/14"
+}
+
+variable "cilium_chart_version" {
+  description = "Pinned. A self-managed CNI is the last thing that should float."
+  type        = string
+  default     = "1.18.1"
+}
