@@ -1,0 +1,3 @@
+issuer=https://hrishi-test.jp.auth0.com/
+client_id=7jNlJTT5S2TrVCQv6QAueIwvUlTKxNhW
+redirect_uri=https://platform.fluidzero.ai/v1/auth/callback

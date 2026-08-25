@@ -1,0 +1,99 @@
+{{- /*
+Pre-upgrade migration gate.
+
+Runs the NEW image with FLUIDBOX_MIGRATE_ONLY=1: it parses the config, applies
+every migration, verifies the RLS posture, and exits 0 without serving. Helm
+waits for it, so a failure fails the release BEFORE a single new pod rolls -
+which is what "a failed gate must stop promotion" means in practice.
+
+It is a CONFIG gate as well as a schema gate. config::Config::from_env() runs
+before the database is touched and the Job shares the Deployment's exact
+environment (templates/server.yaml's `fluidbox.serverEnv`), so a value the
+server would refuse at boot fails here first, visibly, instead of as a
+CrashLoopBackOff after the rollout has begun.
+
+pre-upgrade ONLY, deliberately - NOT pre-install:
+  * the hazard this addresses (an old binary meeting a new schema, the
+    documented discipline for migrations 0018 and 0028) cannot exist on a first
+    install, where the database is empty;
+  * on a first install the Secret this Job reads does not exist yet. External
+    Secrets materialises it from a normal chart resource, and Helm applies hooks
+    BEFORE normal resources - so a pre-install hook would deadlock on a Secret
+    that this same release has not created. On upgrade it is always present.
+*/ -}}
+{{- if .Values.migrationJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "fluidbox.serverName" . }}-migrate
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    {{- /* before-hook-creation, NOT hook-succeeded: the finished Job is the
+           evidence. Deleting it on success would throw away the migration log
+           an operator needs to answer "what did this deploy change". */}}
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrationJob.backoffLimit }}
+  {{- /* VERSION COUPLING - the sharp edge of this gate.
+
+         FLUIDBOX_MIGRATE_ONLY is honoured only by a server binary that knows
+         the variable. An OLDER image ignores it, starts a full server, binds
+         :8787 and NEVER EXITS - so the "gate" becomes a hang, and the deploy
+         fails much later with "Job in progress / context deadline exceeded",
+         which names the symptom and not the cause.
+
+         activeDeadlineSeconds bounds that to a loud, finite failure rather
+         than an indefinite one. Keep migrationJob.enabled aligned with the
+         image: the pipeline always builds both from the same commit, so this
+         only bites a deployment that pins an older images.server. */}}
+  activeDeadlineSeconds: {{ .Values.migrationJob.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "fluidbox.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      {{- /* The SERVER's ServiceAccount, not `default`. The Job shares the
+             server's environment, so it also shares its expectations - and a
+             `default` SA produced a stream of "pods is forbidden" warnings that
+             looked like a broken deployment when it was just the wrong
+             identity. */}}
+      serviceAccountName: {{ include "fluidbox.serverName" . }}
+      {{- /* Same placement as the control plane: a migration killed halfway by
+             a reclaimed Spot node is the one job that must not run on
+             preemptible capacity. */}}
+      {{- with .Values.server.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.images.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: migrate
+          {{- /* The SAME image reference as the Deployment. A migration applied
+                 by a different build than the one about to serve is precisely
+                 the drift this gate exists to remove. */}}
+          image: {{ include "fluidbox.imageRef" (dict "image" .Values.images.server "ctx" $) | quote }}
+          imagePullPolicy: {{ .Values.images.server.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            {{- include "fluidbox.serverEnv" . }}
+            - { name: FLUIDBOX_MIGRATE_ONLY, value: "1" }
+          resources: {{- toYaml .Values.migrationJob.resources | nindent 12 }}
+{{- end }}

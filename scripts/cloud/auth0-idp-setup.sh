@@ -33,6 +33,31 @@ if [ "${1:-}" = "--promote" ]; then
   exit 0
 fi
 
+# The auth0 CLI wraps its --json output in a human header and, depending on the
+# subcommand and version, trailing chatter. `json.loads(raw[raw.find('{'):])`
+# therefore fails whenever anything follows the closing brace - and it fails
+# SILENTLY into an empty client_id, which this script then reports as
+# "app creation failed" for an app it just successfully created.
+#
+# raw_decode stops at the end of the first complete JSON value, so it is immune
+# to both.
+_json_field() {  # _json_field <field> [open-char]  — reads stdin
+  local field="${1:?}" open="${2:-{}"
+  python3 -c "
+import json,sys
+raw=sys.stdin.read()
+i=raw.find(sys.argv[2])
+if i<0: print(''); raise SystemExit
+try:
+    obj,_=json.JSONDecoder().raw_decode(raw[i:])
+except Exception:
+    print(''); raise SystemExit
+if isinstance(obj,list):
+    print(''); raise SystemExit
+print(obj.get(sys.argv[1],'') or '')
+" "$field" "$open"
+}
+
 SLUG="${1:-${AUTH0_ORG_SLUG:-fluidzero}}"
 APP_NAME="${AUTH0_APP_NAME:-Fluidbox Cloud M1}"
 PUBLIC_URL="${FLUIDBOX_PUBLIC_URL:-https://fluidbox-cloud-dashboard.vercel.app}"
@@ -85,24 +110,48 @@ for a in apps:
 
 if [ -n "$CLIENT_ID" ]; then
   ok "reusing app $CLIENT_ID"
-  SECRET=$(auth0 apps show "$CLIENT_ID" --reveal-secrets --json 2>/dev/null | python3 -c "
-import json,sys
-raw=sys.stdin.read(); i=raw.find('{')
-print(json.loads(raw[i:]).get('client_secret',''))" 2>/dev/null)
+  SECRET=$(auth0 apps show "$CLIENT_ID" --reveal-secrets --json 2>/dev/null | _json_field client_secret)
 else
   OUT=$(auth0 apps create --name "$APP_NAME" \
     --description "Fluidbox Cloud — per-org OIDC login" \
     --type regular --callbacks "$REDIRECT_URI" --reveal-secrets --json 2>&1)
-  CLIENT_ID=$(printf '%s' "$OUT" | python3 -c "
-import json,sys
-raw=sys.stdin.read(); i=raw.find('{')
-print(json.loads(raw[i:]).get('client_id',''))" 2>/dev/null)
-  SECRET=$(printf '%s' "$OUT" | python3 -c "
-import json,sys
-raw=sys.stdin.read(); i=raw.find('{')
-print(json.loads(raw[i:]).get('client_secret',''))" 2>/dev/null)
-  [ -n "$CLIENT_ID" ] || die "app creation failed" "$(printf '%s' "$OUT" | head -c 400)"
+  CLIENT_ID=$(printf '%s' "$OUT" | _json_field client_id)
+  SECRET=$(printf '%s' "$OUT" | _json_field client_secret)
+  # Deliberately NOT echoing $OUT: `apps create --reveal-secrets` embeds the
+  # client secret, and a failure path that dumps it puts a live credential into
+  # every terminal scrollback and CI log that ever runs this.
+  [ -n "$CLIENT_ID" ] || die "app creation failed" \
+    "re-run with: auth0 apps list --json | grep -F '$APP_NAME'" \
+    "(the raw CLI output is withheld here because it contains the client secret)"
   ok "created app $CLIENT_ID"
+fi
+
+# `auth0 apps create` sets the callback and nothing else, which leaves three
+# real gaps that only show up later:
+#
+#   allowed_logout_urls  EMPTY. Auth0 refuses a /v2/logout returnTo that is not
+#                        listed, so sign-out dead-ends on an Auth0 error page.
+#   web_origins          EMPTY. Needed for any browser-origin call to Auth0.
+#   grant_types          includes `implicit` and `client_credentials` by
+#                        default. This app is an OIDC authorization-code client
+#                        with PKCE; implicit is deprecated and returns tokens in
+#                        the URL fragment, and client_credentials is a
+#                        machine-to-machine grant this app never uses. Both are
+#                        standing attack surface for a capability nothing needs.
+#
+# Idempotent: PATCH sets the same values on every run.
+say "P2c application URLs + grant hardening"
+LOGOUT_URLS="[\"$PUBLIC_URL\", \"$PUBLIC_URL/login\", \"$PUBLIC_URL/app\"]"
+if auth0 api patch "clients/$CLIENT_ID" --data "{
+  \"allowed_logout_urls\": $LOGOUT_URLS,
+  \"web_origins\": [\"$PUBLIC_URL\"],
+  \"grant_types\": [\"authorization_code\", \"refresh_token\"],
+  \"token_endpoint_auth_method\": \"client_secret_post\",
+  \"oidc_conformant\": true
+}" >/dev/null 2>&1; then
+  ok "callbacks + logout URLs set; implicit and client_credentials removed"
+else
+  warn "could not patch application URLs — set allowed_logout_urls in the Auth0 dashboard, or sign-out will dead-end"
 fi
 [ -n "$SECRET" ] || die "could not obtain the client secret"
 # The secret goes to core's custody and nowhere else. Never write it to $EV.

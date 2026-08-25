@@ -38,6 +38,21 @@ function stubUpstream(): void {
   );
 }
 
+// A 204 upstream carrying a session-clearing Set-Cookie - exactly what
+// POST /v1/auth/logout answers.
+function stubNoContentUpstream(): void {
+  const headers = new Headers();
+  headers.append(
+    "set-cookie",
+    "__Host-fbx_web=; Path=/; HttpOnly; Secure; Max-Age=0"
+  );
+  const upstream = new Response(null, { status: 204, headers });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => Promise.resolve(upstream))
+  );
+}
+
 async function loadRoute() {
   vi.resetModules();
   process.env.FLUIDBOX_WEB_MODE = "sso";
@@ -95,6 +110,33 @@ describe("sso proxy forward", () => {
     );
     expect(setCookies).toContain(
       "__Host-fbx_switch_9f=pend; Path=/; HttpOnly; Secure"
+    );
+  });
+  // REGRESSION. 204/205/304 are "null body statuses" and the Fetch spec forbids
+  // a body on them - `new Response(body, { status: 204 })` throws a TypeError
+  // even when body is the EMPTY STRING, because the check is whether a body was
+  // SUPPLIED, not whether it has content. `await upstream.text()` returns "" for
+  // a 204, so the pass-through threw and the route answered 500.
+  //
+  // The user-visible effect was that signing out was broken: POST
+  // /v1/auth/logout answers 204 with a Set-Cookie that clears the session, so
+  // the click returned an error AND left the user signed in.
+  it("relays a 204 without a body, preserving the session-clearing cookie", async () => {
+    vi.unstubAllGlobals();
+    stubNoContentUpstream();
+    const route = await loadRoute();
+    const req = new Request("https://fbx.example/api/fluidbox/auth/logout", {
+      method: "POST",
+      headers: { cookie: "__Host-fbx_web=a", "x-fluidbox-csrf": "1", origin: "https://fbx.example" },
+    });
+    const ctx = { params: Promise.resolve({ path: ["auth", "logout"] }) };
+
+    const res = await route.POST(req, ctx);
+
+    expect(res.status).toBe(204);
+    expect(res.body).toBeNull();
+    expect(res.headers.getSetCookie()).toContain(
+      "__Host-fbx_web=; Path=/; HttpOnly; Secure; Max-Age=0"
     );
   });
 });
