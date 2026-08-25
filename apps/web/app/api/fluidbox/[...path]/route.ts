@@ -118,9 +118,22 @@ async function forward(req: Request, path: string[]) {
 
   const body = await upstream.text();
 
+  // 204/205/304 are "null body statuses": the Fetch spec forbids a body on
+  // them, and `new Response(body, { status: 204 })` throws a TypeError even
+  // when body is the EMPTY STRING - the check is whether a body was supplied,
+  // not whether it has content. `await upstream.text()` returns "" for a 204,
+  // so the naive pass-through always threw.
+  //
+  // This was not theoretical: POST /v1/auth/logout answers 204 with a
+  // Set-Cookie that clears the session, so signing out through this proxy
+  // returned 500 and the session cookie was never cleared - the user stayed
+  // signed in and saw an error.
+  const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+  const outBody = NULL_BODY_STATUSES.has(upstream.status) ? null : body;
+
   if (MODE === "admin") {
     // Unchanged single-tenant behavior.
-    return new Response(body, {
+    return new Response(outBody, {
       status: upstream.status,
       headers: { "content-type": upstreamCt || "application/json" },
     });
@@ -130,7 +143,7 @@ async function forward(req: Request, path: string[]) {
   const out = new Headers();
   out.set("content-type", upstreamCt || "application/json");
   propagateCookies(out);
-  return new Response(body, { status: upstream.status, headers: out });
+  return new Response(outBody, { status: upstream.status, headers: out });
 }
 
 type Ctx = { params: Promise<{ path: string[] }> };

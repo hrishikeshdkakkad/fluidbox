@@ -135,6 +135,16 @@ resource "google_container_cluster" "fluidbox" {
       # Terraform must not fight it every plan.
       min_master_version,
       node_version,
+      # PROVIDER BUG, not drift. The provider validates this attribute against
+      # ["ENCRYPTED", "DECRYPTED"] but the API READS BACK
+      # "ALL_OBJECTS_ENCRYPTION_ENABLED", so the two never agree and every plan
+      # reports "1 to change" forever. That matters more than it sounds in a
+      # commit-to-production pipeline: a plan that always shows a change is a
+      # plan nobody reads, which is exactly how a real change slips through.
+      #
+      # Only `state` is ignored - `key_name` above stays tracked, so pointing
+      # the cluster at a DIFFERENT KMS key is still caught.
+      database_encryption[0].state,
     ]
   }
 }
