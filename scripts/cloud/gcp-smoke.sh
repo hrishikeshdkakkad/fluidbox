@@ -181,16 +181,35 @@ fi
 
 # ── 5. Dashboard origin ─────────────────────────────────────────────────────
 say "5. Dashboard (Vercel)"
+# Vercel's Attack Challenge Mode answers every NON-JS client with 429 and
+# `x-vercel-mitigated: challenge`. That is the firewall working, not the
+# deployment failing - a real browser solves the challenge and proceeds, which
+# is exactly what tests/browser covers. Detect it and say so, rather than
+# reporting a red that trains people to ignore this suite.
+challenged() {
+  curl -sS -D- -o /dev/null --max-time 25 "$1" 2>/dev/null | grep -qi 'x-vercel-mitigated: *challenge'
+}
+
 dcode=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 25 "https://$DASHBOARD_HOST/" 2>/dev/null)
-[ "$dcode" = "200" ] && ok "GET https://$DASHBOARD_HOST/ -> 200" || bad "dashboard -> $dcode"
+if [ "$dcode" = "200" ]; then
+  ok "GET https://$DASHBOARD_HOST/ -> 200"
+elif [ "$dcode" = "429" ] && challenged "https://$DASHBOARD_HOST/"; then
+  skip "dashboard root" "Vercel Attack Challenge Mode (429 + x-vercel-mitigated) - browsers pass; see tests/browser"
+else
+  bad "dashboard -> $dcode"
+fi
 
 # The /v1 rewrite is what makes __Host- cookies possible: the OIDC callback has
 # to land on the SAME origin the dashboard runs on. Proving it end to end means
 # the dashboard origin answering a control-plane route.
 vcode=$(curl -sS -o /tmp/smoke-rewrite.json -w '%{http_code}' --max-time 25 "https://$DASHBOARD_HOST/v1/health" 2>/dev/null)
-[ "$vcode" = "200" ] \
-  && ok "dashboard origin proxies /v1/health -> 200 (the rewrite that makes __Host- cookies work)" \
-  || bad "dashboard /v1/health -> $vcode" "FLUIDBOX_WEB_MODE=sso + FLUIDBOX_API_URL must be set at BUILD time on Vercel"
+if [ "$vcode" = "200" ]; then
+  ok "dashboard origin proxies /v1/health -> 200 (the rewrite that makes __Host- cookies work)"
+elif [ "$vcode" = "429" ] && challenged "https://$DASHBOARD_HOST/v1/health"; then
+  skip "dashboard /v1 rewrite" "challenged by Vercel firewall - proven instead by tests/browser, which runs a real browser"
+else
+  bad "dashboard /v1/health -> $vcode" "FLUIDBOX_WEB_MODE=sso + FLUIDBOX_API_URL must be set at BUILD time on Vercel"
+fi
 
 # ── 6. Streaming ────────────────────────────────────────────────────────────
 say "6. Event stream budget"
