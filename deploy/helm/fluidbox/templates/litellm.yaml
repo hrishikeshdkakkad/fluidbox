@@ -1,4 +1,7 @@
 {{- if .Values.litellm.enabled }}
+{{- if and .Values.litellm.database.enabled (not (contains "litellm-database" .Values.litellm.image)) }}
+{{- fail (printf "litellm.database.enabled needs the `litellm-database` image variant (got %q). Only that variant ships the prisma client that applies LiteLLM's schema; the plain image starts happily, serves happily, and has no key store at all — so llm.keyMode=\"tenant\" would fail at runtime with a 404 from /key/generate." .Values.litellm.image) }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -44,6 +47,15 @@ spec:
         {{- include "fluidbox.labels" . | nindent 8 }}
         app.kubernetes.io/component: litellm
     spec:
+      {{- with .Values.litellm.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.litellm.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.litellm.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- with .Values.images.pullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -59,6 +71,16 @@ spec:
       containers:
         - name: litellm
           image: {{ .Values.litellm.image | quote }}
+          {{- /* Container-level baseline. The pod-level securityContext above
+                 sets runAsNonRoot/uid/seccomp, but Pod Security Admission's
+                 `restricted` profile ALSO requires these two PER CONTAINER -
+                 without them a namespace labelled
+                 pod-security.kubernetes.io/enforce=restricted refuses the pod,
+                 and the only clue is an admission warning on the Deployment
+                 rather than an error on anything you would think to look at. */}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           args: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--num_workers", "1"]
           ports:
             - { name: http, containerPort: 4000 }
@@ -67,6 +89,36 @@ spec:
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.litellmMasterKey | quote }} } }
             - name: ANTHROPIC_API_KEY
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.litellm.anthropicKeySecretKey | quote }} } }
+            {{- if .Values.litellm.database.enabled }}
+            {{- /* LiteLLM's OWN database, never fluidbox's: LiteLLM applies its
+                   prisma schema to whatever it is handed. Required for
+                   llm.keyMode "tenant" — /key/generate is database-backed. */}}
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.litellmDatabaseUrl | quote }} } }
+            - { name: STORE_MODEL_IN_DB, value: "True" }
+            {{- end }}
+          {{- /* Probes. Without them the Service routes to LiteLLM before it has
+                 loaded its config (and, in database mode, before prisma has
+                 finished migrating) — which surfaces as the facade returning
+                 upstream errors for the first minute of every rollout. */}}
+          startupProbe:
+            httpGet: { path: /health/liveliness, port: http }
+            periodSeconds: 5
+            {{- if .Values.litellm.database.enabled }}
+            {{- /* Database mode runs prisma migrations at start; give it room. */}}
+            failureThreshold: 60
+            {{- else }}
+            failureThreshold: 24
+            {{- end }}
+          readinessProbe:
+            httpGet: { path: /health/readiness, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health/liveliness, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - { name: config, mountPath: /etc/litellm }
           resources: {{- toYaml .Values.litellm.resources | nindent 12 }}

@@ -1,0 +1,515 @@
+name: deploy
+
+# Commit-to-production for the GCP deployment (project fluidbox-506603).
+#
+# Shape: PLAN on every pull request, APPLY + RELEASE on main. The two use
+# DIFFERENT Google identities - a pull-request plan runs as fbx-planner, which
+# holds roles/viewer and nothing else, so a hostile PR cannot change
+# infrastructure no matter what it puts in a .tf file. Only main, and only
+# through the protected `production` environment, can reach fbx-deployer.
+#
+# There is no long-lived cloud credential anywhere in this workflow: GitHub's
+# OIDC token is exchanged for a short-lived one through Workload Identity
+# Federation. Nothing to leak, nothing to rotate.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "migrations/**"
+      - "images/**"
+      - "deploy/**"
+      - "policies/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "apps/web/**"
+      - ".github/workflows/deploy.yml"
+  pull_request:
+    paths:
+      - "deploy/cloud/gcp/**"
+      - "deploy/helm/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      allow_destroy:
+        description: "Permit a plan that DESTROYS or REPLACES resources. Read the plan first."
+        type: boolean
+        default: false
+      rollback_to:
+        description: "Helm revision to roll back to. Set this to run a rollback INSTEAD of a deploy."
+        type: string
+        default: ""
+
+# One production deploy at a time, and NEVER cancel one in flight: a terraform
+# apply or a helm upgrade killed halfway leaves state that is harder to reason
+# about than simply waiting. This is the opposite of the ci.yml setting, which
+# cancels superseded PR runs on purpose.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # Workload Identity Federation
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+
+jobs:
+  # ── What actually changed ──────────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.f.outputs.infra }}
+      server: ${{ steps.f.outputs.server }}
+      workspaced: ${{ steps.f.outputs.workspaced }}
+      runners: ${{ steps.f.outputs.runners }}
+      chart: ${{ steps.f.outputs.chart }}
+      web: ${{ steps.f.outputs.web }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: f
+        name: classify changed paths
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # A manual run deploys everything: the operator asked for a deploy,
+            # not for a diff-derived subset.
+            for k in infra server workspaced runners chart web; do echo "$k=true" >> "$GITHUB_OUTPUT"; done
+            exit 0
+          fi
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          # A first push to a branch (or a force-push) reports an all-zero base.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          CHANGED="$(git diff --name-only "$BASE" "${{ github.sha }}" || true)"
+          echo "--- changed files ---"; echo "$CHANGED"
+          has() { grep -qE "$1" <<<"$CHANGED"; }
+          # The server image embeds the migrations directory at COMPILE time
+          # (sqlx::migrate! bakes it in), so a migration-only change MUST still
+          # rebuild the image or the new SQL never ships.
+          has '^(crates/|migrations/|Cargo\.(toml|lock)$|deploy/server\.Dockerfile)' && echo "server=true" >> "$GITHUB_OUTPUT" || echo "server=false" >> "$GITHUB_OUTPUT"
+          has '^(crates/(workspaced|fluidbox-workspace)/|deploy/workspaced\.Dockerfile)' && echo "workspaced=true" >> "$GITHUB_OUTPUT" || echo "workspaced=false" >> "$GITHUB_OUTPUT"
+          has '^images/' && echo "runners=true" >> "$GITHUB_OUTPUT" || echo "runners=false" >> "$GITHUB_OUTPUT"
+          has '^deploy/cloud/gcp/' && echo "infra=true" >> "$GITHUB_OUTPUT" || echo "infra=false" >> "$GITHUB_OUTPUT"
+          has '^deploy/(helm|cloud/gcp/values)/' && echo "chart=true" >> "$GITHUB_OUTPUT" || echo "chart=false" >> "$GITHUB_OUTPUT"
+          has '^apps/web/' && echo "web=true" >> "$GITHUB_OUTPUT" || echo "web=false" >> "$GITHUB_OUTPUT"
+
+  # ── Static gates: these run before anything reaches the cloud ─────────────
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v4
+      - name: helm lint + render assertions
+        run: bash deploy/helm/chart-assertions.sh
+      - name: production overlay lints and renders
+        run: |
+          helm lint deploy/helm/fluidbox \
+            -f deploy/helm/fluidbox/values/gke.yaml \
+            -f deploy/cloud/gcp/values/production.yaml
+          helm template fluidbox deploy/helm/fluidbox \
+            -f deploy/helm/fluidbox/values/gke.yaml \
+            -f deploy/cloud/gcp/values/production.yaml > /dev/null
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.5
+      - name: terraform fmt + validate (all stacks)
+        run: |
+          set -euo pipefail
+          for d in deploy/cloud/gcp/bootstrap deploy/cloud/gcp/platform deploy/cloud/gcp/app; do
+            echo "── $d"
+            terraform -chdir="$d" fmt -check -recursive
+            terraform -chdir="$d" init -backend=false
+            terraform -chdir="$d" validate
+          done
+
+  # ── Terraform plan ────────────────────────────────────────────────────────
+  plan:
+    needs: [changes, verify]
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      destructive: ${{ steps.inspect.outputs.destructive }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          # PRs plan as the READ-ONLY identity. This is the control that makes
+          # "run terraform from a pull request" safe at all.
+          service_account: ${{ github.event_name == 'pull_request' && vars.GCP_PLANNER_SA || vars.GCP_DEPLOYER_SA }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.5
+      - name: init
+        run: |
+          terraform -chdir=deploy/cloud/gcp/platform init \
+            -backend-config="bucket=${{ vars.GCP_TF_STATE_BUCKET }}" \
+            -backend-config="prefix=platform"
+      - name: plan
+        id: plan
+        run: |
+          # -lock=false on pull requests: the planner identity holds
+          # objectViewer on the state bucket and cannot WRITE the .tflock
+          # object. Granting objectAdmin instead would let any pull request
+          # overwrite production state, which is a far worse trade.
+          LOCK=true
+          [ "${{ github.event_name }}" = "pull_request" ] && LOCK=false
+          terraform -chdir=deploy/cloud/gcp/platform plan \
+            -lock=$LOCK -out=tfplan -detailed-exitcode || rc=$?
+          echo "exit=${rc:-0}" >> "$GITHUB_OUTPUT"
+          [ "${rc:-0}" = "1" ] && exit 1 || true
+      - name: inspect plan for destructive actions
+        id: inspect
+        run: |
+          set -euo pipefail
+          terraform -chdir=deploy/cloud/gcp/platform show -json tfplan > plan.json
+          # delete = a destroy; delete+create (in either order) = a REPLACE,
+          # which for a Cloud SQL instance or a GKE cluster means data loss.
+          DESTRUCTIVE=$(jq '[.resource_changes[]?
+            | select(.change.actions | index("delete"))] | length' plan.json)
+          echo "destructive=$DESTRUCTIVE" >> "$GITHUB_OUTPUT"
+          if [ "$DESTRUCTIVE" -gt 0 ]; then
+            echo "::warning::plan contains $DESTRUCTIVE destroy/replace action(s)"
+            jq -r '.resource_changes[]? | select(.change.actions | index("delete"))
+              | "  \(.change.actions|join("+"))  \(.address)"' plan.json
+          fi
+          {
+            echo "### Terraform plan"
+            echo '```'
+            terraform -chdir=deploy/cloud/gcp/platform show -no-color tfplan | tail -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: refuse an unreviewed destructive plan
+        if: steps.inspect.outputs.destructive != '0' && inputs.allow_destroy != true
+        run: |
+          echo "This plan destroys or REPLACES ${{ steps.inspect.outputs.destructive }} resource(s)."
+          echo "Replacing a Cloud SQL instance or a GKE cluster destroys its data."
+          echo "Review the plan above, take a backup, then re-run this workflow"
+          echo "manually with allow_destroy=true."
+          exit 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tfplan
+          # The plan file records the exact changes that were reviewed. Apply
+          # consumes THIS artifact rather than re-planning, so what is applied
+          # is what was seen.
+          path: deploy/cloud/gcp/platform/tfplan
+          retention-days: 5
+
+  apply:
+    needs: [changes, plan]
+    if: github.event_name == 'push' && needs.changes.outputs.infra == 'true' && inputs.rollback_to == ''
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.5
+      - uses: actions/download-artifact@v8
+        with:
+          name: tfplan
+          path: deploy/cloud/gcp/platform
+      - name: init
+        run: |
+          terraform -chdir=deploy/cloud/gcp/platform init \
+            -backend-config="bucket=${{ vars.GCP_TF_STATE_BUCKET }}" \
+            -backend-config="prefix=platform"
+      - name: apply the REVIEWED plan
+        run: terraform -chdir=deploy/cloud/gcp/platform apply -auto-approve tfplan
+
+  # ── Images: built per commit, deployed by DIGEST ──────────────────────────
+  images:
+    needs: [changes, verify]
+    if: github.event_name != 'pull_request' && inputs.rollback_to == ''
+    runs-on: ubuntu-latest
+    outputs:
+      server: ${{ steps.out.outputs.server }}
+      workspaced: ${{ steps.out.outputs.workspaced }}
+    strategy:
+      fail-fast: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: registry login
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+      - uses: docker/setup-buildx-action@v4
+      - name: build + push server
+        id: server
+        if: needs.changes.outputs.server == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/server.Dockerfile
+          # The nodes are x86; building arm64 here would double the time for an
+          # image nothing pulls.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/fluidbox/fluidbox-server:${{ github.sha }}
+          cache-from: type=gha,scope=deploy-server
+          cache-to: type=gha,mode=max,scope=deploy-server
+      - name: build + push workspaced
+        id: workspaced
+        if: needs.changes.outputs.workspaced == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/workspaced.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/fluidbox/fluidbox-workspaced:${{ github.sha }}
+          cache-from: type=gha,scope=deploy-workspaced
+          cache-to: type=gha,mode=max,scope=deploy-workspaced
+      - name: resolve digests
+        id: out
+        run: |
+          set -euo pipefail
+          AR="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/fluidbox"
+          # A TAG can be moved; a digest cannot. Everything downstream deploys
+          # the digest, so "what is running" is answerable without trusting that
+          # nobody re-pushed the tag.
+          resolve() {
+            gcloud artifacts docker images describe "$AR/$1:${{ github.sha }}" \
+              --format='value(image_summary.digest)' 2>/dev/null || true
+          }
+          for img in server workspaced; do
+            d="$(resolve "fluidbox-$img")"
+            if [ -z "$d" ]; then
+              # Unchanged this commit: keep whatever the live release runs.
+              echo "$img=" >> "$GITHUB_OUTPUT"
+            else
+              echo "$img=$d" >> "$GITHUB_OUTPUT"
+              echo "fluidbox-$img -> $d"
+            fi
+          done
+
+  # ── Helm release ─────────────────────────────────────────────────────────
+  deploy:
+    needs: [changes, images, apply]
+    # `always()` + explicit result checks: `apply` is SKIPPED when no
+    # infrastructure changed, and a skipped need would otherwise skip this job
+    # too - so an application-only commit would never deploy.
+    if: |
+      always() && github.event_name != 'pull_request' && inputs.rollback_to == ''
+      && needs.images.result == 'success'
+      && (needs.apply.result == 'success' || needs.apply.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: Production
+    outputs:
+      revision: ${{ steps.release.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_LOCATION }}
+      - uses: azure/setup-helm@v4
+      - name: record the CURRENT revision (rollback target)
+        id: before
+        run: |
+          rev=$(helm history fluidbox -n fluidbox -o json 2>/dev/null \
+                | jq -r '[.[] | select(.status=="deployed")] | last | .revision // empty')
+          echo "revision=${rev:-}" >> "$GITHUB_OUTPUT"
+          echo "current deployed revision: ${rev:-none}"
+      - name: helm upgrade
+        id: release
+        run: |
+          set -euo pipefail
+          AR="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/fluidbox"
+          ARGS=()
+          # Pin by digest when this commit produced one. When it did not, pass
+          # nothing and let the live release keep the image it already runs -
+          # re-pinning to a stale digest would be a silent rollback of a
+          # component this commit never touched.
+          if [ -n "${{ needs.images.outputs.server }}" ]; then
+            ARGS+=(--set images.server.repository="$AR/fluidbox-server"
+                   --set images.server.digest="${{ needs.images.outputs.server }}")
+          fi
+          if [ -n "${{ needs.images.outputs.workspaced }}" ]; then
+            ARGS+=(--set images.collector="$AR/fluidbox-workspaced@${{ needs.images.outputs.workspaced }}")
+          fi
+          helm upgrade --install fluidbox deploy/helm/fluidbox \
+            --namespace fluidbox \
+            -f deploy/helm/fluidbox/values/gke.yaml \
+            -f deploy/cloud/gcp/values/production.yaml \
+            "${ARGS[@]}" \
+            --atomic \
+            --wait --wait-for-jobs \
+            --timeout 20m
+          # --atomic is the readiness gate AND the automatic rollback: if the
+          # pre-upgrade migration Job fails, or any pod never becomes ready
+          # within the timeout, Helm restores the previous revision and exits
+          # non-zero. Promotion stops here, with the cluster back where it was.
+          rev=$(helm history fluidbox -n fluidbox -o json | jq -r 'last | .revision')
+          echo "revision=$rev" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Helm release"
+            echo "- revision: **$rev**"
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- server digest: \`${{ needs.images.outputs.server || 'unchanged' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Post-deploy proof ─────────────────────────────────────────────────────
+  smoke:
+    needs: [deploy]
+    if: needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_LOCATION }}
+      - name: smoke
+        env:
+          CONTROL_HOST: ${{ vars.CONTROL_PLANE_HOST }}
+          DASHBOARD_HOST: ${{ vars.DASHBOARD_HOST }}
+          EXPECT_SERVER_DIGEST: ${{ needs.deploy.outputs.revision && '' || '' }}
+        run: bash scripts/cloud/gcp-smoke.sh
+
+  # ── Browser journeys ─────────────────────────────────────────────────────
+  #
+  # A real Chromium against the real deployment. These prove things curl
+  # cannot: that the Auth0 round trip completes, that the session cookie the
+  # browser receives actually carries Secure/HttpOnly/Path=/ (a __Host- cookie
+  # missing any of them is SILENTLY DISCARDED, which looks like "login did
+  # nothing"), and that Vercel's Attack Challenge Mode - which 429s every
+  # non-JS client - does not block the login path.
+  browser:
+    needs: [deploy, smoke]
+    if: always() && needs.smoke.result == 'success'
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: install chromium
+        working-directory: tests/browser
+        run: npm install --no-audit --no-fund && npx playwright install --with-deps chromium
+      - name: run journeys
+        working-directory: tests/browser
+        env:
+          BASE_URL: https://${{ vars.DASHBOARD_HOST }}
+          API_URL: https://${{ vars.CONTROL_PLANE_HOST }}
+          ORG_SLUG: ${{ vars.ORG_SLUG }}
+          # Absent credentials SKIP the authenticated journeys rather than
+          # failing them: a missing test account is not a broken deployment,
+          # and a suite that fails for the wrong reason trains people to ignore
+          # it. The unauthenticated and negative-auth journeys always run.
+          TEST_EMAIL: ${{ secrets.E2E_TEST_EMAIL }}
+          TEST_PASSWORD: ${{ secrets.E2E_TEST_PASSWORD }}
+        run: npx playwright test
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report
+          path: tests/browser/playwright-report
+          retention-days: 14
+
+  # ── Rollback ─────────────────────────────────────────────────────────────
+  #
+  # Two entry points. `helm upgrade --atomic` already reverts a release that
+  # never became ready; this covers the other case - a release that DID become
+  # ready and then failed its smoke tests - plus the manual `rollback_to` path.
+  rollback:
+    needs: [deploy, smoke, browser]
+    if: |
+      always() && (
+        (needs.deploy.result == 'success'
+          && (needs.smoke.result == 'failure' || needs.browser.result == 'failure'))
+        || inputs.rollback_to != ''
+      )
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_LOCATION }}
+      - uses: azure/setup-helm@v4
+      - name: helm rollback
+        run: |
+          set -euo pipefail
+          TARGET="${{ inputs.rollback_to }}"
+          if [ -z "$TARGET" ]; then
+            # The last revision that was deployed and is not the one we just
+            # shipped.
+            TARGET=$(helm history fluidbox -n fluidbox -o json \
+              | jq -r '[.[] | select(.status=="superseded")] | last | .revision')
+          fi
+          echo "rolling back to revision $TARGET"
+          helm rollback fluidbox "$TARGET" -n fluidbox --wait --timeout 15m
+          helm history fluidbox -n fluidbox
+          echo "::warning::rolled back to Helm revision $TARGET"
+        # NOTE: a rollback reverts the APPLICATION, never the SCHEMA. Fluidbox
+        # migrations are forward-only and there is no down-migration path, so a
+        # rollback is only safe across revisions whose binaries both accept the
+        # current schema. That is the reason migrations are expected to be
+        # backward-compatible with the immediately previous release; see
+        # docs/hosted/gcp-operations.md#rollback.
+
+  # ── Dashboard (Vercel) ───────────────────────────────────────────────────
+  vercel:
+    needs: [changes, smoke, browser]
+    if: |
+      always() && github.event_name == 'push' && inputs.rollback_to == ''
+      && needs.changes.outputs.web == 'true'
+      && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: deploy to Vercel production
+        # REPO ROOT, not apps/web. The Vercel project's rootDirectory is
+        # already "apps/web", so running the CLI from inside that directory
+        # makes it look for apps/web/apps/web and fail with a bare ENOENT on a
+        # package.json path that does not exist.
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          npx --yes vercel@latest pull --yes --environment=production --token "$VERCEL_TOKEN"
+          npx --yes vercel@latest build --prod --token "$VERCEL_TOKEN"
+          npx --yes vercel@latest deploy --prebuilt --prod --token "$VERCEL_TOKEN" \
+            | tee deploy-url.txt
+          echo "### Vercel" >> "$GITHUB_STEP_SUMMARY"
+          echo "- $(tail -1 deploy-url.txt)" >> "$GITHUB_STEP_SUMMARY"

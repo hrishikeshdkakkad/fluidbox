@@ -1,0 +1,220 @@
+# Fluidbox on GCP — operations runbook
+
+Companion to [`gcp-architecture.md`](./gcp-architecture.md). Project
+`fluidbox-506603`, cluster `fluidbox` in **zone** `us-central1-c`.
+
+```
+gcloud container clusters get-credentials fluidbox \
+  --zone us-central1-c --project fluidbox-506603
+```
+
+> `--zone`, not `--region`. This is a **zonal** cluster; `--region` fails with a
+> confusing "not found".
+
+## Deploying
+
+Push to `main`. `.github/workflows/deploy.yml` does the rest:
+
+```
+changes ─▶ verify ─▶ plan ─▶ apply ─▶ images ─▶ deploy ─▶ smoke ─▶ vercel
+                       │                            │        │
+              destroy gate                   migration    rollback
+                                              gate         on failure
+```
+
+Every arrow is a hard dependency: a failed job stops promotion. Three gates
+matter most:
+
+1. **The destroy gate** (`plan`). If the Terraform plan contains any `delete`
+   action — a destroy, or a replace, which for Cloud SQL or GKE means data loss
+   — the job fails and prints the affected addresses. Re-run manually with
+   `allow_destroy=true` only after reading the plan and taking a backup.
+2. **The migration gate** (`deploy`). The chart's `pre-upgrade` hook runs the
+   NEW image with `FLUIDBOX_MIGRATE_ONLY=1`: it parses the config, applies
+   migrations, verifies the RLS posture, and exits. Helm waits for it, so a bad
+   migration **or a bad config** fails the release before any new pod rolls.
+3. **`--atomic`** (`deploy`). If any pod fails to become ready inside the
+   timeout, Helm restores the previous revision automatically.
+
+### Manual deploy
+
+```
+helm upgrade --install fluidbox deploy/helm/fluidbox -n fluidbox \
+  -f deploy/helm/fluidbox/values/gke.yaml \
+  -f deploy/cloud/gcp/values/production.yaml \
+  --set images.server.digest=sha256:... \
+  --atomic --wait --wait-for-jobs --timeout 20m
+```
+
+Always pin a **digest**, never a tag. Artifact Registry has `immutable_tags`
+on, but a digest is the only reference that cannot be ambiguous.
+
+## Rollback {#rollback}
+
+```
+helm history fluidbox -n fluidbox
+helm rollback fluidbox <REVISION> -n fluidbox --wait --timeout 15m
+```
+
+or run the deploy workflow manually with `rollback_to: <REVISION>`.
+
+**A rollback reverts the APPLICATION, never the SCHEMA.** Fluidbox migrations
+are forward-only; there is no down-migration path. A rollback is therefore safe
+only across revisions whose binaries both accept the *current* schema. In
+practice that means each migration must be backward-compatible with the
+immediately previous release — additive columns, no drops in the same release
+that stops writing them.
+
+Two migrations are documented as **stop-the-old-binary-first** (0018 and 0028).
+For those, a rollback is *not* safe and the procedure is forward-fix.
+
+## Triage
+
+### `REFUSING TO BOOT` {#refusing-to-boot}
+
+The alert `fluidbox: control plane REFUSED TO BOOT` fires on the log-based
+metric `fluidbox/boot_refusal`. Fluidbox fails closed on misconfiguration by
+design, and the refusal line **names the exact gate**:
+
+```
+kubectl -n fluidbox logs -l app.kubernetes.io/component=server --tail=200 \
+  | grep -A15 "REFUSING TO BOOT"
+```
+
+| refusal | cause | fix |
+|---|---|---|
+| `…role this pool runs as … is SUPERUSER or has BYPASSRLS` | RLS would be inert under `REQUIRE_SSO=1` | Confirm `server.runtimeRole: fluidbox_runtime` and that migration 0018 created the role |
+| KEK cannot unwrap a stored DEK | `FLUIDBOX_KMS_STATIC_KEK` changed | Restore the previous KEK from Secret Manager — **do not** let it mint a new one |
+| legacy/v2 sealing retirement gate | `FLUIDBOX_CREDENTIAL_KEY` dropped while v1 rows remain, or KMS off with v2 rows present | See [`kms-operations.md`](./kms-operations.md) |
+| queue knob without a cap | `queueMaxDepth`/`queueMaxWaitSecs` set without `maxConcurrentRuns` | Set the cap or unset the knobs |
+
+Because the pre-upgrade migration Job shares the server's environment, most of
+these now fail **in the Job**, before any pod rolls — read the Job's log:
+
+```
+kubectl -n fluidbox logs job/fluidbox-server-migrate
+```
+
+### CrashLoopBackOff {#crashloop}
+
+```
+kubectl -n fluidbox describe pod -l app.kubernetes.io/component=server
+kubectl -n fluidbox logs -l app.kubernetes.io/component=server --previous --tail=200
+```
+
+Check the boot-refusal table first; it covers most causes. If the container
+never starts at all (`CreateContainerConfigError`), the Secret is missing:
+
+```
+kubectl -n fluidbox describe externalsecret fluidbox
+kubectl -n external-secrets logs -l app.kubernetes.io/name=external-secrets --tail=100
+```
+
+### Control plane unreachable {#control-plane-unreachable}
+
+Work outward, and stop at the first layer that fails:
+
+```
+# 1. Pods
+kubectl -n fluidbox get pods -l app.kubernetes.io/component=server
+# 2. Endpoints — a Service with no endpoints means readiness is failing
+kubectl -n fluidbox get endpoints fluidbox-server
+# 3. Certificate
+kubectl -n fluidbox describe managedcertificate fluidbox-server
+# 4. Load balancer backends
+gcloud compute backend-services list --project fluidbox-506603
+# 5. DNS — ask the AUTHORITATIVE server, not a cached resolver
+dig @$(dig +short NS fluidzero.ai | head -1) api.platform.fluidzero.ai A
+```
+
+`ManagedCertificate` stuck in `Provisioning` with `FailedNotVisible` means the
+DNS record does not resolve to the Ingress address. Google validates by serving
+the challenge from the load balancer itself, so the record must exist **first**.
+Run `scripts/cloud/gcp-dns.sh`.
+
+### Database {#database}
+
+```
+gcloud sql instances describe fluidbox-pg --project fluidbox-506603
+gcloud sql operations list --instance fluidbox-pg --project fluidbox-506603 --limit 5
+```
+
+Connections near the ceiling show up as **acquire timeouts in the app**, not as
+a database error. The deployment-wide figure is
+`replicas × (FLUIDBOX_DB_MAX_CONNECTIONS + 2)` — the `+2` being the two
+`LISTEN/NOTIFY` connections each replica holds outside the pool. Either lower
+`server.dbPool.maxConnections` or raise `sql_max_connections` (which needs an
+instance restart).
+
+There is no public IP. To get a shell, use the Cloud SQL proxy from a pod inside
+the VPC, or `gcloud sql connect` from a machine with Private Service Access.
+
+### Restoring
+
+```
+gcloud sql backups list --instance fluidbox-pg --project fluidbox-506603
+# Point in time (WAL, 7-day window) — restores into a NEW instance:
+gcloud sql instances clone fluidbox-pg fluidbox-pg-restore \
+  --point-in-time '2026-08-25T12:00:00Z' --project fluidbox-506603
+```
+
+Restore into a **new** instance, verify, then repoint `fluidbox-database-url`.
+Restoring in place over a live instance is not reversible.
+
+## Capacity
+
+```
+kubectl -n fluidbox-sandboxes get resourcequota -o yaml
+kubectl get nodes -L fluidbox.dev/role
+kubectl top nodes
+```
+
+The sandbox `ResourceQuota` is the binding limit on concurrent runs (12 pods).
+Its three numbers are one setting expressed three ways —
+`pods × sandbox.resources.requests` — so raising `pods` without raising
+`requestsCpu`/`requestsMemory` silently caps you at whichever binds first.
+
+Node pools scale automatically: system 1→3, sandbox 0→3. The sandbox pool
+returning to zero when idle is what keeps the bill flat.
+
+## Secrets
+
+```
+gcloud secrets list --project fluidbox-506603
+gcloud secrets versions access latest --secret=fluidbox-admin-token --project fluidbox-506603
+```
+
+**Never rotate these casually.** Losing `fluidbox-credential-key` orphans stored
+integration credentials; losing `fluidbox-kms-static-kek` is unrecoverable from
+the moment any v2 sealed row exists. Terraform carries `prevent_destroy` and
+`ignore_changes = [secret_data]` on both for exactly that reason — a re-apply
+cannot rotate them by accident.
+
+Adding a new version and restarting the Deployment is the rotation mechanism for
+the others (External Secrets re-syncs on its `refreshInterval`, or immediately
+if you delete the target Secret).
+
+## Alerts
+
+| policy | means | first action |
+|---|---|---|
+| control plane unreachable | uptime check failing from multiple regions | §"Control plane unreachable" |
+| **REFUSED TO BOOT** | a fail-closed gate tripped | read the refusal line — it names the gate |
+| container restarting repeatedly | crash loop | `--previous` logs |
+| Cloud SQL disk > 85% | growth faster than expected | `disk_autoresize` is on; investigate what is growing |
+| Cloud SQL connections near max | pool ceiling approaching | §"Database" |
+
+## Teardown
+
+```
+helm uninstall fluidbox -n fluidbox
+terraform -chdir=deploy/cloud/gcp/app destroy
+# platform: BOTH deletion_protection switches must be cleared first, deliberately
+terraform -chdir=deploy/cloud/gcp/platform destroy
+```
+
+The KMS key ring, the KMS keys and every Secret Manager secret carry
+`prevent_destroy` and will **refuse**. That is intentional: destroying the KEK
+makes every sealed row unrecoverable, and a `terraform destroy` is not the place
+to make that decision. Remove them by hand, after confirming nothing sealed
+under them still matters.
