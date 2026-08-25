@@ -392,7 +392,13 @@ jobs:
   # ── Post-deploy proof ─────────────────────────────────────────────────────
   smoke:
     needs: [deploy]
-    if: needs.deploy.result == 'success'
+    # `always()` is REQUIRED here, not decorative. Skips propagate transitively
+    # through `needs`: `apply` is skipped when no infrastructure changed, and
+    # although `deploy` overrides that with always() and succeeds, a downstream
+    # job whose own `if` lacks always() still inherits the upstream skip. Without
+    # this, every application-only deploy silently shipped with NO smoke tests -
+    # a green pipeline that verified nothing.
+    if: always() && needs.deploy.result == 'success'
     runs-on: ubuntu-latest
     environment: Production
     steps:
