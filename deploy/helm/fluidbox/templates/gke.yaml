@@ -1,0 +1,95 @@
+{{- /*
+GKE Ingress companions.
+
+The GKE Ingress controller is configured through CRDs that sit BESIDE the
+Ingress, not by annotations on it alone. Three of them matter here, and each
+fixes a default that would otherwise break this application specifically:
+
+  BackendConfig.timeoutSec   GCLB defaults to 30s. That is a ceiling on the
+                             WHOLE response, so every SSE timeline would be cut
+                             at 30 seconds and look like a flaky network.
+  BackendConfig.healthCheck  GCLB probes "/" by default. The control plane
+                             answers /v1/health and returns 404 on "/", so the
+                             backend would be marked UNHEALTHY while the
+                             application is perfectly fine.
+  FrontendConfig             Plain HTTP is answered, not redirected, unless a
+                             redirect is declared. A dashboard that sets
+                             __Host- cookies must never be reachable over http.
+
+All are opt-in so the chart still renders on clusters without these CRDs.
+*/ -}}
+{{- if .Values.gke.enabled }}
+{{- if .Values.gke.backendConfig.enabled }}
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  timeoutSec: {{ .Values.gke.backendConfig.timeoutSec }}
+  connectionDraining:
+    drainingTimeoutSec: {{ .Values.gke.backendConfig.drainingTimeoutSec }}
+  healthCheck:
+    type: HTTP
+    requestPath: {{ .Values.gke.backendConfig.healthCheck.requestPath | quote }}
+    port: {{ .Values.gke.backendConfig.healthCheck.port }}
+    checkIntervalSec: {{ .Values.gke.backendConfig.healthCheck.checkIntervalSec }}
+    timeoutSec: {{ .Values.gke.backendConfig.healthCheck.timeoutSec }}
+    healthyThreshold: {{ .Values.gke.backendConfig.healthCheck.healthyThreshold }}
+    unhealthyThreshold: {{ .Values.gke.backendConfig.healthCheck.unhealthyThreshold }}
+{{- if .Values.web.enabled }}
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: {{ include "fluidbox.webName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  timeoutSec: {{ .Values.gke.backendConfig.timeoutSec }}
+  connectionDraining:
+    drainingTimeoutSec: {{ .Values.gke.backendConfig.drainingTimeoutSec }}
+  healthCheck:
+    type: HTTP
+    requestPath: /
+    port: 3000
+    checkIntervalSec: {{ .Values.gke.backendConfig.healthCheck.checkIntervalSec }}
+    timeoutSec: {{ .Values.gke.backendConfig.healthCheck.timeoutSec }}
+    healthyThreshold: {{ .Values.gke.backendConfig.healthCheck.healthyThreshold }}
+    unhealthyThreshold: {{ .Values.gke.backendConfig.healthCheck.unhealthyThreshold }}
+{{- end }}
+{{- end }}
+{{- if .Values.gke.frontendConfig.enabled }}
+---
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.gke.frontendConfig.redirectToHttps }}
+  redirectToHttps:
+    enabled: true
+    responseCodeName: MOVED_PERMANENTLY_DEFAULT
+  {{- end }}
+  {{- with .Values.gke.frontendConfig.sslPolicy }}
+  sslPolicy: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- if .Values.gke.managedCertificate.enabled }}
+{{- if not .Values.gke.managedCertificate.domains }}
+{{- fail "gke.managedCertificate.enabled needs at least one entry in gke.managedCertificate.domains — an empty ManagedCertificate never leaves Provisioning and the Ingress serves no TLS at all." }}
+{{- end }}
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: {{ include "fluidbox.serverName" . }}
+  labels: {{- include "fluidbox.labels" . | nindent 4 }}
+spec:
+  # Provisioning REQUIRES each domain to already resolve to this Ingress'
+  # address: Google validates by serving the challenge from the load balancer
+  # itself. A name that does not point here stays Provisioning forever with no
+  # error — check `kubectl describe managedcertificate` for FailedNotVisible.
+  domains: {{- toYaml .Values.gke.managedCertificate.domains | nindent 4 }}
+{{- end }}
+{{- end }}
