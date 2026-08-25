@@ -132,23 +132,61 @@ test.describe("authenticated journey", () => {
 
   test("an authenticated API call succeeds through the proxy", async ({ page }) => {
     await signIn(page);
-    const status = await page.evaluate(async () => {
-      const r = await fetch("/api/fluidbox/v1/sessions", { credentials: "include" });
-      return r.status;
+    // Report the BODY on failure. A bare status tells you the call failed but
+    // not whether it was the cookie, the CSRF header, or authorization - and
+    // those have completely different fixes.
+    const res = await page.evaluate(async () => {
+      // /api/fluidbox/sessions, NOT /api/fluidbox/v1/sessions. The proxy
+      // route prepends /v1 itself (`${API}/v1/${path.join("/")}`), so
+      // including it here produces /v1/v1/sessions and a bare 404 with an
+      // empty body - which looks like an auth problem and is not one.
+      const r = await fetch("/api/fluidbox/sessions", {
+        credentials: "include",
+        headers: { "x-fluidbox-csrf": "1" },
+      });
+      return { status: r.status, body: (await r.text()).slice(0, 200) };
     });
-    expect(status, "the session cookie must authenticate a proxied API call").toBeLessThan(400);
+    expect(res.status, `proxied API call returned ${res.status}: ${res.body}`).toBeLessThan(400);
   });
 
   test("logout clears the session and re-protects /app", async ({ page, context }) => {
     await signIn(page);
-    await page.goto("/v1/auth/logout").catch(() => page.goto("/logout"));
-    await page.waitForLoadState("networkidle");
 
-    const after = (await context.cookies()).find((c) => c.name.startsWith("__Host-fbx_web"));
-    expect(after?.value ?? "", "the session cookie must not survive logout").toBe("");
+    // POST, not a navigation. /v1/auth/logout is a POST route guarded by the
+    // CSRF header - a GET gets 405 and the session survives, which reads as
+    // "logout is broken" when the request was simply the wrong shape.
+    const status = await page.evaluate(async () => {
+      // Exactly what the dashboard does (app/lib/api.ts): POST through the
+      // proxy with the CSRF header.
+      const r = await fetch("/api/fluidbox/auth/logout", {
+        method: "POST",
+        credentials: "include",
+        headers: { "x-fluidbox-csrf": "1" },
+      });
+      return r.status;
+    });
+    expect(status, "POST /v1/auth/logout must be accepted").toBeLessThan(400);
 
-    await page.goto("/app");
-    await page.waitForLoadState("networkidle");
-    expect(/\/login|\/sign-in|auth0\.com/.test(page.url()), "/app must be protected again").toBeTruthy();
+    // Require the cookie to be GONE, not merely empty. `?? ""` would pass for a
+    // cookie that is still present with an empty value - and the navigation
+    // gate uses cookies.has(), which is TRUE for exactly that case, so the weak
+    // form would report a pass on a session that still gates as signed-in.
+    const after = (await context.cookies()).find((c) => c.name === "__Host-fbx_web");
+    expect(after, `the session cookie must be removed, got ${JSON.stringify(after)}`).toBeUndefined();
+
+    // CACHE-BUST the navigation. We are already ON /app, and Chromium will
+    // happily satisfy `goto` for the same URL from its cache without issuing a
+    // request - so the server-side gate never runs and the page appears
+    // unprotected when it is not. A unique query string forces a real trip.
+    //
+    // The gate also redirects mid-navigation, which Chromium reports as
+    // ERR_ABORTED on the original goto; that is the redirect working.
+    const bust = `/app?_=${process.hrtime.bigint()}`;
+    await page.goto(bust, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    expect(
+      /\/login|\/sign-in|auth0\.com/.test(page.url()),
+      `/app must be protected again, landed on ${page.url()}`
+    ).toBeTruthy();
   });
 });
