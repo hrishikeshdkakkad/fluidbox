@@ -99,19 +99,14 @@ terraform init \
   -backend-config="bucket=fluidbox-506603-tfstate" -backend-config="prefix=platform"
 terraform apply
 
-# 2. The secrets Terraform must never see. Everything else is generated into
-#    Secret Manager by the platform stack; these come from the model providers.
-printf '%s' "$ANTHROPIC_API_KEY" \
-  | gcloud secrets versions add anthropic-api-key --data-file=- --project fluidbox-506603
-#    OpenAI is OPTIONAL - only the codex harness needs it. Add the version, then
-#    opt in (values/production.yaml: litellm.openaiKeySecretKey, the
-#    externalSecrets OPENAI_API_KEY entry, and the GPT models in
-#    llm.tenant.models) and rotate tenant keys:
-#      POST /v1/admin/orgs/{slug}/llm-key/rotate
-#    Until then the harness catalog reports codex unavailable and the dashboard
-#    hides it - a deployment never offers a model its gateway will refuse.
-printf '%s' "$OPENAI_API_KEY" \
-  | gcloud secrets versions add openai-api-key --data-file=- --project fluidbox-506603
+# 2. The secrets Terraform must never see - the model-provider keys and the IdP
+#    client secret - in ONE command. It reports which ones have a version, adds
+#    versions from a dotenv or the environment (never printing a value), refuses
+#    an empty value by name, and rolls the gateway when a provider key changes.
+#    OpenAI is optional: only the codex harness needs it, and the gateway starts
+#    without it (the key is read as optional; the catalog hides codex meanwhile).
+scripts/cloud/gcp-secrets.sh --from-env-file .env      # or: OPENAI_API_KEY=... scripts/cloud/gcp-secrets.sh
+scripts/cloud/gcp-secrets.sh --prompt                  # or paste, with hidden input
 
 # 3. Cluster prerequisites.
 cd ../app
