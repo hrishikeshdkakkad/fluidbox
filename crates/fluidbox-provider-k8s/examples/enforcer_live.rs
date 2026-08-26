@@ -86,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
         client.clone(),
         ns.clone(),
         20,
+        // Scheduling bound: generous, so a scale-to-zero pool can produce a node.
+        300,
         json!({
             "k8s:io.kubernetes.pod.namespace": ns,
             "app.kubernetes.io/component": "sandbox-dns",
