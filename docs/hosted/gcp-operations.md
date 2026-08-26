@@ -36,6 +36,26 @@ matter most:
 3. **`--atomic`** (`deploy`). If any pod fails to become ready inside the
    timeout, Helm restores the previous revision automatically.
 
+### `helm history` shows `pending-upgrade` while every pod is Ready {#pending-upgrade}
+
+Helm 4's `watcher` wait strategy (the default whenever `--rollback-on-failure`
+is set) waits for every CUSTOM RESOURCE in the release to report Ready, not
+just workloads. A CR that is legitimately not Ready — the optional
+ExternalSecret before its provider key has a version, a ManagedCertificate
+still provisioning — holds the release in `pending-upgrade` until
+`--timeout`, and then `--rollback-on-failure` reverts a healthy release. The
+pipeline passes `--wait=legacy` since 2026-08-26 for exactly this reason. If
+you ever see it anyway:
+
+```
+kubectl -n fluidbox get externalsecret,managedcertificate      # which one is not Ready?
+kubectl -n fluidbox describe externalsecret fluidbox-optional  # its reason
+```
+
+Making the CR Ready (add the missing secret version, wait out certificate
+provisioning) completes the upgrade immediately — rev 8 flipped to `deployed`
+within seconds of the OpenAI key landing.
+
 ### A push run that ends `cancelled` with no failed job {#cancelled-run}
 
 `main` was not deployed, and nothing failed. GitHub keeps at most ONE pending
