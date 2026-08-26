@@ -36,6 +36,27 @@ matter most:
 3. **`--atomic`** (`deploy`). If any pod fails to become ready inside the
    timeout, Helm restores the previous revision automatically.
 
+### A push run that ends `cancelled` with no failed job {#cancelled-run}
+
+`main` was not deployed, and nothing failed. GitHub keeps at most ONE pending
+run per concurrency group and cancels the older pending run when a newer one
+arrives — `cancel-in-progress` only governs runs already executing. Until
+2026-08-26 every event of `deploy.yml`, pull-request plans included, shared the
+`deploy-production` group, so a PR event landing while the push run was still
+queued (release-please opens its own PR on every releasable merge) evicted the
+production deploy of that very merge. Run 32920435324 died that way.
+
+Plans now queue under `deploy-plan-pr-<n>` and only pushes to `main` share
+`deploy-production`. If a push run still shows `cancelled`:
+
+```
+gh run view <run-id> --json jobs --jq '.jobs[] | "\(.conclusion) \(.name)"'   # all skipped/cancelled, none failed?
+gh run rerun <run-id>                                                          # re-queue that exact commit
+```
+
+A rerun deploys the same SHA with the same digest-pinned images — it is not a
+new release, just the one that was owed.
+
 ### Manual deploy
 
 ```
