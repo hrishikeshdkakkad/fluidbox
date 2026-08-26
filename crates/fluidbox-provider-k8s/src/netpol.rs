@@ -30,7 +30,11 @@ pub enum NetpolResult {
 /// Scheduling + image-pull slack added on top of the observation window for
 /// the probe Pod's own `activeDeadlineSeconds` (the script self-terminates at
 /// `wait_secs`; this bound only fires if the pod never got to run it).
-pub const PROBE_SCHEDULING_SLACK_SECS: u64 = 60;
+///
+/// Sized for a scale-to-zero pool: node creation measured between 31 s and
+/// 107 s on GKE Spot, then ~50 s of Cilium preparing the node before the pod
+/// can be placed. 60 s covered a warm node only.
+pub const PROBE_SCHEDULING_SLACK_SECS: u64 = 180;
 /// Extra slack the CALLER (the gate worker) waits beyond the pod's own
 /// deadline before concluding `Unschedulable` — covers apiserver lag between
 /// the kubelet killing the pod and the phase landing.
