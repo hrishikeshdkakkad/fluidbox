@@ -12,11 +12,15 @@
 #   scripts/cloud/gcp-secrets.sh --from-env-file .env    # add versions from a dotenv
 #   OPENAI_API_KEY=... scripts/cloud/gcp-secrets.sh      # add versions from the environment
 #   scripts/cloud/gcp-secrets.sh --prompt                # ask, with hidden input
+#   scripts/cloud/gcp-secrets.sh --rotate ...            # allow REPLACING a version
 #
 # For each secret with a value on hand it adds a version - refusing an EMPTY
 # value up front, because `gcloud secrets versions add` reports that as a bare
 # "Secret Payload cannot be empty" that hides which variable was unset. A value
-# identical to the current version is skipped, so re-running is free.
+# identical to the current version is skipped, so re-running is free. A value
+# that DIFFERS from an existing version is a rotation of a production key, and
+# a dotenv can easily carry a different key than the one the deployment runs
+# on: that is refused with a warning unless --rotate says it is intended.
 #
 # Provider keys are read by the LiteLLM gateway at START, so after adding one
 # this also asks the External Secrets operator to sync now and restarts the
@@ -42,11 +46,12 @@ SECRETS=(
   "auth0-client-secret|AUTH0_CLIENT_SECRET|OIDC client secret for the org IdP|no"
 )
 
-ENV_FILE=""; PROMPT=0
+ENV_FILE=""; PROMPT=0; ROTATE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from-env-file) ENV_FILE="${2:-}"; shift 2;;
     --prompt) PROMPT=1; shift;;
+    --rotate) ROTATE=1; shift;;
     -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) die "unknown argument: $1";;
   esac
@@ -88,8 +93,15 @@ for row in "${SECRETS[@]}"; do
     continue
   fi
   new_fp="$(printf '%s' "$val" | shasum -a 256 | cut -c1-12)"
-  if [ "$n" -gt 0 ] && [ "$(fingerprint "$id")" = "$new_fp" ]; then
-    ok "$id: current version already matches $var (fingerprint $new_fp)"; continue
+  if [ "$n" -gt 0 ]; then
+    cur_fp="$(fingerprint "$id")"
+    if [ "$cur_fp" = "$new_fp" ]; then
+      ok "$id: current version already matches $var (fingerprint $new_fp)"; continue
+    fi
+    if [ "$ROTATE" != 1 ]; then
+      warn "$id: $var DIFFERS from the current version (fingerprints $cur_fp vs $new_fp) - that would be a rotation; re-run with --rotate if intended"
+      continue
+    fi
   fi
   if printf '%s' "$val" | gcloud secrets versions add "$id" --data-file=- --project "$PROJECT" >/dev/null 2>&1; then
     ok "$id: version added from $var (fingerprint $new_fp)"
