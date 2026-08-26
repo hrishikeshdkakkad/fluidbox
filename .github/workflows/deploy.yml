@@ -161,9 +161,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       destructive: ${{ steps.inspect.outputs.destructive }}
-      # "2" = the plan contains changes (-detailed-exitcode). Apply gates on
-      # THIS, not on the path filter, so an owed apply is never skipped.
-      exit: ${{ steps.plan.outputs.exit }}
+      # Resource changes in the REVIEWED plan, counted from its JSON. Apply
+      # gates on THIS - not on the path filter (which lost owed applies) and
+      # not on -detailed-exitcode: under setup-terraform's wrapper the captured
+      # exit code did not survive, a "Plan: 2 to add" run skipped its apply,
+      # and the JSON is the artifact the destroy gate already trusts.
+      changes: ${{ steps.inspect.outputs.changes }}
     steps:
       - uses: actions/checkout@v7
       - uses: google-github-actions/auth@v2
@@ -203,6 +206,10 @@ jobs:
           DESTRUCTIVE=$(jq '[.resource_changes[]?
             | select(.change.actions | index("delete"))] | length' plan.json)
           echo "destructive=$DESTRUCTIVE" >> "$GITHUB_OUTPUT"
+          CHANGES=$(jq '[.resource_changes[]?
+            | select(.change.actions != ["no-op"])] | length' plan.json)
+          echo "changes=$CHANGES" >> "$GITHUB_OUTPUT"
+          echo "plan: $CHANGES resource change(s), $DESTRUCTIVE destructive"
           if [ "$DESTRUCTIVE" -gt 0 ]; then
             echo "::warning::plan contains $DESTRUCTIVE destroy/replace action(s)"
             jq -r '.resource_changes[]? | select(.change.actions | index("delete"))
@@ -235,7 +242,7 @@ jobs:
     needs: [changes, plan]
     # Apply whenever the REVIEWED plan has changes - on a push or a manual
     # deploy, never on a pull request (the planner identity cannot write).
-    if: github.event_name != 'pull_request' && needs.plan.outputs.exit == '2' && inputs.rollback_to == ''
+    if: github.event_name != 'pull_request' && needs.plan.outputs.changes != '0' && inputs.rollback_to == ''
     runs-on: ubuntu-latest
     environment: Production
     steps:
