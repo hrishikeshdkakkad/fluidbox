@@ -53,8 +53,16 @@ on:
 # apply or a helm upgrade killed halfway leaves state that is harder to reason
 # about than simply waiting. This is the opposite of the ci.yml setting, which
 # cancels superseded PR runs on purpose.
+#
+# The group is EVENT-AWARE. A pull-request run only plans, but it used to sit
+# in the same group as production deploys - and GitHub keeps at most ONE
+# pending run per group, cancelling the older pending run when a newer one
+# arrives (cancel-in-progress only governs runs already executing). Opening a
+# PR seconds after a merge therefore cancelled the queued production deploy of
+# that merge, silently: main was never deployed and nothing failed. Plans now
+# queue per PR; only pushes to main share the production group.
 concurrency:
-  group: deploy-production
+  group: ${{ github.event_name == 'pull_request' && format('deploy-plan-pr-{0}', github.event.pull_request.number) || 'deploy-production' }}
   cancel-in-progress: false
 
 permissions:
