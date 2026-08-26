@@ -408,8 +408,18 @@ jobs:
             -f deploy/cloud/gcp/values/production.yaml \
             "${ARGS[@]}" \
             --rollback-on-failure \
-            --wait --wait-for-jobs \
+            --wait=legacy --wait-for-jobs \
             --timeout 20m
+          # --wait=legacy, EXPLICITLY. With --rollback-on-failure set, Helm 4
+          # defaults --wait to "watcher", which also waits for every CUSTOM
+          # RESOURCE to report Ready. The optional ExternalSecret is Ready=False
+          # by design until its provider key has a version, so rev 8 sat in
+          # pending-upgrade for 19 of its 20 minutes - one minute from a
+          # rollback of a perfectly healthy release. "legacy" is the readiness
+          # this chart means: pods, Deployments, Services, and (with
+          # --wait-for-jobs) the migration hook. A ManagedCertificate still
+          # provisioning would have blocked the first install the same way.
+          #
           # --rollback-on-failure (Helm 4's name for --atomic) is the readiness
           # gate AND the automatic rollback: if the
           # pre-upgrade migration Job fails, or any pod never becomes ready
