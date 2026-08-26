@@ -13,8 +13,8 @@ Day-two procedures: [`docs/hosted/gcp-operations.md`](../../../docs/hosted/gcp-o
 | # | stack | identity | what it owns |
 |---|-------|----------|--------------|
 | 0 | `bootstrap` | project **Owner**, once | API enablement, the remote-state bucket, the Workload Identity Federation pool, the two CI service accounts, the billing budget |
-| 1 | `platform` | `fbx-deployer` | VPC + Cloud NAT, GKE (zonal, Dataplane V2), node pools, Cloud SQL, Artifact Registry, Cloud KMS, Secret Manager, the archive bucket, observability |
-| 2 | `app` | `fbx-deployer` | PriorityClasses, the External Secrets operator, the release namespace |
+| 1 | `platform` | `fbx-deployer` | VPC + Cloud NAT, GKE (zonal, legacy datapath — see `cilium_mode`), node pools, Cloud SQL, Artifact Registry, Cloud KMS, Secret Manager, the archive bucket, observability |
+| 2 | `app` | `fbx-deployer` | self-managed Cilium (`cilium_mode = upstream`), PriorityClasses, the External Secrets operator, the release namespace |
 | 3 | the chart | `fbx-deployer` | `helm upgrade --install` — **not** Terraform (see below) |
 
 `bootstrap` is the only stack that runs as Owner, because enabling an API grants
