@@ -4,6 +4,12 @@
 
 use fluidbox_obs::field::error_kind as EK;
 
+/// How long `provision` waits for the runner to reach Running before it gives
+/// up and deletes the pod (`FLUIDBOX_K8S_INIT_GRACE_SECS`). Exported because the
+/// server's reconciler keys its adopt grace on it: a handle-less session younger
+/// than this wait is a driver still provisioning, not a crash.
+pub const DEFAULT_INIT_GRACE_SECS: i64 = 300;
+
 /// The sandbox Pod security + scheduling baseline, portable to any conformant
 /// cluster (design 2026-07-15, §"Sandbox pod security baseline").
 #[derive(Debug, Clone)]
@@ -126,7 +132,7 @@ impl K8sConfig {
                 .unwrap_or(3 * 3600),
             init_grace_secs: get("FLUIDBOX_K8S_INIT_GRACE_SECS")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+                .unwrap_or(DEFAULT_INIT_GRACE_SECS),
             cpu_request: get("FLUIDBOX_K8S_CPU_REQUEST").unwrap_or_else(|| "500m".into()),
             mem_request: get("FLUIDBOX_K8S_MEM_REQUEST").unwrap_or_else(|| "1Gi".into()),
             cpu_limit: get("FLUIDBOX_K8S_CPU_LIMIT").unwrap_or_else(|| "2".into()),
