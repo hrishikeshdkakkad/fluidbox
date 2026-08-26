@@ -477,7 +477,7 @@ async function main() {
 
   try {
     await rpcRequest("initialize", {
-      clientInfo: { name: "fluidbox-supervisor", version: "0.8.0" }, // x-release-please-version
+      clientInfo: { name: "fluidbox-supervisor", version: "0.9.0" }, // x-release-please-version
     });
     rpcSend({ jsonrpc: "2.0", method: "initialized" });
 
