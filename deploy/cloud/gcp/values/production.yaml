@@ -139,6 +139,10 @@ web:
 litellm:
   enabled: true
   image: ghcr.io/berriai/litellm-database:main-stable
+  # OpenAI, for the codex harness. The Secret key is materialised by the
+  # externalSecrets entry below, which requires the openai-api-key secret to
+  # HAVE A VERSION (README step 2) - a versionless secret fails the whole sync.
+  openaiKeySecretKey: OPENAI_API_KEY
   database:
     enabled: true
   nodeSelector:
@@ -156,6 +160,13 @@ llm:
     models:
       - claude-haiku-4-5
       - claude-sonnet-5
+      # The codex harness. These ride the gateway's "gpt-5*" route, which is
+      # backed by litellm.openaiKeySecretKey below. Widening this list does
+      # NOT change keys already minted: rotate them after the deploy
+      # (POST /v1/admin/orgs/{slug}/llm-key/rotate).
+      - gpt-5.4-mini
+      - gpt-5.4
+      - gpt-5.6-sol
     maxBudget: "25"
     budgetDuration: "30d"
 
@@ -219,6 +230,7 @@ externalSecrets:
     - { secretKey: LITELLM_MASTER_KEY, remoteRef: litellm-master-key }
     - { secretKey: LITELLM_DATABASE_URL, remoteRef: litellm-database-url }
     - { secretKey: ANTHROPIC_API_KEY, remoteRef: anthropic-api-key }
+    - { secretKey: OPENAI_API_KEY, remoteRef: openai-api-key }
     # NO archive S3 credentials. They exist only when
     # enable_gcs_archive_store is on in the platform stack, which it is not:
     # the static HMAC key that backend needs is refused by
