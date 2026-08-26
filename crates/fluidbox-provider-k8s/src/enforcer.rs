@@ -78,6 +78,11 @@ pub struct CiliumNetworkEnforcer {
     /// knob for the same physical wait (AWS VPC CNI lands ~20 s; Cilium is much
     /// faster, but the ceiling belongs to the operator, not to us).
     verify_timeout_secs: u64,
+    /// Bound on how long `verify` waits for the pod to be SCHEDULED before the
+    /// observation window above starts ticking. The provider's own
+    /// provisioning wait, so the two clocks agree: past it, `provision` gives
+    /// up on the pod regardless. See `verify` for why this is a separate phase.
+    schedule_timeout_secs: u64,
     /// Labels selecting the controlled resolver a per-run policy may allow.
     resolver_labels: Value,
 }
@@ -87,6 +92,7 @@ impl CiliumNetworkEnforcer {
         client: Client,
         namespace: String,
         verify_timeout_secs: u64,
+        schedule_timeout_secs: u64,
         resolver_labels: Value,
     ) -> Self {
         Self {
@@ -95,8 +101,19 @@ impl CiliumNetworkEnforcer {
             pods: Api::namespaced(client, &namespace),
             namespace,
             verify_timeout_secs,
+            schedule_timeout_secs,
             resolver_labels,
         }
+    }
+
+    /// A pod is scheduled once the scheduler has bound it to a node. Nothing
+    /// below the k8s API can happen for it before then: no CNI call, no
+    /// Cilium endpoint, no policy programmed.
+    fn pod_is_scheduled(pod: &Pod) -> bool {
+        pod.spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .is_some_and(|n| !n.is_empty())
     }
 
     /// Can this deployment actually use CiliumNetworkPolicy? The `auto`
@@ -309,6 +326,54 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
             )));
         }
         let name = Self::object_name(granted);
+
+        // Phase 1: the pod must be ON A NODE before the datapath can program
+        // anything for it. On a scale-to-zero pool that alone is a node
+        // creation (31 s to 107 s measured on GKE Spot) plus Cilium preparing
+        // the node, and the observation window below used to start ticking at
+        // policy creation: every first run on a cold pool failed at exactly
+        // verify_timeout_secs, before a node existed, with "endpoint: no
+        // endpoint". The bound is the provider's own provisioning wait — past
+        // it, `provision` abandons the pod anyway — and the failure names the
+        // real cause (nothing scheduled) rather than the datapath.
+        let sched_deadline = Instant::now()
+            + Duration::from_secs(self.schedule_timeout_secs.max(self.verify_timeout_secs));
+        loop {
+            match self.pods.get_opt(&name).await {
+                Ok(Some(pod)) if Self::pod_is_scheduled(&pod) => break,
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(NetworkPolicyError::Unverified(format!(
+                        "the pod for run {} vanished before it was scheduled",
+                        granted.run_id
+                    )))
+                }
+                Err(e) => {
+                    return Err(NetworkPolicyError::Unverified(format!(
+                        "reading the pod for run {} failed: {e}",
+                        granted.run_id
+                    )))
+                }
+            }
+            if Instant::now() >= sched_deadline {
+                return Err(NetworkPolicyError::Unverified(format!(
+                    "the pod for run {} was not scheduled within {}s — no node accepted it \
+                     (on a scale-to-zero pool, read the autoscaler's event on the pod)",
+                    granted.run_id,
+                    self.schedule_timeout_secs.max(self.verify_timeout_secs)
+                )));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        // The grant may have lapsed while the pod waited for a node.
+        if granted.grant.is_expired(chrono::Utc::now()) {
+            return Err(NetworkPolicyError::Unverified(format!(
+                "the network grant for run {} expired while its pod waited to be scheduled",
+                granted.run_id
+            )));
+        }
+
+        // Phase 2: the observation window, from the moment the pod has a node.
         let deadline = Instant::now() + Duration::from_secs(self.verify_timeout_secs.max(5));
         // Carried out of the loop so a timeout can say WHICH half never
         // converged — "unverified" with no detail is a support ticket.
@@ -322,7 +387,16 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
             let policy_ok = if granted.grant.grants_egress() {
                 match self.cnps.get_opt(&name).await {
                     Ok(Some(obj)) => match Self::policy_is_valid(&obj) {
-                        Some(true) => true,
+                        Some(true) => {
+                            // Recorded, not just returned: a timeout on the OTHER
+                            // half must not report the state of a poll from
+                            // before the operator validated this one (the first
+                            // cold-start failure said "awaiting operator
+                            // validation" about a policy that had been Valid for
+                            // 89 of its 90 seconds).
+                            policy_state = "valid";
+                            true
+                        }
                         Some(false) => {
                             // The operator REJECTED it. Waiting cannot help, so
                             // fail immediately rather than burning the deadline.
@@ -356,8 +430,7 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
             let identity_ok = match self.ceps.get_opt(&name).await {
                 Ok(Some(obj)) => match Self::endpoint_identity(&obj) {
                     Some(id) => {
-                        // No state assignment: the success path returns before
-                        // the timeout message that reads it.
+                        endpoint_state = "ready, identity assigned";
                         tracing::debug!(run_id = %granted.run_id, identity = id, "endpoint identity");
                         true
                     }
@@ -541,6 +614,23 @@ mod tests {
         ] {
             assert_eq!(CiliumNetworkEnforcer::policy_is_valid(&obj(v)), None);
         }
+    }
+
+    #[test]
+    fn pod_is_scheduled_means_bound_to_a_node() {
+        let pod = |node: Option<&str>| -> Pod {
+            serde_json::from_value(json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "fluidbox-x"},
+                "spec": node.map(|n| json!({"nodeName": n})).unwrap_or(json!({}))
+            }))
+            .unwrap()
+        };
+        assert!(!CiliumNetworkEnforcer::pod_is_scheduled(&pod(None)));
+        assert!(!CiliumNetworkEnforcer::pod_is_scheduled(&pod(Some(""))));
+        assert!(CiliumNetworkEnforcer::pod_is_scheduled(&pod(Some(
+            "gke-sandbox-1"
+        ))));
     }
 
     #[test]

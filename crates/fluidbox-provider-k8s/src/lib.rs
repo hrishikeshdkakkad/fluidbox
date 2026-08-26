@@ -137,6 +137,9 @@ impl KubernetesProvider {
                     client,
                     ns,
                     verify_timeout_secs,
+                    // The same wait `provision` gives the runner to start: the
+                    // enforcer's scheduling phase must not give up sooner.
+                    me.cfg.init_grace_secs.max(60) as u64,
                     resolver,
                 ),
             ));
