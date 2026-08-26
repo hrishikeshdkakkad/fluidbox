@@ -315,9 +315,13 @@ litellm:
   # OpenAI key for the gateway, same shape. Empty = not injected, and the
   # bundled model_list's "gpt-5*" route then has nothing behind it: the codex
   # harness cannot be served. Set it to the Secret key that holds the OpenAI
-  # key (and, in llm.keyMode "tenant", add the GPT models to
-  # llm.tenant.models and rotate tenant keys) to enable codex.
+  # key and add the GPT models to llm.tenant.models; tenant keys re-mint
+  # themselves under the new allowlist (the server reconciles them).
   openaiKeySecretKey: ""
+  # The Secret that holds it. Empty = existingSecret. Point it at the
+  # OPTIONAL secret (externalSecrets.optionalData) so a key that has not been
+  # provided yet is a skipped env, never a pod that cannot start.
+  openaiKeySecretName: ""
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
     limits: { cpu: "1", memory: "1Gi" }
@@ -669,6 +673,15 @@ externalSecrets:
   # secretKey = the key inside the Kubernetes Secret; remoteRef = the Secret
   # Manager secret id. The keys must match the secretKeys map above.
   data: []
+  # Provider keys the deployment can run WITHOUT, synced into
+  # "<existingSecret>-optional" by their OWN ExternalSecret. A remote secret
+  # with no version yet fails only that object's sync - the required Secret
+  # above is untouched - and the pods that read these keys mark them optional.
+  # This is what lets a fresh deployment come up before every provider key
+  # exists, and lets a key be added later without a values change.
+  optionalData: []
+    # - secretKey: OPENAI_API_KEY
+    #   remoteRef: openai-api-key
     # - secretKey: DATABASE_URL
     #   remoteRef: fluidbox-database-url
 
