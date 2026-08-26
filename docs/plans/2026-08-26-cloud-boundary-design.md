@@ -267,15 +267,27 @@ and is valuable to a self-hosted operator with no managed service anywhere in
 sight. All per-org values live in the existing `settings` table (gap 14)
 unless a migration is named.
 
-**(a) Per-tenant concurrent-run caps.**
-*What:* per-org `max_concurrent_runs` (and optionally `max_queued`) enforced
-inside the existing dispatcher admission decision, under the deployment-wide
-cap. The run-queue design already anticipated a per-tenant predicate in its
-admission query; this adds the per-org ceiling value and the
-`settings`-sourced lookup. *API:* `PUT/GET
-/v1/admin/orgs/{slug}/limits` (operator plane), values readable by admins in
-the org. *Test:* a self-hosted operator with three internal teams wants
-per-team caps today; holds with no external layer. → Core.
+**(a) Per-tenant admission control (caps + cordon/drain).**
+*What:* two per-org admission terms enforced inside the existing dispatcher
+admission decision, under the deployment-wide cap: a `max_concurrent_runs`
+ceiling (optionally `max_queued`), and an explicit per-org **admission
+state** (`open | paused`) with drain semantics — pausing stops NEW dispatch
+for that tenant (queued and newly submitted runs stay queued, schedules and
+trigger invocations included) while running work continues untouched: the
+Kubernetes cordon/drain pattern applied to a tenant. The run-queue design
+already anticipated a per-tenant predicate in its admission query; this adds
+the per-org terms and the `settings`-sourced lookup. An explicit state is
+preferred over encoding "paused" as `cap = 0`: it is self-documenting in
+audit trails, distinguishes "deliberately closed" from "sized to zero", and
+resumes to the previous ceiling. *API:*
+`POST /v1/admin/orgs/{slug}/admission/pause` / `…/resume`, plus the ceiling
+in `PUT/GET /v1/admin/orgs/{slug}/limits` (operator plane), values readable
+by admins in the org. *Test:* a self-hosted operator wants per-team caps, and
+wants to drain a team's runs before a maintenance window, during an
+incident, or when decommissioning a tenant — pause new work, let existing
+work finish; holds with no external layer. → Core. *Distinct from (d):*
+suspend locks the org out entirely; admission pause leaves the org fully
+usable and running work alive — it only closes the dispatch gate.
 *Unblocks:* fair multi-org capacity; the public-launch quota gate.
 
 **(b) Per-org upstream-key knob overrides.**
@@ -309,7 +321,11 @@ and trigger subscriptions, evict the tenant upstream key
 (`evict_tenant_llm_key` finally gets its caller). `offboard` + `purge` follow
 as a second phase with retention semantics (design of their own). *Test:* a
 self-hosted operator decommissioning a business unit needs exactly this;
-today's answer is a manual runbook labeled incomplete. → Core.
+today's answer is a manual runbook labeled incomplete. → Core. Suspend is
+the heavy sibling of (a)'s admission pause: it cuts logins, tokens, and
+running work, where admission pause only stops new dispatch and lets running
+work drain — an operator normally reaches for (a) first and (d) as the
+terminal step.
 *Unblocks:* real containment; replaces the rev-3 "suspend removed from scope"
 note with its designed resolution.
 
