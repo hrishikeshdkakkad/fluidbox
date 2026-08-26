@@ -144,10 +144,15 @@ own registry at admin-gated `GET /v1/admin/metrics`.
    because GKE Dataplane V2 serves no NAMESPACED `CiliumNetworkPolicy` and the
    per-run enforcer writes exactly that. The standing cost: GKE no longer
    patches the CNI, node upgrades can undo its node configuration (the
-   `node.cilium.io/agent-not-ready` taint is what makes that survivable), and
-   Cilium upgrades are an operator task. `cilium_mode` must keep defaulting to
-   `upstream` in both stacks — a default naming the other mode plans a cluster
-   replacement or a CNI uninstall.
+   startup taint is what makes that survivable), and Cilium upgrades are an
+   operator task. `cilium_mode` must keep defaulting to `upstream` in both
+   stacks — a default naming the other mode plans a cluster replacement or a
+   CNI uninstall. The startup taint's key is declared once (platform output
+   `cilium_agent_not_ready_taint_key`) and MUST carry the
+   `ignore-taint.cluster-autoscaler.kubernetes.io/` prefix: without it the
+   autoscaler's scale-up simulation never fits a sandbox pod and the
+   scale-to-zero pool is stuck at zero (the day-one 503). Fixed and proven
+   2026-08-26: `TriggeredScaleUp` 0→1, gate verified 90 s after the decision.
    See gcp-architecture.md#network-grants.
 7. **The run queue is off.** Enabling `server.maxConcurrentRuns` switches the
    Deployment to `Recreate`; the sandbox `ResourceQuota` (12 pods) is the

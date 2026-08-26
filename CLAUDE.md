@@ -40,7 +40,7 @@ production values overlay); architecture and cost:
 The older `deploy/cloud/terraform/` tree is the **AWS/EKS M1 kit**, whose
 estate was torn down 2026-08-15 — it is kept for reference, not for deploys.
 
-Four things about it are load-bearing and easy to get wrong:
+Five things about it are load-bearing and easy to get wrong:
 
 - **`platform.fluidzero.ai` is Vercel; `api.platform.fluidzero.ai` is GKE.**
   `next.config.ts` rewrites `/v1/*` to the control plane *only* when
@@ -62,6 +62,21 @@ Four things about it are load-bearing and easy to get wrong:
   only mode giving v2 envelope sealing on GCP. Disclosed residual: the KEK
   plaintext is in the pod env (unlike the `aws` backend). See
   `docs/hosted/gcp-architecture.md#sealing`.
+- **The cluster runs self-managed upstream Cilium (`cilium_mode = "upstream"`,
+  legacy datapath) because governed sandbox egress needs the NAMESPACED
+  `CiliumNetworkPolicy`, which GKE Dataplane V2 does not serve.** Two couplings
+  follow. (1) `cilium_mode` defaults to `upstream` in BOTH Terraform stacks and
+  must keep naming the deployed reality — `datapath_provider` is ForceNew, so
+  the other value plans a cluster REPLACEMENT (platform) or a CNI UNINSTALL
+  (app). (2) Every node is born with a startup taint whose key is declared once
+  (platform output `cilium_agent_not_ready_taint_key`) and fed to Cilium's
+  `agentNotReadyTaintKey`; it MUST carry the
+  `ignore-taint.cluster-autoscaler.kubernetes.io/` prefix, because the
+  autoscaler SIMULATES a pending pod against the tainted node template and
+  sandbox pods must not tolerate the taint — under Cilium's plain default key
+  the scale-to-zero pool can never leave zero (probe `Unschedulable`, dashboard
+  `503 … network isolation is not yet verified`). Sandbox pods must never be
+  given that toleration to "fix" it.
 
 Deploys are automatic on push to `main` (`.github/workflows/deploy.yml`):
 plan on PRs as a read-only identity, apply + release on main through a
