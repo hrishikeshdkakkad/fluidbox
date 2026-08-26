@@ -115,6 +115,54 @@ these now fail **in the Job**, before any pod rolls — read the Job's log:
 kubectl -n fluidbox logs job/fluidbox-server-migrate
 ```
 
+### Runs blocked: "network isolation is not yet verified" {#netpol-unschedulable}
+
+The dashboard answers `503 sandbox network isolation is not yet verified on
+this cluster — runs are blocked until the NetworkPolicy enforcement probe
+passes`. The server refuses to admit a run until a probe pod, placed exactly
+like a sandbox, has PROVED the CNI drops traffic — so first read what the probe
+concluded, then why:
+
+```
+kubectl -n fluidbox logs -l app.kubernetes.io/component=server --tail=2000 \
+  | grep '"worker":"netpol_gate"' | tail -3
+kubectl -n fluidbox-sandboxes describe pod fluidbox-netpol-probe | sed -n '/^Events/,$p'
+```
+
+| gate result | probe event | cause | fix |
+|---|---|---|---|
+| `Unschedulable` | `NotTriggerScaleUp: … untolerated taint(s)` | The sandbox pool is at zero and the autoscaler's scale-up simulation refuses the pod because the pool template carries a taint it does not tolerate. On this cluster that is the Cilium startup taint, whose key **must** sit under `ignore-taint.cluster-autoscaler.kubernetes.io/` (the autoscaler ignores that prefix in the simulation). Check `gcloud container node-pools describe sandbox --format='value(config.taints[].key)'`. | Restore the prefix in `platform/gke.tf` (`local.cilium_agent_not_ready_taint_key`) and re-apply — **never** "fix" it by giving sandbox pods a toleration for the not-ready taint; that reopens the unmanaged-pod hole the taint closes. |
+| `Unschedulable` | pod Pending on a node that keeps the not-ready taint | The node was born with a taint key Cilium's operator is not configured to remove: the platform and app stacks disagree on `cilium_agent_not_ready_taint_key`. `kubectl -n kube-system get cm cilium-config -o jsonpath='{.data.agent-not-ready-taint-key}'` vs the pool template. | Re-apply the app stack with the key from `terraform -chdir=platform output -raw cilium_agent_not_ready_taint_key`; the operator lifts the taint from stuck nodes on its next pass. |
+| `Unschedulable` | `TriggeredScaleUp`, pod still Pending | Cold start from zero is legitimately in progress. Measured: autoscaler decision → node ≈30 s, Cilium prepares the node and lifts the taint ≈50 s, gate verified ≈90 s after the decision. The gate's deadline is 240 s and it retries 30 s after a miss, so even a slow cold start heals on the next attempt. | Wait one cycle. Persisting past ~6 min is one of the rows above. |
+| `NotEnforced` | probe `Failed`, exit 3 | The CNI is not dropping traffic. | Runs stay blocked by design; check Cilium agent health on the sandbox node. |
+
+#### Changing the startup taint key (or upgrading Cilium) {#cilium-taint-migration}
+
+Order matters, for two reasons. The operator lifts exactly ONE key, so a node
+born with any other stays tainted `NoExecute` forever. And GKE applies a pool
+taint change to the pool's EXISTING nodes immediately — `NoExecute` evicts every
+pod without a toleration on the spot (27 pods in 8 s when this fix shipped). With
+Cilium already lifting the new key that is a ~30 s blip; with the pools changed
+first it is the whole control plane evicted with nowhere to go.
+
+```
+# 1. Cilium first - it must be lifting the NEW key before any node is born with it.
+terraform -chdir=deploy/cloud/gcp/app apply \
+  -var "external_secrets_sa=$(terraform -chdir=deploy/cloud/gcp/platform output -raw external_secrets_service_account)" \
+  -var "cilium_agent_not_ready_taint_key=<the new key>"
+kubectl -n kube-system get cm cilium-config -o jsonpath='{.data.agent-not-ready-taint-key}'
+
+# 2. Pool templates - merge the platform change; the pipeline applies it in-place.
+
+# 3. Sweep for nodes born in between. A Cilium upgrade rolls cilium-operator,
+#    whose anti-affinity makes the autoscaler add a surge node to the two-node
+#    system pool - born with whichever key the template had at that moment.
+kubectl get nodes -o custom-columns='NAME:.metadata.name,TAINTS:.spec.taints[*].key'
+#    A node still carrying the OLD key with a Ready cilium agent: lift it by hand,
+#    which is exactly what the operator would have done under the old config.
+kubectl taint node <node> <old-key>-
+```
+
 ### CrashLoopBackOff {#crashloop}
 
 ```
