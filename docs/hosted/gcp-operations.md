@@ -317,7 +317,16 @@ cannot rotate them by accident.
 
 Adding a new version and restarting the Deployment is the rotation mechanism for
 the others (External Secrets re-syncs on its `refreshInterval`, or immediately
-if you delete the target Secret).
+if you delete the target Secret). For the out-of-band ones — the model-provider
+keys and the IdP client secret — `scripts/cloud/gcp-secrets.sh` is the whole
+procedure: it reports which have a version, adds missing ones from a dotenv /
+the environment / a hidden prompt, and after a provider key changes it syncs
+External Secrets and restarts the gateway. A value that DIFFERS from the
+version in place is refused unless you pass `--rotate`, because a dotenv can
+carry a different key than the one production runs on.
+
+The tenant LiteLLM keys are not in that list on purpose: the server mints,
+rotates (allowlist drift), and recovers them itself.
 
 ## Alerts
 
