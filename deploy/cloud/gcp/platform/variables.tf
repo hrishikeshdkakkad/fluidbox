@@ -94,9 +94,16 @@ variable "sandbox_machine_type" {
 }
 
 variable "sandbox_min_nodes" {
-  description = "Zero. The sandbox pool costs nothing while idle, which is what makes always-on affordable."
+  description = <<-EOT
+    Sandbox nodes kept even when idle. 1 = one node is always present, so a run
+    never pays the scale-from-zero cold start (measured 31-107 s of node
+    creation plus ~50 s of Cilium preparing the node) and never lands in the
+    autoscaler's cordon-and-delete window. The owner chose "always present and
+    available" over the ~$98/month this node costs (2026-08-26); 0 was the lean
+    tier's scale-to-zero.
+  EOT
   type        = number
-  default     = 0
+  default     = 1
 }
 
 variable "sandbox_max_nodes" {
@@ -105,9 +112,18 @@ variable "sandbox_max_nodes" {
 }
 
 variable "sandbox_spot" {
-  description = "Run sandboxes on Spot VMs (60-91 percent cheaper, preemptible with 30s notice). Safe here: a preempted sandbox is a failed run the control plane already knows how to re-drive, and no control-plane state lives on these nodes."
+  description = <<-EOT
+    Whether sandbox nodes are Spot VMs. false = on-demand: present AND
+    available, never reclaimed. true = ~70% cheaper, but GCP can reclaim a
+    Spot node with 30 s notice - a run in flight on it fails and is re-driven,
+    and the pool is "present" only until the next preemption. The owner chose
+    on-demand (2026-08-26). CHANGING THIS REPLACES THE POOL: spot is immutable
+    on a node pool, so Terraform destroys and recreates it (no data lives
+    there; runs in flight on it fail). The pipeline's destroy gate refuses the
+    plan until a manual deploy passes allow_destroy=true.
+  EOT
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "gke_release_channel" {

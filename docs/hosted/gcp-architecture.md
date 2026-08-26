@@ -38,7 +38,7 @@ choice costs — including the things it gives up.
   │   └── ExternalSecret → fluidbox-secrets                                 │
   │                                                                         │
   │  node pool "system"   1→3 × e2-standard-4, on-demand   (always on)      │
-  │  node pool "sandbox"  0→3 × e2-standard-4, SPOT        (zero when idle) │
+  │  node pool "sandbox"  1→3 × e2-standard-4, on-demand  (one always warm) │
   └────────────┬───────────────────────────────────┬────────────────────────┘
                │ private IP                        │ Cloud NAT (one static IP)
                ▼                                   ▼
@@ -76,7 +76,7 @@ Consequences that follow, and are not optional:
 | Dataplane | **V2 (Cilium)** | NetworkPolicy is not optional here — the server refuses to start runs until a boot probe proves the CNI actually drops traffic (`netpol.requireEnforced`). DPv2 enforces natively with no add-on to forget. It is also the prerequisite for the governed-egress feature (`networkGrants`), which is off but now becomes available. |
 | Nodes | private, `GKE_METADATA`, Shielded, image streaming | Private nodes have no external address; Cloud NAT gives them one stable egress IP. `GKE_METADATA` blocks the legacy metadata endpoints from pods — the same `169.254.169.254` class the control plane's own egress predicate refuses. Image streaming matters concretely: the runner images are ~1.5 GB. |
 | System pool | 1→3 × `e2-standard-4`, `max_surge=1 max_unavailable=0` | This is the fix for the lean tier's "single node = downtime" caveat. An upgrade **adds** a node, drains onto it, then removes the old one — so a one-node pool still upgrades without dropping the control plane, and the extra node is billed only for the minutes an upgrade takes. |
-| Sandbox pool | 0→3 × `e2-standard-4`, **Spot**, tainted | Zero nodes when idle is what makes always-on affordable. Spot is safe here: a preempted sandbox is a failed run the control plane already knows how to re-drive, and no control-plane state lives on these nodes. The taint keeps everything else off preemptible capacity. |
+| Sandbox pool | 1→3 × `e2-standard-4`, **on-demand**, tainted | One node is always present and never reclaimed, so a run never pays the scale-from-zero cold start (31–107 s of node creation plus ~50 s of Cilium preparing it) or lands in the autoscaler's cordon window. The owner chose that over the ~$98/month it costs; `sandbox_spot = true` / `sandbox_min_nodes = 0` restore the lean tier. The taint keeps everything else off these nodes. |
 | etcd | CMEK (`gke-etcd` key) | Application-layer encryption of Secret objects under a key we can rotate and revoke, on top of Google's default at-rest encryption. |
 
 **Control-plane endpoint.** Public, with `master_authorized_cidrs` empty by
@@ -224,17 +224,18 @@ deploy, in any order.
 |---|---|---|
 | GKE management | 1 zonal cluster | **$0** — the free tier's $74.40 credit cancels it |
 | System pool | 1 × `e2-standard-4`, on-demand, us-central1 | ~$98 |
-| Sandbox pool | 0 × `e2-standard-4` Spot at idle | **$0** idle; ~$30/mo per node if run continuously |
+| Sandbox pool | 1 × `e2-standard-4`, on-demand, always on | ~$98 |
 | Cloud SQL | `db-g1-small`, zonal, 20 GB SSD, PITR | ~$27 + ~$3 storage |
 | Cloud NAT | 1 gateway + 1 static IP | ~$32 + egress |
 | Load balancer | 1 global forwarding rule + static IP | ~$18 + egress |
 | Artifact Registry | a few GB | ~$1 |
 | Logging / monitoring | first 50 GiB free | ~$0–5 |
 | GCS archives | 14-day retention | <$1 |
-| **Idle baseline** | | **≈ $180–190/month** |
+| **Idle baseline** | | **≈ $280–290/month** |
 
-Burst: each busy sandbox node adds roughly **$0.04/hour** (Spot
-`e2-standard-4`), so an hour of three-node saturation is about $0.12.
+Burst: each additional sandbox node adds roughly **$0.134/hour** (on-demand
+`e2-standard-4`), so an hour of three-node saturation is about $0.27 more than
+baseline.
 
 Not included: Anthropic model spend (metered per run by the facade and capped
 per tenant at `$25 / 30d` by `llm.tenant.maxBudget`), and Vercel.
@@ -251,7 +252,7 @@ on concurrent runs.
 | The single system node dies | **Control plane down** until the autoscaler replaces it (minutes). Both replicas were on that node. Raise `system_min_nodes` to 2 to remove this. |
 | A node *upgrade* | No downtime — `max_surge=1, max_unavailable=0` adds a node first. |
 | A zone outage | **Everything down.** Zonal cluster, zonal Cloud SQL. This is the deliberate lean-tier trade. |
-| A Spot preemption | The affected run fails and is re-driven. The control plane is unaffected (different pool). |
+| A sandbox node dies | The affected run fails and is re-driven; the autoscaler replaces the node. On-demand since 2026-08-26, so this is a fault, not a scheduled reclaim. The control plane is unaffected (different pool). |
 | Cloud SQL failover | `ZONAL` has none; recovery is restore-from-backup. `REGIONAL` adds automatic failover for roughly double the cost. |
 
 ## 10. Governed sandbox egress {#network-grants}
