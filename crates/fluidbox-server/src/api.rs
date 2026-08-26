@@ -409,15 +409,28 @@ fn harness_defaults<'a>(
     harness_id: &str,
     cfg: &'a crate::config::Config,
 ) -> Result<(&'a str, &'a str), ApiError> {
-    match (
-        harness::default_runner_image(harness_id, cfg),
-        harness::default_model(harness_id, cfg),
-    ) {
-        (Some(image), Some(model)) => Ok((image, model)),
-        _ => Err(ApiError::UnprocessableEntity(format!(
+    if !harness::is_known(harness_id) {
+        return Err(ApiError::UnprocessableEntity(format!(
             "unknown harness '{harness_id}' (known: {})",
             harness::KNOWN.join(", ")
-        ))),
+        )));
+    }
+    // The inherited default must be one the deployment SERVES: an agent
+    // created without an explicit model must not inherit a default the tenant
+    // key will 403 at its first model call.
+    match (
+        harness::default_runner_image(harness_id, cfg),
+        harness::servable_default_model(harness_id, cfg),
+    ) {
+        (Some(image), Some(model)) => Ok((image, model)),
+        _ => {
+            let known: Vec<&str> = harness::models(harness_id).iter().map(|m| m.id).collect();
+            Err(ApiError::UnprocessableEntity(format!(
+                "harness '{harness_id}' has no model this deployment serves (its models: {}); \
+                 widen llm.tenant.models and rotate the tenant key to enable it",
+                known.join(", ")
+            )))
+        }
     }
 }
 
@@ -425,15 +438,39 @@ fn harness_defaults<'a>(
 /// before anything persists, instead of a murky failure at the first model
 /// call. Inherited/default models are trusted (a shipped default is always a
 /// member of its list, pinned by a harness unit test).
-fn validate_model(harness_id: &str, model: &str) -> Result<(), ApiError> {
-    if harness::model_belongs(harness_id, model) {
-        return Ok(());
+fn validate_model(
+    cfg: &crate::config::Config,
+    harness_id: &str,
+    model: &str,
+) -> Result<(), ApiError> {
+    if !harness::model_belongs(harness_id, model) {
+        let valid: Vec<&str> = harness::models(harness_id).iter().map(|m| m.id).collect();
+        return Err(ApiError::UnprocessableEntity(format!(
+            "model '{model}' is not valid for harness '{harness_id}' (valid: {})",
+            valid.join(", ")
+        )));
     }
-    let valid: Vec<&str> = harness::models(harness_id).iter().map(|m| m.id).collect();
-    Err(ApiError::UnprocessableEntity(format!(
-        "model '{model}' is not valid for harness '{harness_id}' (valid: {})",
-        valid.join(", ")
-    )))
+    // Valid for the harness, but can THIS deployment serve it? In tenant key
+    // mode the answer is the allowlist the tenant's LiteLLM key was minted
+    // with; refusing here is a 422 before anything persists, instead of a 403
+    // at the first model call of an already-provisioned run.
+    if !harness::is_servable(cfg, model) {
+        let served: Vec<&str> = harness::servable_models(harness_id, cfg)
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        return Err(ApiError::UnprocessableEntity(format!(
+            "model '{model}' is valid for harness '{harness_id}' but this deployment's LLM \
+             gateway does not serve it (served: {}); widen llm.tenant.models and rotate \
+             the tenant key to enable it",
+            if served.is_empty() {
+                "none".to_string()
+            } else {
+                served.join(", ")
+            }
+        )));
+    }
+    Ok(())
 }
 
 /// The deployment's RESOLVED network posture, asked of the provider rather
@@ -453,16 +490,23 @@ pub async fn list_harnesses(
     _principal: Principal,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
+    // What the facade can SERVE, not what the harness knows: in tenant key
+    // mode the per-tenant LiteLLM key carries a model allowlist, and a model
+    // outside it is a 403 at the first model call — after the sandbox was
+    // provisioned. The catalog is where that gets caught instead. A harness
+    // with no servable model is reported unavailable, and the dashboard hides
+    // it rather than offering a run that cannot start.
     let harnesses: Vec<Value> = harness::KNOWN
         .iter()
         .map(|&id| {
+            let models = harness::servable_models(id, &state.cfg);
             json!({
                 "id": id,
                 "display_name": harness::display_name(id),
                 "hint": harness::hint(id),
-                "available": true,
-                "default_model": harness::default_model(id, &state.cfg),
-                "models": harness::models(id)
+                "available": !models.is_empty(),
+                "default_model": harness::servable_default_model(id, &state.cfg),
+                "models": models
                     .iter()
                     .map(|m| json!({
                         "id": m.id,
@@ -511,7 +555,7 @@ pub async fn create_agent(
     let harness_id = req.harness.as_deref().unwrap_or(harness::CLAUDE_AGENT_SDK);
     let (default_image, default_model) = harness_defaults(harness_id, &state.cfg)?;
     if let Some(m) = req.model.as_deref() {
-        validate_model(harness_id, m)?;
+        validate_model(&state.cfg, harness_id, m)?;
     }
 
     let scope = principal.scope();
@@ -629,7 +673,7 @@ pub async fn add_revision(
         .unwrap_or(harness::CLAUDE_AGENT_SDK);
     let (default_image, default_model) = harness_defaults(harness_id, &state.cfg)?;
     if let Some(m) = req.model.as_deref() {
-        validate_model(harness_id, m)?;
+        validate_model(&state.cfg, harness_id, m)?;
     }
     let harness_changed = latest
         .as_ref()

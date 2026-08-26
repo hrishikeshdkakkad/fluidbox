@@ -116,6 +116,39 @@ pub fn model_belongs(harness: &str, model: &str) -> bool {
     models(harness).iter().any(|m| m.id == model)
 }
 
+/// Whether the deployment's LLM facade can actually serve a model. In `tenant`
+/// key mode every request rides a per-tenant LiteLLM virtual key minted with
+/// `FLUIDBOX_LLM_TENANT_MODELS` as its allowlist, so a model outside that list
+/// is refused upstream with a 403 — after the sandbox was provisioned and the
+/// run is already `running`. Asking here moves that refusal to the catalog and
+/// to agent-write time, where it is a clean 422 and nothing has been spent.
+/// `shared` mode has no allowlist, and an empty list in tenant mode means none
+/// was configured; both serve everything the harness knows.
+pub fn is_servable(cfg: &Config, model: &str) -> bool {
+    !matches!(cfg.llm_key_mode, crate::config::LlmKeyMode::Tenant)
+        || cfg.llm_tenant_models.is_empty()
+        || cfg.llm_tenant_models.iter().any(|m| m == model)
+}
+
+/// `models(harness)` narrowed to what this deployment serves.
+pub fn servable_models(harness: &str, cfg: &Config) -> Vec<&'static HarnessModel> {
+    models(harness)
+        .iter()
+        .filter(|m| is_servable(cfg, m.id))
+        .collect()
+}
+
+/// The default the deployment can honour: the configured default when it is
+/// servable, else the first servable model, else `None` — a harness the
+/// deployment cannot serve at all (codex on an Anthropic-only gateway).
+pub fn servable_default_model<'a>(harness: &str, cfg: &'a Config) -> Option<&'a str> {
+    let configured = default_model(harness, cfg)?;
+    if is_servable(cfg, configured) {
+        return Some(configured);
+    }
+    servable_models(harness, cfg).first().map(|m| m.id)
+}
+
 /// Per-harness env extras beyond the generic `FLUIDBOX_*` block.
 ///
 /// `llm_token` is the LLM-AUDIENCE credential (Gap 10): it authenticates model
@@ -372,5 +405,48 @@ mod tests {
         assert!(!model_belongs(CODEX, "claude-opus-4-8"));
         assert!(!model_belongs(CLAUDE_AGENT_SDK, "made-up-model"));
         assert!(models("nope").is_empty());
+    }
+
+    /// In tenant key mode the catalog must not offer what the facade will 403.
+    #[test]
+    fn tenant_allowlist_narrows_the_catalog_and_its_defaults() {
+        let mut cfg = test_cfg();
+        cfg.llm_key_mode = crate::config::LlmKeyMode::Tenant;
+        cfg.llm_tenant_models = vec!["claude-sonnet-5".into()];
+
+        // Only the allowlisted model survives; the configured default (haiku)
+        // is not servable, so the servable default moves to sonnet.
+        let ids: Vec<&str> = servable_models(CLAUDE_AGENT_SDK, &cfg)
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["claude-sonnet-5"]);
+        assert_eq!(
+            servable_default_model(CLAUDE_AGENT_SDK, &cfg),
+            Some("claude-sonnet-5")
+        );
+
+        // A harness none of whose models are allowlisted is unservable: no
+        // models, no default — the dashboard hides it and agent writes 422.
+        assert!(servable_models(CODEX, &cfg).is_empty());
+        assert_eq!(servable_default_model(CODEX, &cfg), None);
+        assert!(!is_servable(&cfg, "gpt-5.4-mini"));
+    }
+
+    /// Shared mode, and tenant mode with no allowlist configured, serve the
+    /// whole catalog — exactly the pre-existing behaviour.
+    #[test]
+    fn without_an_allowlist_the_catalog_is_untouched() {
+        let shared = test_cfg();
+        assert_eq!(servable_models(CODEX, &shared).len(), models(CODEX).len());
+        assert_eq!(servable_default_model(CODEX, &shared), Some("gpt-5.4-mini"));
+
+        let mut tenant_open = test_cfg();
+        tenant_open.llm_key_mode = crate::config::LlmKeyMode::Tenant;
+        assert_eq!(
+            servable_models(CODEX, &tenant_open).len(),
+            models(CODEX).len()
+        );
+        assert!(is_servable(&tenant_open, "gpt-5.6-sol"));
     }
 }
