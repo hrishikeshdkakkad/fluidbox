@@ -157,6 +157,10 @@ pub fn spawn_all(state: AppState) {
     // FLUIDBOX_MAX_CONCURRENT_RUNS is set, so an unconfigured deployment gains
     // no worker and no polling.
     crate::dispatcher::spawn(state.clone());
+    // Tenant mode only: shared mode has no per-tenant keys to keep honest.
+    if matches!(state.cfg.llm_key_mode, crate::config::LlmKeyMode::Tenant) {
+        tokio::spawn(llm_key_allowlist_reconcile(state.clone()));
+    }
     tokio::spawn(finalize_worker(state));
 }
 
@@ -1098,6 +1102,88 @@ pub fn spawn_approval_wakeups(state: AppState) {
             }
         }
     });
+}
+
+/// Keep every tenant's LiteLLM key minted under the CURRENT model allowlist.
+///
+/// A virtual key's allowlist is fixed at mint, so widening
+/// `FLUIDBOX_LLM_TENANT_MODELS` and deploying only changed what NEW keys would
+/// get — every existing key kept refusing the new models with
+/// `403 key not allowed to access model` until an operator rotated it by hand,
+/// which is how the first codex run on the hosted deployment ended.
+/// Configuration should drive state: this asks LiteLLM what each key was
+/// minted with and rotates the ones that drifted. LiteLLM's own record is the
+/// source of truth deliberately — it also heals a key someone edited there.
+///
+/// Bounded on purpose: a tenant is rotated at most once per hour from this
+/// replica, so a comparison mistake can never become a rotation storm, and the
+/// first pass waits for the gateway to come up rather than warn at boot.
+async fn llm_key_allowlist_reconcile(state: AppState) {
+    const TICK: Duration = Duration::from_secs(600);
+    const ROTATION_COOLDOWN: Duration = Duration::from_secs(3600);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let mut tick = periodic(TICK);
+    let mut last_rotation: std::collections::HashMap<uuid::Uuid, std::time::Instant> =
+        std::collections::HashMap::new();
+    loop {
+        tick.tick().await;
+        let tenants = match fluidbox_db::system_worker::tenants_with_llm_keys(&state.pool).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, error_kind = EK::DB, worker = "llm_key_reconcile", "scan failed");
+                continue;
+            }
+        };
+        for tenant_id in tenants {
+            // The row exists, so this unseals (or serves the cache) — it never mints.
+            let key = match crate::llm_keys::ensure_tenant_key(&state, tenant_id).await {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(tenant_id = %tenant_id, error = %e, worker = "llm_key_reconcile", "could not load the tenant key");
+                    continue;
+                }
+            };
+            let minted = match crate::llm_keys::key_models_at_litellm(&state, &key).await {
+                Ok(Some(m)) => m,
+                // Unknown at LiteLLM: the reactive recovery on the facade path
+                // owns that, and it needs the 401 to prove it.
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(tenant_id = %tenant_id, error = %e, worker = "llm_key_reconcile", "could not read the key's allowlist from litellm");
+                    continue;
+                }
+            };
+            if !crate::llm_keys::allowlist_drifted(&minted, &state.cfg.llm_tenant_models) {
+                continue;
+            }
+            if last_rotation
+                .get(&tenant_id)
+                .is_some_and(|t| t.elapsed() < ROTATION_COOLDOWN)
+            {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    worker = "llm_key_reconcile",
+                    "allowlist still drifted after a rotation less than an hour ago; not rotating again"
+                );
+                continue;
+            }
+            match crate::llm_keys::rotate_tenant_key(&state, tenant_id).await {
+                Ok(()) => {
+                    last_rotation.insert(tenant_id, std::time::Instant::now());
+                    tracing::info!(
+                        tenant_id = %tenant_id,
+                        minted = ?minted,
+                        configured = ?state.cfg.llm_tenant_models,
+                        worker = "llm_key_reconcile",
+                        "rotated a tenant LLM key whose model allowlist drifted from configuration"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(tenant_id = %tenant_id, error = %e, worker = "llm_key_reconcile", "rotation failed; retrying next tick");
+                }
+            }
+        }
+    }
 }
 
 /// Kubernetes netpol run-gate (design 2026-07-15): probe that the CNI enforces
