@@ -41,9 +41,17 @@ variable "external_secrets_chart_version" {
 }
 
 variable "cilium_mode" {
-  description = "Must match the platform stack. `upstream` installs self-managed Cilium here; `dataplane_v2` installs nothing (GKE manages it)."
+  description = <<-EOT
+    Must match the platform stack. `upstream` installs self-managed Cilium here;
+    `dataplane_v2` installs nothing (GKE manages it).
+
+    Defaulting this to the mode the live deployment does NOT run is destructive
+    in a quieter way than the platform stack: count would drop to 0 and Terraform
+    would UNINSTALL the cluster's CNI. Keep it in lockstep with
+    platform/variables.tf.
+  EOT
   type        = string
-  default     = "dataplane_v2"
+  default     = "upstream"
 
   validation {
     condition     = contains(["dataplane_v2", "upstream"], var.cilium_mode)
