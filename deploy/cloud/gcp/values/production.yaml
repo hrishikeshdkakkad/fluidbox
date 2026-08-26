@@ -139,6 +139,11 @@ web:
 litellm:
   enabled: true
   image: ghcr.io/berriai/litellm-database:main-stable
+  # OpenAI, for the codex harness - from the OPTIONAL secret, so the gateway
+  # starts whether or not the key has been provided yet
+  # (scripts/cloud/gcp-secrets.sh adds it and restarts this Deployment).
+  openaiKeySecretKey: OPENAI_API_KEY
+  openaiKeySecretName: fluidbox-secrets-optional
   database:
     enabled: true
   nodeSelector:
@@ -156,6 +161,12 @@ llm:
     models:
       - claude-haiku-4-5
       - claude-sonnet-5
+      # The codex harness, on the gateway's "gpt-5*" route (backed by the
+      # optional OpenAI key). Existing tenant keys re-mint themselves under
+      # this list - the server reconciles allowlists against LiteLLM.
+      - gpt-5.4-mini
+      - gpt-5.4
+      - gpt-5.6-sol
     maxBudget: "25"
     budgetDuration: "30d"
 
@@ -219,6 +230,10 @@ externalSecrets:
     - { secretKey: LITELLM_MASTER_KEY, remoteRef: litellm-master-key }
     - { secretKey: LITELLM_DATABASE_URL, remoteRef: litellm-database-url }
     - { secretKey: ANTHROPIC_API_KEY, remoteRef: anthropic-api-key }
+  # Keys the deployment runs without. Their own ExternalSecret + Secret: a
+  # missing version fails only that sync, never the eight above.
+  optionalData:
+    - { secretKey: OPENAI_API_KEY, remoteRef: openai-api-key }
     # NO archive S3 credentials. They exist only when
     # enable_gcs_archive_store is on in the platform stack, which it is not:
     # the static HMAC key that backend needs is refused by
