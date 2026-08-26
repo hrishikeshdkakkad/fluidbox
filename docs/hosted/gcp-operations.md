@@ -156,6 +156,18 @@ these now fail **in the Job**, before any pod rolls — read the Job's log:
 kubectl -n fluidbox logs job/fluidbox-server-migrate
 ```
 
+### Expected warning: `DPv2MigrationUnsupportedCNIDetected` on a node {#dpv2-condition}
+
+A Warning event and a node condition, `DPv2MigrationUnsupportedCNI=True`,
+citing `/etc/cni/net.d/05-cilium.conflist`. This is GKE's Dataplane V2
+migration pre-check noticing the self-managed Cilium this cluster runs ON
+PURPOSE (`cilium_mode = "upstream"`; see gcp-architecture.md#network-grants).
+It is advisory: the node stays Ready, untainted and fully allocatable, and it
+appears on nodes created after the check was introduced. The only thing it
+forbids — an in-place migration to Dataplane V2 — is the one thing that must
+never be done here, because it would replace the Cilium that governed sandbox
+egress depends on. Do not "fix" it.
+
 ### Runs blocked: "network isolation is not yet verified" {#netpol-unschedulable}
 
 The dashboard answers `503 sandbox network isolation is not yet verified on
