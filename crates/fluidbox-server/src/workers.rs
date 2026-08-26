@@ -52,7 +52,7 @@ pub(crate) fn periodic(period: Duration) -> tokio::time::Interval {
 pub async fn boot_orphan_sweep(state: AppState) {
     // Resume interrupted finalizations FIRST, so a crash mid-collect finishes
     // (and reaps its own sandbox) before the orphan sweep would kill it.
-    recover_finalizations(&state).await;
+    recover_finalizations(&state, true).await;
 
     match state.provider.list_managed().await {
         Ok(managed) => {
@@ -98,11 +98,22 @@ pub async fn boot_orphan_sweep(state: AppState) {
 /// Re-drive every session that has a persisted finalization intent but hasn't
 /// reached terminal — the restart-recovery + crashed-driver path. Claim-
 /// guarded in `drive_finalization`, so this never double-finalizes.
-async fn recover_finalizations(state: &AppState) {
+async fn recover_finalizations(state: &AppState, at_boot: bool) {
     match fluidbox_db::system_worker::pending_finalizations(&state.pool).await {
         Ok(ids) => {
             for id in ids {
-                tracing::info!(session_id = %id, worker = "finalize_driver", "resuming an interrupted finalization");
+                // Every pending intent is offered to the driver; the CLAIM
+                // decides whether anyone else is already on it. At boot a
+                // pending intent really was interrupted (the previous process
+                // is gone), so that is worth a line. On the 20 s tick it is
+                // usually a finalization the run's own driver is mid-way
+                // through — logging "resuming an interrupted finalization"
+                // there was false alarm on every healthy run.
+                if at_boot {
+                    tracing::info!(session_id = %id, worker = "finalize_driver", "resuming a finalization interrupted by the previous process");
+                } else {
+                    tracing::debug!(session_id = %id, worker = "finalize_driver", "offering a pending finalization to the driver");
+                }
                 // Bounded so one hung drive cannot starve the rest of the
                 // backlog (this worker is serial). An abandoned drive's
                 // claim goes stale and is retried; 300 s comfortably covers
@@ -173,7 +184,31 @@ enum SessionLookup {
     Unparseable,
 }
 
-fn reconcile_action(session: SessionLookup, has_handle: bool) -> ReconcileAction {
+/// How long after launch a handle-less `provisioning`/`initializing` session is
+/// presumed to be a LIVE driver still inside `provision()`, rather than the
+/// crash window the reconciler exists to heal. `run()` writes the handle only
+/// once the runner is Running, and on Kubernetes that wait now includes a
+/// scale-from-zero: node creation, Cilium preparing the node, the image pull.
+/// Adopting inside that window is not healing — it races a healthy driver and
+/// files a false "control-plane interruption" in the session's ledger.
+///
+/// Must exceed the provider's own provisioning wait
+/// (`fluidbox_provider_k8s::config::DEFAULT_INIT_GRACE_SECS`, pinned by a test):
+/// past that, a live driver has either written the handle or deleted the pod,
+/// so anything still there without a handle really is orphaned and the plain
+/// Adopt arm takes over. Docker provisioning is seconds; the grace costs it
+/// nothing.
+const ADOPT_GRACE_SECS: i64 = 420;
+// Pinned at compile time: a grace shorter than the provider's provisioning wait
+// would adopt a slow-but-live driver mid-provision again.
+const _: () = assert!(ADOPT_GRACE_SECS > fluidbox_provider_k8s::config::DEFAULT_INIT_GRACE_SECS);
+
+fn reconcile_action(
+    session: SessionLookup,
+    has_handle: bool,
+    launch_fresh: bool,
+) -> ReconcileAction {
+    use fluidbox_core::state::SessionStatus;
     match session {
         SessionLookup::Missing => ReconcileAction::Terminate,
         SessionLookup::Unparseable => ReconcileAction::Leave,
@@ -190,6 +225,15 @@ fn reconcile_action(session: SessionLookup, has_handle: bool) -> ReconcileAction
         // The finalizer owns winding-down sandboxes — collection may be in
         // flight; it reaps on completion, and recovery re-drives it.
         SessionLookup::Known(s) if s.is_winding_down() => ReconcileAction::Leave,
+        // A freshly launched session still provisioning: its driver is inside
+        // `provision()` and writes the handle itself when the runner is
+        // Running (see ADOPT_GRACE_SECS). Past the grace it falls through to
+        // Adopt like any other handle-less session.
+        SessionLookup::Known(SessionStatus::Provisioning | SessionStatus::Initializing)
+            if !has_handle && launch_fresh =>
+        {
+            ReconcileAction::Leave
+        }
         SessionLookup::Known(_) if !has_handle => ReconcileAction::Adopt,
         SessionLookup::Known(_) => ReconcileAction::Leave,
     }
@@ -251,7 +295,15 @@ async fn reconcile_managed(state: AppState) {
                 .as_ref()
                 .map(|s| s.status.clone())
                 .unwrap_or_else(|| "unknown".into());
-            match reconcile_action(lookup, has_handle) {
+            // `launched_at` is the first entry into `provisioning` — the same
+            // anchor the stale-launch watchdog ages on. A row without one
+            // (never launched, or pre-migration) gets no grace.
+            let launch_fresh = session
+                .as_ref()
+                .and_then(|s| s.launched_at)
+                .map(|t| (chrono::Utc::now() - t).num_seconds() < ADOPT_GRACE_SECS)
+                .unwrap_or(false);
+            match reconcile_action(lookup, has_handle, launch_fresh) {
                 ReconcileAction::Leave => {}
                 ReconcileAction::Terminate => {
                     tracing::info!(
@@ -1151,7 +1203,7 @@ async fn finalize_worker(state: AppState) {
     let mut tick = periodic(Duration::from_secs(20));
     loop {
         tick.tick().await;
-        recover_finalizations(&state).await;
+        recover_finalizations(&state, false).await;
     }
 }
 
@@ -1323,46 +1375,89 @@ mod tests {
         use ReconcileAction::*;
         use SessionLookup::*;
         // Unknown session → the pod is an orphan: terminate.
-        assert_eq!(reconcile_action(Missing, false), Terminate);
-        assert_eq!(reconcile_action(Missing, true), Terminate);
+        assert_eq!(reconcile_action(Missing, false, false), Terminate);
+        assert_eq!(reconcile_action(Missing, true, false), Terminate);
         // A session row whose status this binary cannot parse was written by
         // a NEWER deploy — that is not proof of death. Never terminate on it
         // (Codex round 2: status_enum's Failed fallback would have).
-        assert_eq!(reconcile_action(Unparseable, false), Leave);
-        assert_eq!(reconcile_action(Unparseable, true), Leave);
+        assert_eq!(reconcile_action(Unparseable, false, false), Leave);
+        assert_eq!(reconcile_action(Unparseable, true, false), Leave);
         // Terminal session → the pod is a leak: terminate.
         assert_eq!(
-            reconcile_action(Known(SessionStatus::Completed), true),
+            reconcile_action(Known(SessionStatus::Completed), true, false),
             Terminate
         );
         assert_eq!(
-            reconcile_action(Known(SessionStatus::Cancelled), false),
+            reconcile_action(Known(SessionStatus::Cancelled), false, false),
             Terminate
         );
         // Winding down → the finalizer owns the pod (collection may be in
         // flight): never touch it here.
         assert_eq!(
-            reconcile_action(Known(SessionStatus::Cancelling), true),
+            reconcile_action(Known(SessionStatus::Cancelling), true, false),
             Leave
         );
         assert_eq!(
-            reconcile_action(Known(SessionStatus::Finalizing), false),
+            reconcile_action(Known(SessionStatus::Finalizing), false, false),
             Leave
         );
         // Active session without a handle → the M5 crash window: adopt.
         assert_eq!(
-            reconcile_action(Known(SessionStatus::Initializing), false),
+            reconcile_action(Known(SessionStatus::Initializing), false, false),
             Adopt
         );
         assert_eq!(
-            reconcile_action(Known(SessionStatus::Running), false),
+            reconcile_action(Known(SessionStatus::Running), false, false),
             Adopt
         );
         // Active session with its handle → healthy: leave.
-        assert_eq!(reconcile_action(Known(SessionStatus::Running), true), Leave);
         assert_eq!(
-            reconcile_action(Known(SessionStatus::AwaitingApproval), true),
+            reconcile_action(Known(SessionStatus::Running), true, false),
             Leave
+        );
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::AwaitingApproval), true, false),
+            Leave
+        );
+    }
+
+    /// A FRESH launch still provisioning is a live driver, not a crash: adopting
+    /// it would race `set_sandbox_handle` and ledger a false "control-plane
+    /// interruption" on every cold start. Past the grace the crash-window
+    /// healing is unchanged.
+    #[test]
+    fn reconcile_leaves_a_fresh_launch_alone_and_adopts_a_stale_one() {
+        use ReconcileAction::*;
+        use SessionLookup::*;
+        for st in [SessionStatus::Provisioning, SessionStatus::Initializing] {
+            assert_eq!(
+                reconcile_action(Known(st), false, true),
+                Leave,
+                "{st:?} fresh"
+            );
+            assert_eq!(
+                reconcile_action(Known(st), false, false),
+                Adopt,
+                "{st:?} stale"
+            );
+            // A handle already stored means healthy regardless of age.
+            assert_eq!(
+                reconcile_action(Known(st), true, true),
+                Leave,
+                "{st:?} handled"
+            );
+        }
+        // `running` without a handle is the crash window at any age: the
+        // handle is written BEFORE the transition to running.
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Running), false, true),
+            Adopt
+        );
+        // Freshness never rescues an orphan or a leak.
+        assert_eq!(reconcile_action(Missing, false, true), Terminate);
+        assert_eq!(
+            reconcile_action(Known(SessionStatus::Completed), false, true),
+            Terminate
         );
     }
 
@@ -1377,17 +1472,17 @@ mod tests {
         // it would keep unauthorized code alive, and `adopt_sandbox_handle`
         // refuses this status anyway, so the sweep would never converge.
         assert_eq!(
-            reconcile_action(Known(SessionStatus::AwaitingAuthorization), false),
+            reconcile_action(Known(SessionStatus::AwaitingAuthorization), false, false),
             Terminate
         );
         assert_eq!(
-            reconcile_action(Known(SessionStatus::AwaitingAuthorization), true),
+            reconcile_action(Known(SessionStatus::AwaitingAuthorization), true, false),
             Terminate
         );
         // Guard against passing by terminating everything: the ordinary
         // handle-less active session is still ADOPTED.
         assert_eq!(
-            reconcile_action(Known(SessionStatus::Running), false),
+            reconcile_action(Known(SessionStatus::Running), false, false),
             Adopt
         );
     }
