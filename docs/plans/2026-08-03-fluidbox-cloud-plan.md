@@ -1,6 +1,38 @@
-# Fluidbox Cloud — fully managed hosted platform (PLAN, rev 3)
+# Fluidbox Cloud — fully managed hosted platform (PLAN, rev 4)
 
-Status: **DRAFT — architecture conditionally approved by external review; P0 kill-switch proofs gate implementation.** Rev 3 incorporates the full external review of rev 2 (4 blockers + corrections) and the Core-vs-Cloud ownership model settled in follow-up discussion.
+Status: **rev 4 (2026-08-26) — split at the repository boundary; body below is the rev-3 historical record.**
+
+Rev 3 → rev 4 change ledger (owner decisions, 2026-08-26):
+
+- **The commercial and managed-service design moved to the private
+  `fluidbox-cloud` repository.** This repository keeps no billing-domain code,
+  schema, or design content; the dependency arrow is one-way (`fluidbox-cloud`
+  consumes fluidbox's public APIs and published artifacts; fluidbox never
+  knows the managed layer exists).
+- **The OSS-side authority is now
+  [`2026-08-26-cloud-boundary-design.md`](./2026-08-26-cloud-boundary-design.md)** —
+  the boundary contract, the upstream-gateway seam, the ranked capability
+  gaps, the M3 generic-capability interface specs, the rollout-gate
+  re-scoring, and the disposition of this plan's P0–P7 phases. That document
+  satisfies the OSS half of this plan's P0 design-doc deliverable; the
+  commercial half lives in the private repository.
+- **Substrate:** the EKS estate this revision describes was torn down
+  2026-08-15; the live deployment is GCP/GKE (`deploy/cloud/gcp/`,
+  `docs/hosted/gcp-*.md`). **Identity:** the per-org WorkOS Connect assumption
+  was disproven and re-decided as bring-your-own IdP per org, with Auth0 as
+  the operated default (see `2026-08-03-cloud-m1-decisions.md` and the
+  2026-08-25 evidence).
+- **Unchanged and still binding:** the ownership deciding test and rules
+  (below), zero core changes outside separately-approved generic
+  capabilities, and public self-serve gated on the quota-enforcement
+  capability set (boundary design §6(a)/(b)/(d)).
+
+The body below is retained verbatim as the rev-3 record. Where it conflicts
+with the change ledger above or the boundary design, the newer documents win.
+
+---
+
+Rev-3 status was: **DRAFT — architecture conditionally approved by external review; P0 kill-switch proofs gate implementation.** Rev 3 incorporates the full external review of rev 2 (4 blockers + corrections) and the Core-vs-Cloud ownership model settled in follow-up discussion.
 
 ## Context
 
@@ -73,7 +105,7 @@ Cloud API endpoints: `POST /signup/orgs`, `GET /signup/orgs/{slug}/status`, `GET
 
 ## Phases (each: `just check` + existing hermetic suites green + that phase's terraform apply + hand back)
 
-- **P0 — Guardrails + kill-switch proofs** *(first hand-back; implementation gated on these passing)*: design doc (`docs/plans/2026-08-03-fluidbox-cloud-design.md`, house §-style; embeds assessment, API inventory, ownership model, threat-model delta outline, cost model, M1–M4 map, rev-1 appendix). Guardrail IaC applied first: scoped IAM deploy role (retire root-key use; scoped `iam:PassRole`), **two budgets** (tag-filtered $50 fluidbox + account-wide kept as second circuit-breaker — user sets its number), CloudTrail/root-activity alarms, log retention, ECR/S3 lifecycle, Terraform state encrypted/versioned/locked with no secret values in state. **Proofs:** WorkOS Connect spike (nonce, PKCE, organization_id restriction, external_id, invitations) against Staging; dual-session login flow demonstrated against a local core through a dev Vercel deployment (cookie lands on the right host, dual logout works); Vercel SSE pass-through probe (duration cap measured; Last-Event-ID resume UX acceptable); cost model re-verified incl. IPv4 + ALB LCUs. *(Moot on this substrate, recorded as such: CloudFront-OAC/bearer collision, Lambda starvation, artifact payload limits, RunTask idempotency — Fargate/Lambda-core findings; oauth advisory lock already exists in core.)*
+- **P0 — Guardrails + kill-switch proofs** *(first hand-back; implementation gated on these passing)*: design doc (delivered 2026-08-26 as [`2026-08-26-cloud-boundary-design.md`](./2026-08-26-cloud-boundary-design.md) — the OSS half: assessment, API inventory, ownership/boundary, gate re-scoring; the commercial half lives in the private `fluidbox-cloud` repository). Guardrail IaC applied first: scoped IAM deploy role (retire root-key use; scoped `iam:PassRole`), **two budgets** (tag-filtered $50 fluidbox + account-wide kept as second circuit-breaker — user sets its number), CloudTrail/root-activity alarms, log retention, ECR/S3 lifecycle, Terraform state encrypted/versioned/locked with no secret values in state. **Proofs:** WorkOS Connect spike (nonce, PKCE, organization_id restriction, external_id, invitations) against Staging; dual-session login flow demonstrated against a local core through a dev Vercel deployment (cookie lands on the right host, dual logout works); Vercel SSE pass-through probe (duration cap measured; Last-Event-ID resume UX acceptable); cost model re-verified incl. IPv4 + ALB LCUs. *(Moot on this substrate, recorded as such: CloudFront-OAC/bearer collision, Lambda starvation, artifact payload limits, RunTask idempotency — Fargate/Lambda-core findings; oauth advisory lock already exists in core.)*
 - **P1 — Cloud scaffold + hermetic saga**: `crates/fluidbox-cloud` (axum + `lambda_http`), DDB tables per ownership model, SSM wiring, CI job, `scripts/cloud-e2e.sh` (identity-e2e style; dynamodb-local + Dex-as-AuthKit + fake WorkOS behind `FLUIDBOX_CLOUD_WORKOS_API_URL`); saga e2e vs LOCAL core: cross-tenant denial, duplicate-request no-dup, kill-mid-step resume, 409-adoption-refusal, sweeper-race (versioned transitions). Apply: skeleton + DDB live.
 - **P2 — EKS dev environment**: Terraform cluster + addons (encode the recipe: VPC CNI netpol standard mode, off us-east-1a, gp3, arm64/t4g, LiteLLM 2Gi; single t4g.medium + RWO PVC explicitly labeled dev/private-beta availability tier); `helm_release` of the unchanged chart (`web.enabled=false`); Pod Identity → KMS; ALB controller + chart Ingress; CloudFront + rotating origin header (direct-ALB requests refused — tested); Neon + LiteLLM DB. Prove on-cluster: replay run (`just demo`-style, no key), governance pause/approve smoke, **edge SSE long-stream + resume through CloudFront** (the P2 gate). Apply: core platform live.
 - **P3 — Live provisioning** (reordered after EKS per review — a deployed Lambda cannot call a laptop): saga against the deployed core + WorkOS Staging, per-org Connect apps, `needs_operator` drill. Apply: signup path live end-to-end.
