@@ -375,28 +375,21 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
 
         // Phase 2: the observation window, from the moment the pod has a node.
         let deadline = Instant::now() + Duration::from_secs(self.verify_timeout_secs.max(5));
-        // Carried out of the loop so a timeout can say WHICH half never
-        // converged — "unverified" with no detail is a support ticket.
-        let mut policy_state = "not created";
-        let mut endpoint_state = "no endpoint";
 
         loop {
+            // Both halves are (ok, state) for THIS poll, so a timeout reports
+            // what was true at the end — not the state of an earlier poll. The
+            // first cold-start failure said "awaiting operator validation" about
+            // a policy that had been Valid for 89 of its 90 seconds, because
+            // the state was only recorded on the non-success branches.
+            //
             // An offline run has no policy object, so only the identity half
             // applies: there is still a pod that must be a real endpoint under
             // the default-deny baseline.
-            let policy_ok = if granted.grant.grants_egress() {
+            let (policy_ok, policy_state) = if granted.grant.grants_egress() {
                 match self.cnps.get_opt(&name).await {
                     Ok(Some(obj)) => match Self::policy_is_valid(&obj) {
-                        Some(true) => {
-                            // Recorded, not just returned: a timeout on the OTHER
-                            // half must not report the state of a poll from
-                            // before the operator validated this one (the first
-                            // cold-start failure said "awaiting operator
-                            // validation" about a policy that had been Valid for
-                            // 89 of its 90 seconds).
-                            policy_state = "valid";
-                            true
-                        }
+                        Some(true) => (true, "valid"),
                         Some(false) => {
                             // The operator REJECTED it. Waiting cannot help, so
                             // fail immediately rather than burning the deadline.
@@ -406,15 +399,9 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
                                 granted.run_id
                             )));
                         }
-                        None => {
-                            policy_state = "accepted, awaiting operator validation";
-                            false
-                        }
+                        None => (false, "accepted, awaiting operator validation"),
                     },
-                    Ok(None) => {
-                        policy_state = "not created";
-                        false
-                    }
+                    Ok(None) => (false, "not created"),
                     Err(e) => {
                         return Err(NetworkPolicyError::Unverified(format!(
                             "reading the network policy for run {} failed: {e}",
@@ -423,26 +410,18 @@ impl NetworkPolicyProvider for CiliumNetworkEnforcer {
                     }
                 }
             } else {
-                policy_state = "n/a (offline)";
-                true
+                (true, "n/a (offline)")
             };
 
-            let identity_ok = match self.ceps.get_opt(&name).await {
+            let (identity_ok, endpoint_state) = match self.ceps.get_opt(&name).await {
                 Ok(Some(obj)) => match Self::endpoint_identity(&obj) {
                     Some(id) => {
-                        endpoint_state = "ready, identity assigned";
                         tracing::debug!(run_id = %granted.run_id, identity = id, "endpoint identity");
-                        true
+                        (true, "ready, identity assigned")
                     }
-                    None => {
-                        endpoint_state = "endpoint exists but is not ready / has no identity";
-                        false
-                    }
+                    None => (false, "endpoint exists but is not ready / has no identity"),
                 },
-                Ok(None) => {
-                    endpoint_state = "no endpoint";
-                    false
-                }
+                Ok(None) => (false, "no endpoint"),
                 Err(e) => {
                     return Err(NetworkPolicyError::Unverified(format!(
                         "reading the Cilium endpoint for run {} failed: {e}",
