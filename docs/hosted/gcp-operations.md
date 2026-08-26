@@ -154,7 +154,7 @@ kubectl -n fluidbox-sandboxes describe pod fluidbox-netpol-probe | sed -n '/^Eve
 |---|---|---|---|
 | `Unschedulable` | `NotTriggerScaleUp: … untolerated taint(s)` | The sandbox pool is at zero and the autoscaler's scale-up simulation refuses the pod because the pool template carries a taint it does not tolerate. On this cluster that is the Cilium startup taint, whose key **must** sit under `ignore-taint.cluster-autoscaler.kubernetes.io/` (the autoscaler ignores that prefix in the simulation). Check `gcloud container node-pools describe sandbox --format='value(config.taints[].key)'`. | Restore the prefix in `platform/gke.tf` (`local.cilium_agent_not_ready_taint_key`) and re-apply — **never** "fix" it by giving sandbox pods a toleration for the not-ready taint; that reopens the unmanaged-pod hole the taint closes. |
 | `Unschedulable` | pod Pending on a node that keeps the not-ready taint | The node was born with a taint key Cilium's operator is not configured to remove: the platform and app stacks disagree on `cilium_agent_not_ready_taint_key`. `kubectl -n kube-system get cm cilium-config -o jsonpath='{.data.agent-not-ready-taint-key}'` vs the pool template. | Re-apply the app stack with the key from `terraform -chdir=platform output -raw cilium_agent_not_ready_taint_key`; the operator lifts the taint from stuck nodes on its next pass. |
-| `Unschedulable` | `TriggeredScaleUp`, pod still Pending | Cold start from zero is legitimately in progress. Measured: autoscaler decision → node ≈30 s, Cilium prepares the node and lifts the taint ≈50 s, gate verified ≈90 s after the decision. The gate's deadline is 240 s and it retries 30 s after a miss, so even a slow cold start heals on the next attempt. | Wait one cycle. Persisting past ~6 min is one of the rows above. |
+| `Unschedulable` | `TriggeredScaleUp`, pod still Pending | Cold start from zero is legitimately in progress. Measured: autoscaler decision → node **31–107 s** (Spot varies), Cilium prepares the node and lifts the taint ≈50 s, gate verified ≈90 s after the node. The gate's deadline is 360 s (`PROBE_SCHEDULING_SLACK_SECS` was sized to a warm node until 2026-08-26) and it retries 30 s after a miss. | Wait one cycle. Persisting past ~8 min is one of the rows above. |
 | `NotEnforced` | probe `Failed`, exit 3 | The CNI is not dropping traffic. | Runs stay blocked by design; check Cilium agent health on the sandbox node. |
 
 #### Changing the startup taint key (or upgrading Cilium) {#cilium-taint-migration}
@@ -184,6 +184,24 @@ kubectl get nodes -o custom-columns='NAME:.metadata.name,TAINTS:.spec.taints[*].
 kubectl taint node <node> <old-key>-
 ```
 
+### Run fails: "network enforcement … was not verified within 90s" {#netgrant-verify-timeout}
+
+```
+provider error: network policy enforcement could not be verified: network
+enforcement for run <id> was not verified within 90s
+(policy: accepted, awaiting operator validation; endpoint: no endpoint)
+```
+
+`endpoint: no endpoint` after the full window means the pod never got a node:
+until 2026-08-26 the per-run verifier started its 90 s observation clock at
+policy creation, and on a scale-to-zero pool the first run after idle spent
+that whole window waiting for a node (measured: the run failed 19 s BEFORE its
+node existed). The verifier now waits for the pod to be SCHEDULED first,
+bounded by the provider's own provisioning wait (`FLUIDBOX_K8S_INIT_GRACE_SECS`,
+300 s), and only then runs the 90 s window; the failure text distinguishes
+"not scheduled within Ns" (read the autoscaler's event on the pod) from a
+datapath that never converged.
+
 ### Run fails: "key not allowed to access model" {#tenant-model-allowlist}
 
 ```
@@ -200,7 +218,7 @@ widened without rotating keys.
 | cause | fix |
 |---|---|
 | the model is genuinely not served here (e.g. any `gpt-5*` with no OpenAI key) | Change the agent's model, or enable the provider (README step 2) |
-| `llm.tenant.models` was widened but keys predate it | `POST /v1/admin/orgs/{slug}/llm-key/rotate` with the admin token — a key's allowlist is fixed at mint |
+| `llm.tenant.models` was widened but keys predate it | Nothing, usually: the server reconciles every tenant key against the configured allowlist (LiteLLM's `/key/info` is the source of truth) within ten minutes of a deploy and rotates the ones that drifted. To force it now: `scripts/cloud/gcp-rotate-llm-keys.sh [slug…]` |
 
 ### CrashLoopBackOff {#crashloop}
 

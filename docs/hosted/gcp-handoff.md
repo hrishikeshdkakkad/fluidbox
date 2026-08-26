@@ -70,7 +70,7 @@ Not included: Anthropic model spend (metered per run, capped per tenant at
 | `fluidbox-kms-static-kek` | Terraform | **UNRECOVERABLE** once any v2 sealed row exists |
 | `litellm-master-key`, `litellm-database-url` | Terraform | Rotate |
 | `anthropic-api-key` | out-of-band | Re-add from Anthropic |
-| `openai-api-key` | out-of-band, **no version yet** | Add from OpenAI to enable the codex harness (README step 2) |
+| `openai-api-key` | out-of-band via `gcp-secrets.sh` | Re-add from OpenAI; optional — the gateway runs without it |
 | `auth0-client-secret` | out-of-band backup | Re-read from Auth0 |
 
 All are CMEK-encrypted under `projects/fluidbox-506603/locations/us-central1/keyRings/fluidbox/cryptoKeys/secrets`
@@ -162,9 +162,10 @@ own registry at admin-gated `GET /v1/admin/metrics`.
    gateway has a `gpt-5*` route but nothing behind it, and the tenant allowlist
    is Claude-only. The catalog now reports codex `available: false` (hidden in
    the dashboard) and agent writes 422 instead of runs failing with a 403 at
-   the first model call. Enabling it: add the `openai-api-key` version, set
-   `litellm.openaiKeySecretKey` + the ExternalSecret entry + the GPT models in
-   `llm.tenant.models`, deploy, then rotate tenant keys.
+   the first model call. Enabling it is one command,
+   `scripts/cloud/gcp-secrets.sh --from-env-file .env` (or `OPENAI_API_KEY=…`):
+   the values already opt in, the key is optional to the gateway, and tenant
+   keys re-mint themselves under the widened allowlist.
 8. **`FLUIDBOX_TRUST_FORWARDED_FOR` is off**, so audit rows record the load
    balancer's address rather than the client's. Trusting it on a publicly
    reachable Ingress would let an attacker choose the identity that per-IP
