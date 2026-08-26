@@ -29,7 +29,8 @@ uniform access, public-access-prevented), the Workload Identity Federation pool
 
 **platform** — VPC `fluidbox` (nodes `10.10.0.0/20`, pods `10.20.0.0/14`,
 services `10.24.0.0/20`, Cloud SQL peering `10.30.0.0/16`); Cloud Router + NAT;
-GKE Standard, zonal, Dataplane V2, private nodes, `GKE_METADATA`, Shielded,
+GKE Standard, zonal, legacy datapath + self-managed upstream Cilium
+(`cilium_mode`), private nodes, `GKE_METADATA`, Shielded,
 image streaming, etcd CMEK; node pools `system` (1→3 × e2-standard-4, on-demand,
 `max_surge=1 max_unavailable=0`) and `sandbox` (0→3 × e2-standard-4, **Spot**,
 tainted); Cloud SQL Postgres 16 private-IP with PITR and two databases
@@ -137,15 +138,17 @@ own registry at admin-gated `GET /v1/admin/metrics`.
 5. **Auth0 is the `hrishi-test` tenant, JP region.** Standards-conformant and
    working, but dev-named. Moving to a production tenant is a dashboard action
    plus a re-run of `scripts/cloud/gcp-auth0.sh`.
-6. **Sandboxes are OFFLINE-ONLY; governed network grants are impossible here.**
-   GKE Dataplane V2 exposes Cilium's state CRDs but not its POLICY CRDs
-   (`CiliumClusterwideNetworkPolicy`, `CiliumEgressGatewayPolicy`), so
-   `networkGrants` cannot be enabled. Agents declaring `approved` or `public`
-   are refused with `422 this deployment cannot enforce network grants` - the
-   fail-closed design declining a grant it cannot enforce. Agents that declare
-   no network (or `offline`) work normally. Getting real governed egress means
-   a cluster without Dataplane V2 plus self-managed upstream Cilium.
-   See gcp-architecture.md §10.
+6. **The CNI is self-managed, which is the price of governed egress.**
+   Network grants ARE enabled (`enforcer: cilium`, resolved at boot). Reaching
+   that took a cluster rebuild onto legacy datapath plus upstream Cilium,
+   because GKE Dataplane V2 serves no NAMESPACED `CiliumNetworkPolicy` and the
+   per-run enforcer writes exactly that. The standing cost: GKE no longer
+   patches the CNI, node upgrades can undo its node configuration (the
+   `node.cilium.io/agent-not-ready` taint is what makes that survivable), and
+   Cilium upgrades are an operator task. `cilium_mode` must keep defaulting to
+   `upstream` in both stacks — a default naming the other mode plans a cluster
+   replacement or a CNI uninstall.
+   See gcp-architecture.md#network-grants.
 7. **The run queue is off.** Enabling `server.maxConcurrentRuns` switches the
    Deployment to `Recreate`; the sandbox `ResourceQuota` (12 pods) is the
    capacity backstop meanwhile.
