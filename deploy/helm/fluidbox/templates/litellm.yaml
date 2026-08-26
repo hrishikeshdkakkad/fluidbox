@@ -89,6 +89,10 @@ spec:
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.litellmMasterKey | quote }} } }
             - name: ANTHROPIC_API_KEY
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.litellm.anthropicKeySecretKey | quote }} } }
+            {{- if .Values.litellm.openaiKeySecretKey }}
+            - name: OPENAI_API_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.litellm.openaiKeySecretKey | quote }} } }
+            {{- end }}
             {{- if .Values.litellm.database.enabled }}
             {{- /* LiteLLM's OWN database, never fluidbox's: LiteLLM applies its
                    prisma schema to whatever it is handed. Required for
