@@ -66,6 +66,11 @@ locals {
   external_secrets = {
     "anthropic-api-key"   = "Anthropic key for the LiteLLM gateway. The control plane never holds it."
     "auth0-client-secret" = "OIDC client secret for the org IdP. Held by the control plane's own custody, not by the chart."
+    # Declared with NO version: the gateway only needs it for the codex
+    # harness, and until the owner adds one the chart must not reference it
+    # (an ExternalSecret entry pointing at a versionless secret fails the whole
+    # sync). README step 2 adds the version; production.yaml then opts in.
+    "openai-api-key" = "OpenAI key for the LiteLLM gateway (the codex harness). The control plane never holds it."
   }
 }
 

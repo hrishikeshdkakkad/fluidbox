@@ -312,6 +312,12 @@ litellm:
   image: ghcr.io/berriai/litellm:main-stable
   # Anthropic key for the gateway (from the existing Secret, referenced key).
   anthropicKeySecretKey: ANTHROPIC_API_KEY
+  # OpenAI key for the gateway, same shape. Empty = not injected, and the
+  # bundled model_list's "gpt-5*" route then has nothing behind it: the codex
+  # harness cannot be served. Set it to the Secret key that holds the OpenAI
+  # key (and, in llm.keyMode "tenant", add the GPT models to
+  # llm.tenant.models and rotate tenant keys) to enable codex.
+  openaiKeySecretKey: ""
   resources:
     requests: { cpu: "250m", memory: "512Mi" }
     limits: { cpu: "1", memory: "1Gi" }
