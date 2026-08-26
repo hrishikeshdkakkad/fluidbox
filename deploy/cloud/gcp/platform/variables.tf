@@ -189,9 +189,17 @@ variable "cilium_mode" {
     and node upgrades or reboots can undo Cilium's node configuration. The
     agent-not-ready taint below is what makes that survivable - pods are held off
     a node until Cilium has re-prepared it.
+
+    The DEFAULT is `upstream` because it is the only mode in which fluidbox's
+    network grants work at all - `dataplane_v2` is the cheaper-to-operate choice
+    only for a deployment that accepts offline-only sandboxes.
+
+    A DEFAULT THAT DISAGREES WITH STATE IS A LOADED GUN: datapath_provider is
+    ForceNew, so the next plan run with defaults is a cluster REPLACEMENT. This
+    default must always name the mode the live deployment actually runs.
   EOT
   type        = string
-  default     = "dataplane_v2"
+  default     = "upstream"
 
   validation {
     condition     = contains(["dataplane_v2", "upstream"], var.cilium_mode)
