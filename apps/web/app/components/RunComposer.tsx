@@ -771,7 +771,17 @@ export function RunComposer({
     if (agentChoice === "existing" && !selectedAgentName) return "Choose an agent or create one here.";
     if (agentChoice === "new" && !newAgentName.trim()) return "Give the new agent a name.";
     if (harnessesError) return "Reload the runtime catalog before continuing.";
-    if (harnessesLoading || harnesses.length === 0 || !model) return "Loading the runtime and model catalog…";
+    if (harnessesLoading || harnesses.length === 0) return "Loading the runtime and model catalog…";
+    // A harness seeded by a URL or a draft may be one this deployment cannot
+    // serve (an Anthropic-only gateway has no codex; the catalog says
+    // `available: false` and the picker shows it disabled). Its model list is
+    // empty, so without this the gate would read "Loading…" forever. Name the
+    // problem; the person picks another runtime.
+    const runtime = harnesses.find((h) => h.id === harness);
+    if (runtime && !runtime.available) {
+      return `The ${runtime.display_name} runtime is not available on this deployment.`;
+    }
+    if (!model) return "Loading the runtime and model catalog…";
     if (workspace.mode === "local" && !workspace.path.trim()) return "Enter the local workspace path.";
     if (workspace.mode === "git" && !(workspace.repository || workspace.cloneUrl.trim())) {
       return "Choose a repository or provide its public clone URL.";
@@ -779,7 +789,7 @@ export function RunComposer({
     return "";
   }, [
     agentOnly, mode, automationName, kind, cron, connection, eventConnectionsError, task, allowTask, agentsLoading, revisionLoading,
-    agentChoice, selectedAgentName, newAgentName, harnessesError, harnessesLoading, harnesses.length,
+    agentChoice, selectedAgentName, newAgentName, harnessesError, harnessesLoading, harnesses, harness,
     model, workspace,
   ]);
 
