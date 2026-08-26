@@ -13,6 +13,29 @@
 # traffic (netpol.requireEnforced), and DPv2 is Cilium - enforcing natively,
 # with no add-on to forget.
 
+# ── The Cilium startup taint ────────────────────────────────────────────────
+#
+# Under cilium_mode = "upstream" every node is born carrying this taint, and
+# Cilium's operator removes exactly this key once it has prepared the node. The
+# app stack feeds the SAME value to Cilium (`agentNotReadyTaintKey`) from the
+# output below - it is never retyped, because if the two ever disagree a new
+# node stays tainted NoExecute forever and the only symptom is the netpol probe
+# reporting Unschedulable.
+#
+# The prefix is load-bearing, not cosmetic. The cluster autoscaler decides a
+# scale-up by SIMULATING the pending pod against the pool's node template,
+# taints included. Sandbox pods must not tolerate the not-ready taint (that is
+# the whole point of it), so under the plain `node.cilium.io/agent-not-ready`
+# key the simulation always answered "does not fit" and a scale-to-zero pool
+# could never leave zero: every probe and every run sat Pending with
+# "1 node(s) had untolerated taint(s)". The autoscaler treats a key under
+# ignore-taint.cluster-autoscaler.kubernetes.io/ as startup-only and ignores it
+# in that simulation; nothing else reads the prefix. Cilium documents this key
+# for exactly this purpose.
+locals {
+  cilium_agent_not_ready_taint_key = "ignore-taint.cluster-autoscaler.kubernetes.io/cilium-agent-not-ready"
+}
+
 resource "google_container_cluster" "fluidbox" {
   provider = google-beta
 
@@ -241,7 +264,7 @@ resource "google_container_node_pool" "system" {
     dynamic "taint" {
       for_each = var.cilium_mode == "upstream" ? [1] : []
       content {
-        key    = "node.cilium.io/agent-not-ready"
+        key    = local.cilium_agent_not_ready_taint_key
         value  = "true"
         effect = "NO_EXECUTE"
       }
@@ -332,7 +355,7 @@ resource "google_container_node_pool" "sandbox" {
     dynamic "taint" {
       for_each = var.cilium_mode == "upstream" ? [1] : []
       content {
-        key    = "node.cilium.io/agent-not-ready"
+        key    = local.cilium_agent_not_ready_taint_key
         value  = "true"
         effect = "NO_EXECUTE"
       }

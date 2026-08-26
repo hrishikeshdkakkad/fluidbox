@@ -77,3 +77,8 @@ output "archive_endpoint" {
   description = "GCS XML API endpoint. Path-style addressing (the chart defaults to it whenever an endpoint is set)."
   value       = "https://storage.googleapis.com"
 }
+
+output "cilium_agent_not_ready_taint_key" {
+  description = "The startup taint the node pools carry. Pass it to the app stack's cilium_agent_not_ready_taint_key so Cilium removes the SAME key it finds."
+  value       = local.cilium_agent_not_ready_taint_key
+}

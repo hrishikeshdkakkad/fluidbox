@@ -108,7 +108,9 @@ printf '%s' "$ANTHROPIC_API_KEY" \
 cd ../app
 terraform init \
   -backend-config="bucket=fluidbox-506603-tfstate" -backend-config="prefix=app"
-terraform apply -var "external_secrets_sa=$(terraform -chdir=../platform output -raw external_secrets_service_account)"
+terraform apply \
+  -var "external_secrets_sa=$(terraform -chdir=../platform output -raw external_secrets_service_account)" \
+  -var "cilium_agent_not_ready_taint_key=$(terraform -chdir=../platform output -raw cilium_agent_not_ready_taint_key)"
 
 # 4. DNS: point the control-plane host at the reserved GCLB address (Route 53).
 scripts/cloud/gcp-dns.sh
