@@ -267,9 +267,58 @@ Verify on any cluster rather than assuming either way:
     kubectl get crd ciliumclusterwidenetworkpolicies.cilium.io # deny wall
 
 **What it costs.** GKE no longer manages the CNI. Node upgrades and reboots can
-undo Cilium's node configuration; the `node.cilium.io/agent-not-ready` taint on
-the node pools is what makes that survivable, holding pods off a node until
-Cilium has re-prepared it. Cilium version upgrades become an operator task.
+undo Cilium's node configuration; the startup taint on the node pools is what
+makes that survivable, holding pods off a node until Cilium has re-prepared it.
+Cilium version upgrades become an operator task.
+
+**The startup taint and the autoscaler — a coupling that bit on day one.**
+Every node is born tainted
+`ignore-taint.cluster-autoscaler.kubernetes.io/cilium-agent-not-ready=true:NoExecute`,
+and Cilium's operator removes exactly that key once the node is prepared
+(`agentNotReadyTaintKey`, fed from the platform output — never retyped). The
+prefix is the load-bearing part. The cluster autoscaler decides a scale-up by
+SIMULATING the pending pod against the pool's node template, taints included,
+and sandbox pods must not tolerate the not-ready taint (tolerating it is the
+unmanaged-pod hole it exists to close). Under Cilium's plain default key,
+`node.cilium.io/agent-not-ready`, the simulation therefore always answered
+"does not fit" and the scale-to-zero sandbox pool could never leave zero: the
+netpol probe sat Pending with `NotTriggerScaleUp: 1 node(s) had untolerated
+taint(s)`, the gate reported `Unschedulable`, and the dashboard answered
+`503 sandbox network isolation is not yet verified on this cluster`. Real runs
+carry the same placement and would have hung identically. The
+`ignore-taint.cluster-autoscaler.kubernetes.io/` prefix marks a taint as
+startup-only — ignored in that simulation, honoured by everything else — and is
+the key Cilium's own documentation prescribes for the purpose. Measured on this
+cluster, on the pipeline apply that shipped the fix (2026-08-26): autoscaler
+`TriggeredScaleUp` on the probe pod at 01:23:25Z → node born at 01:23:56Z
+(31 s) → taint lifted by the operator ≈47 s later → probe scheduled, image
+pulled in 0.8 s, and the gate logged *verified* at 01:24:55Z — **90 s from
+decision to admitted runs**, against a 240 s probe deadline and a 300 s run-pod
+grace. The seven probes before the fix had all ended `NotTriggerScaleUp`.
+
+If the two stacks ever disagree on the key, a NEW node stays tainted NoExecute
+forever and the only symptom is that same `Unschedulable`; see the runbook's
+triage entry. Changing the key is therefore an ORDERED migration: Cilium learns
+the new key first (app stack), the pool templates follow (platform stack), and
+any node born in between must be checked. That window is not theoretical — on
+2026-08-26 it caught a node. The Cilium upgrade itself rolls `cilium-operator`,
+whose two replicas carry a required anti-affinity, so on the two-node system
+pool the surge pod cannot co-locate and the autoscaler adds a THIRD node for
+the rollout (then scales it away ~10 min later). That surge node was born with
+the old key after the operator had stopped lifting it, and had to be untainted
+by hand once its Cilium agent was ready. Expect the surge on every Cilium
+upgrade; it is bounded and harmless once both stacks agree.
+
+The order is not a preference. GKE applies a node-pool taint change to the
+pool's EXISTING nodes immediately, and `NoExecute` means the taint manager
+evicts every pod without a toleration: the apply that shipped this fix evicted
+**27 pods** across `kube-system`, `external-secrets` and `fluidbox` in eight
+seconds. Because the operator was already lifting the new key, it cleared the
+taints within seconds and everything rescheduled — a ~30 s control-plane blip
+the pipeline's smoke stage never saw. Had the pools been changed FIRST, the same
+apply would have tainted every system node with a key nothing lifts and evicted
+the entire control plane with nowhere to go. Cilium first is the difference
+between a blip and an outage.
 
 **The committed default must keep naming reality.** `cilium_mode` defaults to
 `upstream` in BOTH stacks, and that is load-bearing rather than tidy: a default
