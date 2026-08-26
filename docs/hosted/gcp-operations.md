@@ -68,6 +68,26 @@ that stops writing them.
 Two migrations are documented as **stop-the-old-binary-first** (0018 and 0028).
 For those, a rollback is *not* safe and the procedure is forward-fix.
 
+**Exercised against production, 2026-08-26.** The workflow path was run for
+real, not reasoned about: `workflow_dispatch` with `rollback_to=2` produced
+Helm revision 4 (`Rollback to 2`) and, decisively, changed the RUNNING
+workload - the server Deployment moved to revision 2's image digest, the pod
+came back `1/1 Running`, and `api.platform.fluidzero.ai/v1/health` answered
+`200`. `images`, `apply`, `deploy`, `smoke` and `browser` all skipped, which is
+the rollback path correctly bypassing the deploy path. Rolling forward by
+re-running the deploy restored revision 5 on the original digest with smoke and
+browser green.
+
+Two things that run showed which are worth knowing before you need them:
+
+* A rollback ADDS a revision rather than rewinding to one. History reads
+  2, 3, 4 (`Rollback to 2`), 5 - so `rollback_to` always names the revision you
+  want the CONTENT of, never the number you expect to land on.
+* The deployment is single-replica with `strategy: Recreate` (see the
+  `archiveStore` note), so a rollback is a brief hard interruption, not a
+  drain. Budget for tens of seconds of 5xx, and do not start one during a
+  window where that matters.
+
 ## Triage
 
 ### `REFUSING TO BOOT` {#refusing-to-boot}
