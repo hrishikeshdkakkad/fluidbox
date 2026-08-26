@@ -150,10 +150,20 @@ jobs:
   # ── Terraform plan ────────────────────────────────────────────────────────
   plan:
     needs: [changes, verify]
-    if: needs.changes.outputs.infra == 'true'
+    # Pull requests plan only when they touch infrastructure. Pushes to main
+    # (and manual deploys) plan ALWAYS: a plan is idempotent and cheap, and
+    # "No changes" is a perfectly good answer. The path filter used to gate
+    # this too, which lost work in a way nothing reported - when the deploy of
+    # a commit was cancelled before its apply ran, the NEXT push's diff base
+    # had moved past that commit, its infrastructure change was classified as
+    # "no infra", and the apply it was owed never happened.
+    if: github.event_name != 'pull_request' || needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     outputs:
       destructive: ${{ steps.inspect.outputs.destructive }}
+      # "2" = the plan contains changes (-detailed-exitcode). Apply gates on
+      # THIS, not on the path filter, so an owed apply is never skipped.
+      exit: ${{ steps.plan.outputs.exit }}
     steps:
       - uses: actions/checkout@v7
       - uses: google-github-actions/auth@v2
@@ -223,7 +233,9 @@ jobs:
 
   apply:
     needs: [changes, plan]
-    if: github.event_name == 'push' && needs.changes.outputs.infra == 'true' && inputs.rollback_to == ''
+    # Apply whenever the REVIEWED plan has changes - on a push or a manual
+    # deploy, never on a pull request (the planner identity cannot write).
+    if: github.event_name != 'pull_request' && needs.plan.outputs.exit == '2' && inputs.rollback_to == ''
     runs-on: ubuntu-latest
     environment: Production
     steps:
