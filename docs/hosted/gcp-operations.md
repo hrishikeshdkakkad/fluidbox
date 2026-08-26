@@ -163,6 +163,24 @@ kubectl get nodes -o custom-columns='NAME:.metadata.name,TAINTS:.spec.taints[*].
 kubectl taint node <node> <old-key>-
 ```
 
+### Run fails: "key not allowed to access model" {#tenant-model-allowlist}
+
+```
+error: unexpected status 403 Forbidden: key not allowed to access model.
+       This key can only access models=[...]. Tried to access <model>
+```
+
+The per-tenant LiteLLM key was minted with `llm.tenant.models` as its
+allowlist and the run asked for a model outside it. Since 2026-08-26 the
+catalog and agent writes are narrowed to that list, so this now only happens
+for an agent created BEFORE the list was narrowed, or after the list was
+widened without rotating keys.
+
+| cause | fix |
+|---|---|
+| the model is genuinely not served here (e.g. any `gpt-5*` with no OpenAI key) | Change the agent's model, or enable the provider (README step 2) |
+| `llm.tenant.models` was widened but keys predate it | `POST /v1/admin/orgs/{slug}/llm-key/rotate` with the admin token — a key's allowlist is fixed at mint |
+
 ### CrashLoopBackOff {#crashloop}
 
 ```
