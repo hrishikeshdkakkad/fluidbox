@@ -66,6 +66,24 @@ const FINALIZE_CLAIM_STALE_SECS: i64 = 420;
 /// workspace never waits).
 const PROVISION_SETTLE_SECS: i64 = 120;
 
+/// Whether a handle-less session's provisioning might still be in flight — the
+/// only reason collection waits out `PROVISION_SETTLE_SECS` instead of asking
+/// the provider straight away.
+///
+/// A `failed` intent never qualifies. Only two callers record one: the run
+/// driver, from its own error path — so provisioning is over, and if it left a
+/// pod behind the provider's truth (`list_managed`) finds it immediately — and
+/// the heartbeat watchdog, whose session was running and therefore has a
+/// handle. Waiting here used to cost every provisioning failure two minutes in
+/// `finalizing` (visible on the timeline) for a race that cannot happen.
+fn provisioning_may_be_in_flight(
+    outcome: &str,
+    intent_created: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    outcome != "failed" && now < intent_created + chrono::Duration::seconds(PROVISION_SETTLE_SECS)
+}
+
 /// Terminal artifact collection is bounded: a hostile or huge worktree can
 /// waste the cap, never wedge `finalizing`.
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -923,8 +941,11 @@ async fn collect_and_terminalize(
             let handle = match session_handle_state(&session) {
                 StoredHandle::Handle(h) => Some(h),
                 StoredHandle::None
-                    if chrono::Utc::now()
-                        < intent.created_at + chrono::Duration::seconds(PROVISION_SETTLE_SECS) =>
+                    if provisioning_may_be_in_flight(
+                        &intent.outcome,
+                        intent.created_at,
+                        chrono::Utc::now(),
+                    ) =>
                 {
                     tracing::info!(
                         session_id = %id,
@@ -2426,6 +2447,29 @@ fn uuid_token() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A failed intent with no handle is the driver's own provisioning failure:
+    /// nothing is in flight, so collection must consult the provider at once
+    /// instead of waiting out the settle window.
+    #[test]
+    fn a_failed_intent_never_waits_for_provisioning_to_settle() {
+        let t0 = chrono::Utc::now();
+        let early = t0 + chrono::Duration::seconds(1);
+        let late = t0 + chrono::Duration::seconds(PROVISION_SETTLE_SECS + 1);
+        assert!(!provisioning_may_be_in_flight("failed", t0, early));
+        assert!(!provisioning_may_be_in_flight("failed", t0, late));
+        // Every other outcome keeps the bounded wait: a cancel can genuinely
+        // race an in-flight provision.
+        for o in ["completed", "cancelled", "budget_exceeded"] {
+            assert!(
+                provisioning_may_be_in_flight(o, t0, early),
+                "{o} inside the window"
+            );
+            assert!(
+                !provisioning_may_be_in_flight(o, t0, late),
+                "{o} past the window"
+            );
+        }
+    }
     use super::*;
     use fluidbox_core::state::SessionStatus::*;
 
