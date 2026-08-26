@@ -192,6 +192,26 @@ variant. All three are wired, and the chart now **refuses to render** any
 combination that is missing one — a control plane where no run can reach a model
 is not a degraded deployment, it is a non-functional one.
 
+**The tenant allowlist is the catalog.** Each per-tenant LiteLLM key is minted
+with `llm.tenant.models` as its model allowlist, and LiteLLM refuses anything
+else at the key check — a `403 key not allowed to access model`, which lands
+*after* the sandbox was provisioned and the run is already `running`. So
+`GET /v1/harnesses` and every agent write are narrowed to the same list: a
+model outside it is a clean `422` before anything is spent, and a harness with
+no servable model is reported `available: false`, which the dashboard hides.
+The first codex run on this deployment failed exactly that way on 2026-08-26
+(`gpt-5.4-mini` against a Claude-only allowlist) — the catalog now says so
+up front. Widening the list is not enough on its own: existing keys were
+minted with the old list, so `POST /v1/admin/orgs/{slug}/llm-key/rotate`
+after the deploy.
+
+**OpenAI is optional and not provisioned.** The gateway routes `gpt-5*` to
+`OPENAI_API_KEY`, but no such secret exists here: `openai-api-key` is declared
+in Secret Manager with **no version** (an ExternalSecret entry pointing at a
+versionless secret fails the whole sync, so the chart references it only once
+`litellm.openaiKeySecretKey` is set). Enabling codex is README step 2: add the
+version, opt in, widen the allowlist, rotate.
+
 ## 8. Capacity and cost (lean tier)
 
 | line | configuration | est. USD/month |
