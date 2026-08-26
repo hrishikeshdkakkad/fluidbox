@@ -70,6 +70,7 @@ Not included: Anthropic model spend (metered per run, capped per tenant at
 | `fluidbox-kms-static-kek` | Terraform | **UNRECOVERABLE** once any v2 sealed row exists |
 | `litellm-master-key`, `litellm-database-url` | Terraform | Rotate |
 | `anthropic-api-key` | out-of-band | Re-add from Anthropic |
+| `openai-api-key` | out-of-band, **no version yet** | Add from OpenAI to enable the codex harness (README step 2) |
 | `auth0-client-secret` | out-of-band backup | Re-read from Auth0 |
 
 All are CMEK-encrypted under `projects/fluidbox-506603/locations/us-central1/keyRings/fluidbox/cryptoKeys/secrets`
@@ -157,6 +158,13 @@ own registry at admin-gated `GET /v1/admin/metrics`.
 7. **The run queue is off.** Enabling `server.maxConcurrentRuns` switches the
    Deployment to `Recreate`; the sandbox `ResourceQuota` (12 pods) is the
    capacity backstop meanwhile.
+9. **The codex harness is unavailable until an OpenAI key is added.** The
+   gateway has a `gpt-5*` route but nothing behind it, and the tenant allowlist
+   is Claude-only. The catalog now reports codex `available: false` (hidden in
+   the dashboard) and agent writes 422 instead of runs failing with a 403 at
+   the first model call. Enabling it: add the `openai-api-key` version, set
+   `litellm.openaiKeySecretKey` + the ExternalSecret entry + the GPT models in
+   `llm.tenant.models`, deploy, then rotate tenant keys.
 8. **`FLUIDBOX_TRUST_FORWARDED_FOR` is off**, so audit rows record the load
    balancer's address rather than the client's. Trusting it on a publicly
    reachable Ingress would let an attacker choose the identity that per-IP
