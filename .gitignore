@@ -60,3 +60,7 @@ deploy/cloud/**/plan.json
 # Vercel CLI local project link (created by `vercel pull` at the repo root,
 # because the project rootDirectory is apps/web and the CLI must run from here)
 .vercel/
+
+# Playwright output - artifacts, never sources.
+tests/browser/test-results/
+tests/browser/playwright-report/
