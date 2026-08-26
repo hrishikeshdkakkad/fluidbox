@@ -202,6 +202,19 @@ bounded by the provider's own provisioning wait (`FLUIDBOX_K8S_INIT_GRACE_SECS`,
 "not scheduled within Ns" (read the autoscaler's event on the pod) from a
 datapath that never converged.
 
+A GKE alert reading **"Cannot schedule pods: node(s) were unschedulable"** on
+a sandbox pod is the same cold start seen from the other side: the autoscaler
+CORDONS an empty sandbox node about ten minutes after it idles, and a run that
+arrives in the minute before the node is gone cannot use it (`1 node(s) were
+unschedulable`). The autoscaler orders a new node in the same breath
+(`TriggeredScaleUp` on the pod); the run simply waits ~2 minutes for it. It
+was fatal only under the old 90 s clock.
+
+A run that fails AT provisioning now lands `failed` immediately. If one ever
+sits in `finalizing` logging *"artifact collection deferred … provisioning
+may be in flight"*, that is the 120 s settle window for a finalize that races
+an in-flight provision — a cancel, never a driver-reported failure.
+
 ### Run fails: "key not allowed to access model" {#tenant-model-allowlist}
 
 ```
