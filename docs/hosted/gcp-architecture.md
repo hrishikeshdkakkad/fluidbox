@@ -201,16 +201,22 @@ model outside it is a clean `422` before anything is spent, and a harness with
 no servable model is reported `available: false`, which the dashboard hides.
 The first codex run on this deployment failed exactly that way on 2026-08-26
 (`gpt-5.4-mini` against a Claude-only allowlist) — the catalog now says so
-up front. Widening the list is not enough on its own: existing keys were
-minted with the old list, so `POST /v1/admin/orgs/{slug}/llm-key/rotate`
-after the deploy.
+up front. Widening the list is enough: a key's allowlist is fixed at mint, so
+the server reconciles every tenant key against the configured list (asking
+LiteLLM's `/key/info` what each was minted with) and rotates the drifted ones —
+within ten minutes of a deploy, at most once per tenant per hour, so a
+comparison mistake can never become a rotation storm.
 
-**OpenAI is optional and not provisioned.** The gateway routes `gpt-5*` to
-`OPENAI_API_KEY`, but no such secret exists here: `openai-api-key` is declared
-in Secret Manager with **no version** (an ExternalSecret entry pointing at a
-versionless secret fails the whole sync, so the chart references it only once
-`litellm.openaiKeySecretKey` is set). Enabling codex is README step 2: add the
-version, opt in, widen the allowlist, rotate.
+**OpenAI is optional, and optional means the deployment runs without it.** The
+gateway routes `gpt-5*` to `OPENAI_API_KEY`. That key comes from a SECOND
+ExternalSecret (`externalSecrets.optionalData` → Secret
+`fluidbox-secrets-optional`): ESO fails a whole object when one remote key is
+unreadable, so a not-yet-provided key listed next to `DATABASE_URL` would take
+the control plane's credentials down with it. Isolated, a missing version fails
+only that sync, the gateway reads the key as `optional: true` and starts
+without it, and `scripts/cloud/gcp-secrets.sh` adds the version, syncs, and
+restarts the gateway whenever the operator has the key — before or after the
+deploy, in any order.
 
 ## 8. Capacity and cost (lean tier)
 
