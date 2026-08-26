@@ -90,8 +90,11 @@ spec:
             - name: ANTHROPIC_API_KEY
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.litellm.anthropicKeySecretKey | quote }} } }
             {{- if .Values.litellm.openaiKeySecretKey }}
+            {{- /* optional: an absent key means "OpenAI not enabled", which is a
+                   valid state the gateway must start in. Adding the key later
+                   needs a restart of this Deployment (env is read at start). */}}
             - name: OPENAI_API_KEY
-              valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.litellm.openaiKeySecretKey | quote }} } }
+              valueFrom: { secretKeyRef: { name: {{ .Values.litellm.openaiKeySecretName | default .Values.existingSecret | quote }}, key: {{ .Values.litellm.openaiKeySecretKey | quote }}, optional: true } }
             {{- end }}
             {{- if .Values.litellm.database.enabled }}
             {{- /* LiteLLM's OWN database, never fluidbox's: LiteLLM applies its
