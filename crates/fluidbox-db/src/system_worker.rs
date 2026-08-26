@@ -22,7 +22,10 @@
 //!     ([`sweep_expired_llm_reservations`], Gap 14 — convert a crashed booking into
 //!     a conservative `usage_entries` row and CAS it to `charged`), the
 //!     restart-recoverable finalize
-//!     driver, the managed-sandbox reconciler, and the delivery worker
+//!     driver, the managed-sandbox reconciler, the tenant LLM-key allowlist
+//!     reconciler ([`tenants_with_llm_keys`] — which tenants hold a minted key;
+//!     each rotation is then the tenant-scoped `rotate_tenant_llm_key`), and
+//!     the delivery worker
 //!     ([`claim_due_deliveries`] — Phase E: the scan now STAMPS a per-row claim
 //!     under `for update skip locked` so replicas take disjoint sets), and the
 //!     capacity dispatcher's four ([`dispatch_claim`] — the SERIALIZED
@@ -350,6 +353,20 @@ pub async fn pending_finalizations(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
     let mut tx = crate::worker_tx(pool).await?;
     let rows: Vec<(Uuid,)> =
         sqlx::query_as("select session_id from session_finalizations order by created_at asc")
+            .fetch_all(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Every tenant that holds a minted LiteLLM virtual key. The allowlist
+/// reconciler walks these and re-mints any whose allowlist drifted from
+/// `FLUIDBOX_LLM_TENANT_MODELS`; the rotation itself is the tenant-scoped
+/// `rotate_tenant_llm_key`, so this is a scan of ids and nothing more.
+pub async fn tenants_with_llm_keys(pool: &PgPool) -> sqlx::Result<Vec<Uuid>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let rows: Vec<(Uuid,)> =
+        sqlx::query_as("select tenant_id from tenant_llm_keys order by tenant_id")
             .fetch_all(&mut *tx)
             .await?;
     tx.commit().await?;

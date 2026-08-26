@@ -904,6 +904,62 @@ pub async fn rotate_tenant_key(state: &AppState, tenant_id: Uuid) -> ApiResult<(
     Ok(())
 }
 
+/// The model allowlist LiteLLM holds for a key (`GET /key/info`), or `None`
+/// when LiteLLM no longer knows the key — the reactive recovery owns that case,
+/// not the reconciler. Master-key bearer, like every admin-plane call here.
+pub async fn key_models_at_litellm(state: &AppState, key: &str) -> ApiResult<Option<Vec<String>>> {
+    // reqwest 0.13 gates `.query()` behind a feature this crate does not
+    // enable; the url crate it re-exports encodes the parameter just as well.
+    let base = format!("{}/key/info", state.cfg.llm_admin_url.trim_end_matches('/'));
+    let url = reqwest::Url::parse_with_params(&base, &[("key", key)])
+        .map_err(|e| ApiError::Upstream(format!("litellm /key/info url: {e}")))?;
+    let resp = state
+        .http
+        .get(url)
+        .timeout(HTTP_TIMEOUT)
+        .header(
+            "authorization",
+            format!("Bearer {}", state.cfg.llm_upstream_key),
+        )
+        .send()
+        .await
+        .map_err(|e| ApiError::Upstream(format!("litellm /key/info request failed: {e}")))?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(ApiError::Upstream(format!(
+            "litellm /key/info returned {status}"
+        )));
+    }
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Upstream(format!("litellm /key/info response parse: {e}")))?;
+    let models = v
+        .get("info")
+        .and_then(|i| i.get("models"))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(models))
+}
+
+/// Whether a key's minted allowlist differs from the configured one — compared
+/// as SETS, so order and duplicates are not drift. An empty configured list is
+/// "no allowlist", which LiteLLM records as an empty `models` too.
+pub fn allowlist_drifted(minted: &[String], configured: &[String]) -> bool {
+    let a: std::collections::BTreeSet<&str> = minted.iter().map(String::as_str).collect();
+    let b: std::collections::BTreeSet<&str> = configured.iter().map(String::as_str).collect();
+    a != b
+}
+
 /// Drop a tenant's cached virtual key so the next use re-reads the sealed row.
 /// Used by the recovery path when a concurrent writer won the compare-and-swap
 /// (our cached value is then provably stale), and available as the standalone
@@ -934,6 +990,23 @@ async fn evict_rejected_key(state: &AppState, tenant_id: Uuid, rejected: &str) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn allowlist_drift_is_set_equality() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(
+            !allowlist_drifted(&s(&["a", "b"]), &s(&["b", "a"])),
+            "order"
+        );
+        assert!(
+            !allowlist_drifted(&s(&["a", "a", "b"]), &s(&["a", "b"])),
+            "duplicates"
+        );
+        assert!(allowlist_drifted(&s(&["a"]), &s(&["a", "b"])), "widened");
+        assert!(allowlist_drifted(&s(&["a", "b"]), &s(&["a"])), "narrowed");
+        assert!(!allowlist_drifted(&[], &[]), "no allowlist either side");
+        assert!(allowlist_drifted(&[], &s(&["a"])), "allowlist introduced");
+    }
+
     use super::*;
 
     #[test]
