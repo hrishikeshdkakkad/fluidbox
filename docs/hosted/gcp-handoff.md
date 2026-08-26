@@ -32,7 +32,7 @@ services `10.24.0.0/20`, Cloud SQL peering `10.30.0.0/16`); Cloud Router + NAT;
 GKE Standard, zonal, legacy datapath + self-managed upstream Cilium
 (`cilium_mode`), private nodes, `GKE_METADATA`, Shielded,
 image streaming, etcd CMEK; node pools `system` (1→3 × e2-standard-4, on-demand,
-`max_surge=1 max_unavailable=0`) and `sandbox` (0→3 × e2-standard-4, **Spot**,
+`max_surge=1 max_unavailable=0`) and `sandbox` (1→3 × e2-standard-4, **on-demand**,
 tainted); Cloud SQL Postgres 16 private-IP with PITR and two databases
 (`fluidbox`, `litellm`); Artifact Registry `fluidbox` with immutable tags; Cloud
 KMS keyring with `gke-etcd` and `secrets`; eight Secret Manager secrets under
@@ -48,14 +48,16 @@ namespace (Pod Security `restricted`).
 
 ## 3. Cost
 
-Idle baseline **≈ $180–190/month**. Lines and the reasoning are in
+Idle baseline **≈ $280–290/month**. Lines and the reasoning are in
 [`gcp-architecture.md` §8](./gcp-architecture.md). Two things dominate and both
-are deliberate: one always-on `e2-standard-4` (~$98) and Cloud NAT (~$32). The
+are deliberate: one always-on system `e2-standard-4` (~$98), one always-on
+on-demand sandbox `e2-standard-4` (~$98, chosen 2026-08-26 over scale-to-zero
+so a run never waits for a node) and Cloud NAT (~$32). The
 GKE management fee is **$0** because a single zonal cluster is exactly cancelled
 by the free tier's $74.40 credit.
 
-The sandbox pool costs nothing while idle. Burst is about **$0.04/hour** per
-Spot node.
+The sandbox pool keeps one on-demand node; each extra node is about **$0.134/hour** while
+it runs.
 
 Not included: Anthropic model spend (metered per run, capped per tenant at
 `$25 / 30d` by `llm.tenant.maxBudget`) and Vercel.
