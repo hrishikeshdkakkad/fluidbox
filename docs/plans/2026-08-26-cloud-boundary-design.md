@@ -37,6 +37,25 @@ the two so that both stay honest:
   managed layer reads the ledger and the API; it is never consulted inside a
   run-time decision path, and a stale external mapping never grants access.
 
+The right analogy is PostgreSQL and a managed database service: PostgreSQL is
+complete and independently useful, knows nothing about any particular
+operator's customers, and any company can operate it as a service. fluidbox
+relates to its managed operators — ours included — exactly like that: the
+managed service is a deployment and operating model *around* fluidbox, never
+a mode *inside* it, and it automates only the same public capabilities
+available to every operator. Two clarifications make the rule precise:
+
+1. **One-directional describes knowledge, authority, and product
+   dependency — not network packets.** Responses flow back, and fluidbox must
+   call *some* operator-configured model upstream (§4). That is a replaceable
+   data-plane dependency, not knowledge of who operates it.
+2. **The forbidden direction is decisions.** fluidbox never asks an external
+   control plane whether a run may start, what limits a tenant should have,
+   or to record anything on its behalf. An operator expresses decisions *to*
+   fluidbox through its public admin surfaces — limits, admission state,
+   suspension — and fluidbox's own machinery enforces them, without knowing
+   or caring why the operator decided.
+
 What this document contains: the current-substrate assessment (§2), the exact
 API surface an external management layer consumes plus a proposed stability
 posture (§3), the upstream-gateway seam and its conformance surface (§4), the
@@ -114,7 +133,13 @@ Two structural facts matter for anything managing this estate from outside:
 - **Run facts (public plane, per-tenant credential required):**
   `GET /v1/sessions/{id}`, `GET /v1/sessions/{id}/cost`,
   `GET /v1/sessions/{id}/events`, artifacts; plus the signed result webhook
-  (`x-fluidbox-delivery`-deduplicated) pushed per subscription.
+  (`x-fluidbox-delivery`-deduplicated) pushed per subscription. The webhook
+  is a per-subscription, opt-in delivery available to every operator — an
+  external layer should treat it as a latency optimization and stay correct
+  by polling the read surfaces; §6(c)'s export is deliberately the
+  poll-shaped source for cross-tenant reconciliation, consumable with the
+  operator token alone. fluidbox has no required outbound callback to any
+  management layer, and must never grow one.
 - **Deployment artifacts:** the GHCR images and the OCI Helm chart, pinned by
   digest.
 
@@ -207,6 +232,16 @@ own gateway, using the tenant identity that already rides key minting. Core
 neither knows nor cares what the upstream does — which is precisely invariant
 4 doing its job.
 
+The seam is deliberately anonymous in both directions, and must stay so: an
+interposed gateway learns the technical tenant only from the existing generic
+key metadata (`metadata.tenant_id`, sent identically to any upstream), and
+fluidbox requires nothing operator-specific of its upstream — no proprietary
+headers or body fields, no operator SDK inside fluidbox, no calls from
+fluidbox to any operator-side API beyond this conformance surface. Whatever
+an upstream does with a request — route it, audit it, account for it, refuse
+it — is its operator's business; fluidbox treats any non-2xx as an ordinary
+upstream refusal and records it as such on the run timeline.
+
 ## 5. Ranked capability gaps (full API audit, verified at `61838d8`)
 
 Ranked by how hard they block external management of a multi-org deployment.
@@ -285,7 +320,13 @@ in `PUT/GET /v1/admin/orgs/{slug}/limits` (operator plane), values readable
 by admins in the org. *Test:* a self-hosted operator wants per-team caps, and
 wants to drain a team's runs before a maintenance window, during an
 incident, or when decommissioning a tenant — pause new work, let existing
-work finish; holds with no external layer. → Core. *Distinct from (d):*
+work finish; holds with no external layer. → Core. Core may record an
+operator-supplied free-text reason for audit, but semantics never branch on
+it: a pause is a pause, whatever the operator's motive — maintenance, an
+incident, capacity protection, decommissioning, or reasons entirely their
+own. fluidbox's understanding is only "the operator asked me to pause new
+work; I preserve running work and stop dispatching queued work."
+*Distinct from (d):*
 suspend locks the org out entirely; admission pause leaves the org fully
 usable and running work alive — it only closes the dispatch gate.
 *Unblocks:* fair multi-org capacity; the public-launch quota gate.
