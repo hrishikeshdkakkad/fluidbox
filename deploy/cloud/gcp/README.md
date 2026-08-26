@@ -107,6 +107,9 @@ terraform apply
 #    without it (the key is read as optional; the catalog hides codex meanwhile).
 scripts/cloud/gcp-secrets.sh --from-env-file .env      # or: OPENAI_API_KEY=... scripts/cloud/gcp-secrets.sh
 scripts/cloud/gcp-secrets.sh --prompt                  # or paste, with hidden input
+#    A value that differs from a version already in place is a ROTATION and is
+#    refused unless you pass --rotate - a dotenv can carry a different key than
+#    the one production runs on.
 
 # 3. Cluster prerequisites.
 cd ../app
