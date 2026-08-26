@@ -179,7 +179,7 @@ widened without rotating keys.
 | cause | fix |
 |---|---|
 | the model is genuinely not served here (e.g. any `gpt-5*` with no OpenAI key) | Change the agent's model, or enable the provider (README step 2) |
-| `llm.tenant.models` was widened but keys predate it | `POST /v1/admin/orgs/{slug}/llm-key/rotate` with the admin token — a key's allowlist is fixed at mint |
+| `llm.tenant.models` was widened but keys predate it | `scripts/cloud/gcp-rotate-llm-keys.sh [slug…]` (wraps `POST /v1/admin/orgs/{slug}/llm-key/rotate`; reads the admin token from Secret Manager) — a key's allowlist is fixed at mint |
 
 ### CrashLoopBackOff {#crashloop}
 
