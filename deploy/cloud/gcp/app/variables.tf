@@ -70,3 +70,15 @@ variable "cilium_chart_version" {
   type        = string
   default     = "1.18.1"
 }
+
+variable "cilium_agent_not_ready_taint_key" {
+  description = <<-EOT
+    The startup taint every node is born with (platform stack output
+    cilium_agent_not_ready_taint_key). Cilium's operator removes exactly this
+    key once a node is prepared. Deliberately no default: it is fed from the
+    platform output the way external_secrets_sa is, because a retyped value
+    that drifts leaves every NEW node tainted NoExecute forever, with the netpol
+    probe's "Unschedulable" as the only symptom.
+  EOT
+  type        = string
+}
