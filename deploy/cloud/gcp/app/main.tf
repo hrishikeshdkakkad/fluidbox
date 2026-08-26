@@ -2,7 +2,8 @@
 #
 # Installed here rather than by the fluidbox chart because it is CLUSTER
 # infrastructure: it owns the CNI, every other workload depends on it, and the
-# nodes stay tainted `node.cilium.io/agent-not-ready` until it removes the taint.
+# nodes stay tainted (`agentNotReadyTaintKey`, fed from the platform stack) until
+# it removes the taint.
 # Nothing else can schedule before this succeeds.
 #
 # Why at all: GKE Dataplane V2 exposes only CiliumClusterwideNetworkPolicy,
@@ -55,6 +56,14 @@ resource "helm_release" "cilium" {
   set {
     name  = "ipv4NativeRoutingCIDR"
     value = var.pods_cidr
+  }
+  # The key the operator removes once a node is prepared. Must be the key the
+  # node pools are born with - fed from the platform output, never retyped -
+  # and must carry the cluster-autoscaler ignore-taint prefix, or a
+  # scale-to-zero pool can never scale up (see platform/gke.tf).
+  set {
+    name  = "agentNotReadyTaintKey"
+    value = var.cilium_agent_not_ready_taint_key
   }
 
   # NOT atomic: a rollback here would uninstall the CNI from a running cluster,
