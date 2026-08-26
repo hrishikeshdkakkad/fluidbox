@@ -173,6 +173,14 @@ resource "kubernetes_namespace_v1" "fluidbox" {
     labels = {
       "app.kubernetes.io/name"       = "fluidbox"
       "app.kubernetes.io/managed-by" = "terraform"
+      # Helm server-side-applies this label to the release namespace as its own
+      # bookkeeping - it is not in the chart. Undeclared, it made every app-stack
+      # plan a permanent one-line diff that Terraform removed and the next helm
+      # upgrade restored. Declaring it ends the tug-of-war between two field
+      # managers so a NON-empty plan here means real drift. Nothing selects on
+      # it: every namespaceSelector uses kubernetes.io/metadata.name, which
+      # Kubernetes maintains and no one can remove.
+      "name" = var.namespace
       # Pod Security Admission. The control plane is an ordinary workload:
       # non-root, no privilege escalation, all capabilities dropped.
       "pod-security.kubernetes.io/enforce" = "restricted"
