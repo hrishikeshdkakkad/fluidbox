@@ -12,14 +12,14 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@workos-inc/authkit-nextjs": "^4.3.1",
+    "@workos-inc/authkit-nextjs": "^4.4.0",
     "@workos-inc/node": "^10.9.0",
-    "lucide-react": "^1.24.0",
+    "lucide-react": "^1.49.0",
     "mermaid": "^11.16.0",
-    "next": "16.2.10",
-    "react": "19.2.7",
-    "react-dom": "19.2.7",
-    "shiki": "^4.3.1"
+    "next": "16.3.8",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "shiki": "^4.5.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -27,10 +27,10 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.2.10",
-    "stylelint": "^17.14.1",
+    "eslint-config-next": "16.3.8",
+    "stylelint": "^17.16.0",
     "stylelint-config-standard": "^40.0.0",
-    "stylelint-declaration-strict-value": "^1.11.1",
+    "stylelint-declaration-strict-value": "^1.12.1",
     "tailwindcss": "^4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10"
