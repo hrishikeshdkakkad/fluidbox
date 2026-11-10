@@ -10,6 +10,32 @@ ignore = [
     # operator-initiated flows, and no untrusted party can drive or precisely
     # time signing operations. Re-evaluate when rsa 0.10 ships.
     { id = "RUSTSEC-2023-0071", reason = "no patched rsa release; control-plane-side signing with our own key, not attacker-timeable" },
+    # crypto-bigint 0.5 timing variability, reached ONLY through
+    # elliptic-curve 0.13 <- p256/p384 <- jsonwebtoken 10 + openidconnect 4.0.
+    # The fix is crypto-bigint 0.7, which needs elliptic-curve 0.14: that means
+    # openidconnect 4.1 AND jsonwebtoken 11 (a major) together — a change to the
+    # login path that deserves its own PR and the identity suite, not a ride on
+    # a patch bump. Accepted meanwhile because a timing sidechannel leaks SECRET
+    # operands and this binary has none on these curves: ES256/ES384 are used
+    # only to VERIFY IdP id-token signatures (login.rs) — public key, public
+    # message. The control plane holds no EC private key and never signs or does
+    # ECDH through this stack (TLS key exchange is aws-lc-rs/ring, not
+    # RustCrypto). Remove when both libraries are on elliptic-curve 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "fix needs openidconnect 4.1 + jsonwebtoken 11; EC is verify-only here (IdP id-token signatures), no secret operand to time" },
+    # pin-utils is flagged UNMAINTAINED — a notice, not a vulnerability. It
+    # reaches us only through the AWS SDK's smithy runtime (aws-smithy-http,
+    # -runtime, -types), which backs FLUIDBOX_KMS_MODE=aws. There is nothing to
+    # upgrade to from our side; it goes when the SDK drops it. Re-check on each
+    # aws-sdk-kms bump.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained notice only; transitive via the AWS SDK smithy runtime, no alternative until the SDK drops it" },
+    # unsafe-libyaml is flagged UNMAINTAINED (no known vulnerability). It is the
+    # parser inside serde_yaml 0.9, which is itself deprecated. It parses policy
+    # YAML: the boot seed's policies/*.yaml and — the part that matters — the
+    # body of the policy import and validate endpoints, i.e. text from an
+    # authenticated API caller, bounded by the request body limit. This entry is
+    # a STOPGAP, not an acceptance: the fix is moving fluidbox-core off
+    # serde_yaml onto a maintained parser. Delete this entry when that lands.
+    { id = "RUSTSEC-2024-0449", reason = "stopgap: unmaintained parser behind deprecated serde_yaml, reachable from authenticated policy import; replace serde_yaml, then delete this" },
 ]
 
 [licenses]
