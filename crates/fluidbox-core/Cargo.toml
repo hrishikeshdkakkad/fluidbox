@@ -22,8 +22,6 @@ hex.workspace = true
 # workspace dep note; hardened further by `schema_guard`.
 jsonschema.workspace = true
 async-trait.workspace = true
-tokio.workspace = true
-futures.workspace = true
 
 [dev-dependencies]
 proptest = "1"
