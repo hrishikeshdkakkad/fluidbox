@@ -318,7 +318,7 @@ pub async fn create_org(
 /// authenticated. Answers identically (None) for unknown slugs. Rides the audited
 /// system-worker bypass (`worker_tx`): no tenant is known yet — the slug IS the
 /// key — so RLS cannot filter on `fluidbox.tenant_id`; the sanctioned pre-auth
-/// org-routing category (mirrors the token-digest resolvers in lib.rs).
+/// org-routing category (mirrors the token-digest resolvers in tokens.rs).
 pub async fn get_org_by_slug(pool: &PgPool, slug: &str) -> sqlx::Result<Option<OrgRow>> {
     let mut tx = crate::worker_tx(pool).await?;
     let __rls_out = sqlx::query_as(
@@ -726,7 +726,7 @@ pub async fn resolve_web_session(
     // Rides the audited system-worker bypass (`worker_tx`): keyed purely on the
     // session-token sha256 with NO tenant scope — the caller has no principal until
     // this resolves the tenant. The credential-digest bootstrap category (mirrors
-    // the lib.rs token-digest resolvers).
+    // the tokens.rs token-digest resolvers).
     let mut tx = crate::worker_tx(pool).await?;
     let __rls_out = sqlx::query_as(
         "update user_sessions s
@@ -914,7 +914,7 @@ pub async fn resolve_pat(pool: &PgPool, token_plain: &str) -> sqlx::Result<Optio
     // Rides the audited system-worker bypass (`worker_tx`): keyed purely on the
     // PAT sha256 with NO tenant scope — the caller has no principal until this
     // resolves the tenant. The credential-digest bootstrap category (mirrors the
-    // lib.rs token-digest resolvers).
+    // tokens.rs token-digest resolvers).
     let mut tx = crate::worker_tx(pool).await?;
     let __rls_out = sqlx::query_as(
         "update api_tokens tok set last_used_at = now()

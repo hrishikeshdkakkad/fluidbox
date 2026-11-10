@@ -13,7 +13,7 @@ fluidbox-cli (thin reqwest client) ───────────────
 ```
 
 - **`fluidbox-core`** — pure domain, no I/O. The policy engine, the session state machine, the canonical event schema and redaction types, `RunSpec` and autonomy rules, and the extension traits. Domain rules change here, and the tests live here.
-- **`fluidbox-db`** — sqlx repositories against Postgres (Neon), embedded migrations, `LISTEN/NOTIFY`.
+- **`fluidbox-db`** — sqlx repositories against Postgres (Neon), embedded migrations, `LISTEN/NOTIFY`. One module per table family; the crate root only declares and re-exports them, so callers write `fluidbox_db::create_session`.
 - **`fluidbox-provider`** — sandbox lifecycles. Today: `DockerProvider` (bollard). `SandboxHandle` is serializable jsonb, so a control-plane restart can reattach to running sandboxes.
 - **`fluidbox-server`** — one binary wiring several planes together (below).
 - **`images/`** — the sandbox workloads: runner images for each agent harness. This is the only place non-Rust code is sanctioned; the runner is *payload*, not backend.

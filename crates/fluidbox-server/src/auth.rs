@@ -1601,7 +1601,7 @@ mod tests {
     /// is what makes deleting the join fail — no database required.
     #[test]
     fn both_session_token_resolvers_carry_the_recorded_addresses() {
-        let db = include_str!("../../fluidbox-db/src/lib.rs");
+        let db = include_str!("../../fluidbox-db/src/tokens.rs");
         assert_eq!(
             db.matches("select t.session_id, t.tenant_id, t.audience, s.workload_addrs")
                 .count(),
