@@ -107,7 +107,7 @@ for (const k of Object.keys(childEnv)) {
     delete childEnv[k];
   }
 }
-const child = new Client({ name: `fluidbox-gate-${SERVER_NAME}`, version: "0.8.0" }, { capabilities: {} }); // x-release-please-version
+const child = new Client({ name: `fluidbox-gate-${SERVER_NAME}`, version: "0.9.0" }, { capabilities: {} }); // x-release-please-version
 const childTransport = new StdioClientTransport({
   command: CHILD_COMMAND,
   args: CHILD_ARGS,
@@ -115,7 +115,7 @@ const childTransport = new StdioClientTransport({
 });
 
 const server = new Server(
-  { name: `fluidbox-gate-${SERVER_NAME}`, version: "0.8.0" }, // x-release-please-version
+  { name: `fluidbox-gate-${SERVER_NAME}`, version: "0.9.0" }, // x-release-please-version
   { capabilities: { tools: {} } },
 );
 
