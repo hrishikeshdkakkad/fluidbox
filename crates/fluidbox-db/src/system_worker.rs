@@ -103,13 +103,16 @@
 //! [`crate::worker_tx`] internally, for the pre-auth categories above. They stay
 //! where they are (they belong to their repository's family, not to the worker
 //! scans), so the honest guarantee is this ENUMERATION. `rg 'worker_tx\('` over
-//! `crates/fluidbox-db/src` must yield exactly this set plus this module:
+//! `crates/fluidbox-db/src` must yield exactly this set plus this module — and
+//! `the_rls_bypass_is_opened_only_where_inventoried`
+//! (`crates/fluidbox-server/tests/architecture.rs`) fails when it does not:
 //!
-//! * **`crate` (lib.rs)** — `ensure_default_tenant` (boot seed: the tenant's own id
-//!   is not yet any GUC's tenant); `session_for_token`,
-//!   `session_for_token_incl_revoked`, `extend_session_token`,
-//!   `subscription_for_token` (token-DIGEST resolution — the tenant is unknown until
-//!   the secret resolves); `claim_connector_oauth_flow`, `peek_connector_oauth_flow`,
+//! * **`crate`** (re-exported by the root from the module named) — `tenants`:
+//!   `ensure_default_tenant` (boot seed: the tenant's own id is not yet any GUC's
+//!   tenant); `tokens`: `session_for_token`, `session_for_token_incl_revoked`,
+//!   `extend_session_token`, `subscription_for_token` (token-DIGEST resolution — the
+//!   tenant is unknown until the secret resolves); `connector_oauth`:
+//!   `claim_connector_oauth_flow`, `peek_connector_oauth_flow`; `github_app`:
 //!   `claim_github_app_bootstrap`, `claim_github_app_flow` (one-time PRE-AUTH claims
 //!   where a sealed `state` param or a browser-cookie hash inside the predicate IS
 //!   the auth).
