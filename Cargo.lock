@@ -1661,7 +1661,6 @@ dependencies = [
  "chrono-tz",
  "cron",
  "fluidbox-obs",
- "futures",
  "globset",
  "hex",
  "jsonschema",
@@ -1672,7 +1671,6 @@ dependencies = [
  "serde_yaml",
  "sha2 0.11.0",
  "thiserror 2.0.18",
- "tokio",
  "uuid",
 ]
 
