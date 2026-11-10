@@ -3,7 +3,9 @@
 
 use crate::*;
 use fluidbox_core::policy::Policy;
+use sqlx::PgPool;
 use std::path::Path;
+use uuid::Uuid;
 
 pub struct SeedOutcome {
     pub tenant_id: Uuid,

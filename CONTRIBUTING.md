@@ -85,7 +85,7 @@ Notes:
 |--------|-----------|
 | Domain rules (policy, state machine, events, specs) | `crates/fluidbox-core` — pure, no I/O, tests live next to the code |
 | API endpoints, orchestration, approvals, SSE | `crates/fluidbox-server` |
-| Persistence | `crates/fluidbox-db` + `migrations/` (append a new migration; never edit an applied one) |
+| Persistence | `crates/fluidbox-db` — one module per table family; `lib.rs` only declares and re-exports them — + `migrations/` (append a new migration; never edit an applied one) |
 | Sandbox lifecycle | `crates/fluidbox-provider` |
 | Agent harnesses / runner images | `images/` (this is sandbox workload — Node is allowed here) |
 | Dashboard | `apps/web` (presentation only) |
