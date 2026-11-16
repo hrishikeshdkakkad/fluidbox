@@ -331,9 +331,8 @@ paths:
       operationId: createRun
       summary: Start a run
       description: |
-        Freezes an immutable `RunSpec` and accepts the run. Depending on the
-        deployment and the run's policy, the returned run may be `created`,
-        `awaiting_authorization`, or `queued` before provisioning begins; watch
+        Freezes an immutable `RunSpec` and begins provisioning. The response
+        returns immediately with the new run in `created`; watch
         `/v1/sessions/{id}/events/stream` for progress.
 
         What gets frozen: the agent revision's model and system prompt, a full
@@ -377,7 +376,7 @@ paths:
                   capabilities: [github-readonly]
       responses:
         '200':
-          description: The run was accepted. Its status says whether it is paused, queued, or provisioning.
+          description: The run was created and is provisioning.
           content:
             application/json:
               schema:
@@ -400,8 +399,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '429':
-          $ref: '#/components/responses/RunQueueFull'
 
   /v1/sessions/{id}:
     parameters:
@@ -423,14 +420,6 @@ paths:
                     $ref: '#/components/schemas/Session'
                   usage:
                     $ref: '#/components/schemas/UsageTotals'
-                  queue_position:
-                    type: integer
-                    format: int64
-                    minimum: 0
-                    description: |
-                      Number of older queued runs in the same organization.
-                      Present only while this run is `queued`; it is a lower
-                      bound on deployment-wide position.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -1128,6 +1117,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
   /v1/policies/{name}/revert:
     parameters:
       - $ref: '#/components/parameters/PolicyName'
@@ -1504,8 +1494,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '429':
-          $ref: '#/components/responses/RunQueueFull'
 
   /v1/triggers/{id}/runs/{sid}:
     parameters:
@@ -3974,20 +3962,6 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-    RunQueueFull:
-      description: The deployment-wide run queue is full. Retry after the indicated delay.
-      headers:
-        Retry-After:
-          required: true
-          description: Seconds the caller should wait before retrying.
-          schema:
-            type: integer
-            minimum: 1
-            examples: [30]
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
     Unavailable:
       description: The control plane cannot serve this request right now.
       content:
@@ -4048,28 +4022,8 @@ components:
         Where a run is in its lifecycle. The server is the single writer of
         this field. `completed`, `failed`, `cancelled`, and `budget_exceeded`
         are terminal.
-
-        `awaiting_authorization` is the pre-provisioning pause: the run's spec
-        (including its network grant) is frozen, but no sandbox exists and no
-        model spend is possible until a human authorizes the grant.
-
-        `queued` is the pre-provisioning capacity park: the run's spec is
-        frozen but no sandbox exists and no model spend is possible until the
-        dispatcher admits it under `FLUIDBOX_MAX_CONCURRENT_RUNS`. It appears
-        only on deployments that have configured that cap; without it runs
-        launch on creation and this value is never written. Runs are admitted
-        oldest-first, and a queued session carries `queued_at` plus a
-        `queue_position` field on the single-session response (the number of
-        older queued runs in the same organization — a lower bound on the
-        deployment-wide position, which is deliberately not exposed).
-
-        The two pauses compose: a run needing network authorization waits for a
-        human first and for capacity second, and its queue-wait clock starts
-        only when it becomes dispatchable.
       enum:
         - created
-        - awaiting_authorization
-        - queued
         - provisioning
         - initializing
         - running
@@ -4080,78 +4034,6 @@ components:
         - failed
         - cancelled
         - budget_exceeded
-
-    NetworkRequest:
-      type: object
-      description: |
-        Sandbox network access an agent declares, or a per-run narrowing of it.
-        Policy caps what may actually be granted; a downstream override may only
-        narrow (a smaller mode, a subset of the declared targets, a shorter
-        lifetime). A target the declaration never carried is dropped, so an
-        override can never introduce reach.
-      properties:
-        mode:
-          type: string
-          description: |
-            `offline` = no egress beyond the control plane (the default, and what
-            every run had before governed networking). `approved` = exactly the
-            listed targets. `public` = everything the deployment's deny wall
-            permits; refused for a run holding brokered tool surfaces unless
-            policy opts in.
-          enum: [offline, approved, public]
-          default: offline
-        targets:
-          type: array
-          description: |
-            Where the run may connect. Must be empty for `public`. DNS and CIDR
-            are distinct selectors — a DNS grant is not an IP grant, even for an
-            address the name currently resolves to.
-          items:
-            $ref: '#/components/schemas/NetworkTarget'
-        duration_secs:
-          type: integer
-          description: |
-            Requested grant lifetime. Clamped by the policy ceiling, and
-            validated to outlive the run's own wall-clock budget so authority
-            never lapses mid-run.
-          nullable: true
-
-    NetworkTarget:
-      type: object
-      required: [kind, ports, protocol]
-      properties:
-        kind:
-          type: string
-          enum: [dns, cidr]
-        pattern:
-          type: object
-          description: |
-            DNS targets only. `exact` matches one name; `wildcard` matches
-            exactly ONE additional label (`*.example.com` covers
-            `api.example.com` but not `a.b.example.com` and not the bare apex) —
-            this mirrors what the datapath can actually enforce.
-          properties:
-            kind:
-              type: string
-              enum: [exact, wildcard]
-            name:
-              type: string
-            suffix:
-              type: string
-        cidr:
-          type: string
-          description: CIDR targets only, in `addr/prefix` form.
-        ports:
-          type: array
-          items:
-            type: object
-            required: [from, to]
-            properties:
-              from: { type: integer }
-              to: { type: integer }
-        protocol:
-          type: string
-          enum: [tcp, udp]
 
     TrustTier:
       type: string
@@ -4497,13 +4379,6 @@ components:
         created_at:
           type: string
           format: date-time
-        queued_at:
-          type: string
-          format: date-time
-          nullable: true
-          description: |
-            Time this run first became dispatchable. Set when the run enters
-            `queued` and preserved across capacity requeues.
         ended_at:
           type: string
           format: date-time

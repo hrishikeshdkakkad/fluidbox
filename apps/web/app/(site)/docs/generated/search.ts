@@ -563,7 +563,7 @@ export const SEARCH_SECTIONS: SearchSection[] = [
   "slug": "kubernetes",
   "title": "Kubernetes",
   "heading": "Managed cloud: the generic recipe",
-  "text": "Every managed cloud follows the same five steps; only the CNI enforcement and StorageClass differ (covered per-cloud below). 1. Provision a cluster with an enforcing CNI. 2. Create the namespace and the fluidbox-secrets Secret (Secrets). 3. helm install from the OCI registry with the cloud's values preset: FLUIDBOX_VERSION=0.3.0 # x-release-please-version helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \\ --version \"$FLUIDBOX_VERSION\" \\ -n fluidbox --create-namespace \\ -f deploy/helm/fluidbox/values/<cloud>.yaml Presets ship for eks, gke, aks, doks, and kind under deploy/helm/fluidbox/values/. 4. Certify enforcement — helm test passes and the server log confirms the boot gate (Certifying enforcement). 5. Point DNS/Ingress and set FLUIDBOX_PUBLIC_URL to your https origin — this lights up OAuth callbacks, CIMD, and GitHub App webhooks with no code change. > Images ship public on GHCR, so no imagePullSecret is needed unless you mirror to a private registry. For production, pin image digests and supply all credentials through the existing Secret — the chart never generates credential material. ---"
+  "text": "Every managed cloud follows the same five steps; only the CNI enforcement and StorageClass differ (covered per-cloud below). 1. Provision a cluster with an enforcing CNI. 2. Create the namespace and the fluidbox-secrets Secret (Secrets). 3. helm install from the OCI registry with the cloud's values preset: FLUIDBOX_VERSION=0.8.0 # x-release-please-version helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \\ --version \"$FLUIDBOX_VERSION\" \\ -n fluidbox --create-namespace \\ -f deploy/helm/fluidbox/values/<cloud>.yaml Presets ship for eks, gke, aks, doks, and kind under deploy/helm/fluidbox/values/. 4. Certify enforcement — helm test passes and the server log confirms the boot gate (Certifying enforcement). 5. Point DNS/Ingress and set FLUIDBOX_PUBLIC_URL to your https origin — this lights up OAuth callbacks, CIMD, and GitHub App webhooks with no code change. > Images ship public on GHCR, so no imagePullSecret is needed unless you mirror to a private registry. For production, pin image digests and supply all credentials through the existing Secret — the chart never generates credential material. ---"
  },
  {
   "slug": "kubernetes",
@@ -587,7 +587,7 @@ export const SEARCH_SECTIONS: SearchSection[] = [
   "slug": "kubernetes",
   "title": "Kubernetes",
   "heading": "3. Secrets, install, certify",
-  "text": "kubectl create namespace fluidbox # ...create fluidbox-secrets (see Secrets)... FLUIDBOX_VERSION=0.3.0 # x-release-please-version helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \\ --version \"$FLUIDBOX_VERSION\" -n fluidbox \\ -f deploy/helm/fluidbox/values/eks.yaml \\ --set litellm.enabled=true \\ --set litellm.resources.limits.memory=2Gi # see field notes helm test fluidbox -n fluidbox kubectl -n fluidbox logs deploy/fluidbox-fluidbox-server grep 'netpol gate' # expect: netpol gate: enforcement verified (+:8788 -:8787)"
+  "text": "kubectl create namespace fluidbox # ...create fluidbox-secrets (see Secrets)... FLUIDBOX_VERSION=0.8.0 # x-release-please-version helm install fluidbox oci://ghcr.io/hrishikeshdkakkad/charts/fluidbox \\ --version \"$FLUIDBOX_VERSION\" -n fluidbox \\ -f deploy/helm/fluidbox/values/eks.yaml \\ --set litellm.enabled=true \\ --set litellm.resources.limits.memory=2Gi # see field notes helm test fluidbox -n fluidbox kubectl -n fluidbox logs deploy/fluidbox-fluidbox-server grep 'netpol gate' # expect: netpol gate: enforcement verified (+:8788 -:8787)"
  },
  {
   "slug": "kubernetes",
@@ -670,8 +670,8 @@ export const SEARCH_SECTIONS: SearchSection[] = [
  {
   "slug": "security",
   "title": "Security model",
-  "heading": "The workload has nowhere to go",
-  "text": "Sandboxes run with no network egress: Docker locally, and on Kubernetes a deny-all NetworkPolicy admission-gated before the untrusted payload starts. Separately, the control plane's own egress rides one hardened boundary: destination admission that blocks private, loopback, link-local, and cloud-metadata address classes at every dial site; redirect refusal on the clients that carry credentials; and per-tenant/host rate limits with a circuit breaker."
+  "heading": "The workload goes only where it was granted",
+  "text": "A sandbox's network is default-deny, and anything wider is an explicit, frozen, auditable grant — never an ambient capability. By default a run is offline: on Kubernetes a deny-all NetworkPolicy, admission-gated before the untrusted payload starts, and on Docker a per-session internal bridge under the hardened profile. (The Docker host-dev default is a local-development posture and has never been a hosted boundary — it deliberately injects a host gateway.) A run may instead be granted approved (exactly the FQDN/CIDR targets its agent declared, capped by policy) or public (everything the deployment's deny wall permits). Both are resolved BEFORE any sandbox exists, frozen into the immutable RunSpec, and enforced at L3/L4 in the datapath — so there is no application shim to bypass and nothing for the workload to opt into. A deployment with no enforcer refuses a wider grant at create time rather than running it unenforced, and public is refused outright for a run that also holds brokered tool results unless policy explicitly opts in: the dangerous pairing is credentials plus reach. Policy may require a human to authorize a grant, which parks the run BEFORE provisioning — no pod, no tok"
  },
  {
   "slug": "security",
