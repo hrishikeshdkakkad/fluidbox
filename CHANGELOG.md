@@ -4,6 +4,109 @@ All notable, user-visible changes to fluidbox are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
 
+## [0.9.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.8.0...v0.9.0) (2026-11-17)
+
+
+### Added
+
+* **core:** add queued session status with capacity-park edges ([6fbe9ff](https://github.com/hrishikeshdkakkad/fluidbox/commit/6fbe9ff5292190096367a780c15b9af8a7bd085a)), closes [#152](https://github.com/hrishikeshdkakkad/fluidbox/issues/152)
+* **db:** run-queue columns (0034), transition stamps, launch-anchored stale sweep ([96e9131](https://github.com/hrishikeshdkakkad/fluidbox/commit/96e913140f01420c76723d35462df9c84dce5930)), closes [#153](https://github.com/hrishikeshdkakkad/fluidbox/issues/153)
+* **db:** serialized dispatch claim + capacity occupancy loaders ([e26c2ca](https://github.com/hrishikeshdkakkad/fluidbox/commit/e26c2caeca865896c1b26a6b032882d63bea871f)), closes [#154](https://github.com/hrishikeshdkakkad/fluidbox/issues/154)
+* **gcp:** an optional OpenAI key for the gateway, declared but not yet provisioned ([833bedf](https://github.com/hrishikeshdkakkad/fluidbox/commit/833bedff4c4ba0320206ec1e34f1fd553753aa52))
+* **gcp:** Auth0 hardening + live isolation/egress evidence ([52dd62b](https://github.com/hrishikeshdkakkad/fluidbox/commit/52dd62bd2fa8f80e4e6ada78592726e7b27071e8))
+* **gcp:** cilium_mode — self-managed upstream Cilium for governed egress ([698877b](https://github.com/hrishikeshdkakkad/fluidbox/commit/698877bb4849e3cab55b919bbcbb03e9dd324338))
+* **gcp:** GKE production deployment — Terraform, chart hardening, commit-to-prod pipeline ([533eb97](https://github.com/hrishikeshdkakkad/fluidbox/commit/533eb971ffb6b0dfb10c8aa5f02f349ddccab8f3))
+* **gcp:** production deployment on GKE — Terraform, chart hardening, commit-to-prod pipeline ([f02535b](https://github.com/hrishikeshdkakkad/fluidbox/commit/f02535b1d4da2f6e00ed4e3870671d057cb0a376))
+* **gcp:** production opts into OpenAI through the optional secret ([9ed9b2d](https://github.com/hrishikeshdkakkad/fluidbox/commit/9ed9b2d9fc401ebebec5059c7af9740ce6fce8de))
+* **gcp:** the sandbox pool is on-demand with one node always present ([eb4ef94](https://github.com/hrishikeshdkakkad/fluidbox/commit/eb4ef94dfa0f1f4e4d5dbe55ba1c4dc7bc58f03b))
+* **gcp:** upstream Cilium for governed sandbox egress ([547cb1a](https://github.com/hrishikeshdkakkad/fluidbox/commit/547cb1a06f18da22cac00156f49f1b66bb622c78))
+* **helm:** optional provider secrets in their own ExternalSecret ([98553cb](https://github.com/hrishikeshdkakkad/fluidbox/commit/98553cbf4e7ba691349e910fd141c884d76d657a))
+* instrument the db, provider and workspace crates ([60bd3bc](https://github.com/hrishikeshdkakkad/fluidbox/commit/60bd3bcaf3626f3aa3aa637b69a8c82cfea80b0a))
+* **obs:** fluidbox-obs — structured, redacted, correlated logging ([e1db162](https://github.com/hrishikeshdkakkad/fluidbox/commit/e1db1626b83789dd69b3c2c9600e3f29e1ca84ea))
+* **provider:** typed CapacityDenied classification for quota and throttle rejections ([545c8b7](https://github.com/hrishikeshdkakkad/fluidbox/commit/545c8b716b25e6db2dc7f6af7794709c41089591)), closes [#155](https://github.com/hrishikeshdkakkad/fluidbox/issues/155)
+* **runner:** structured, redacted logging inside the sandbox ([1329d19](https://github.com/hrishikeshdkakkad/fluidbox/commit/1329d192dc091fbb2d612829dc0449b92798408c))
+* **scripts:** gcp-reauth.sh - restore local gcloud credentials ([6f1a578](https://github.com/hrishikeshdkakkad/fluidbox/commit/6f1a5781be7cfef3cff23316d779f7b33b080ff9))
+* **scripts:** gcp-secrets.sh - the out-of-band secrets in one command ([bb4a197](https://github.com/hrishikeshdkakkad/fluidbox/commit/bb4a1974abc8a27b0b8702f87db96d68a0e3ad36))
+* **server:** boot on fluidbox-obs, and one canonical record per request ([65f3178](https://github.com/hrishikeshdkakkad/fluidbox/commit/65f317882df5c310d3f9c2e2871eef9863592f42))
+* **server:** bounded queue depth with per-entry-point shed semantics ([ca30898](https://github.com/hrishikeshdkakkad/fluidbox/commit/ca30898c2879ae12c31312668a650b1310e9d290)), closes [#159](https://github.com/hrishikeshdkakkad/fluidbox/issues/159)
+* **server:** capacity dispatcher + park-at-admission (inert unless configured) ([610bc49](https://github.com/hrishikeshdkakkad/fluidbox/commit/610bc494b797722c4d57468eb0c72a582ac8a26e)), closes [#157](https://github.com/hrishikeshdkakkad/fluidbox/issues/157)
+* **server:** instrument the credential and egress plane, and the boot banner ([dae7cbf](https://github.com/hrishikeshdkakkad/fluidbox/commit/dae7cbf6ebb80a22f91c48f2b1044506469ce4d0))
+* **server:** instrument the governance plane ([09cfe0b](https://github.com/hrishikeshdkakkad/fluidbox/commit/09cfe0b0e65b67b3354beebce4909bcf0e033648))
+* **server:** instrument the run lifecycle plane ([21b4e91](https://github.com/hrishikeshdkakkad/fluidbox/commit/21b4e91963da678fcc95902ddbc58ced9770e9fd))
+* **server:** queue observability — live gauges, requeue counter, queued position in the session API ([d53ebca](https://github.com/hrishikeshdkakkad/fluidbox/commit/d53ebca61c76e2e86751a0ae576468a240356b1d)), closes [#161](https://github.com/hrishikeshdkakkad/fluidbox/issues/161)
+* **server:** reconcile every tenant's LiteLLM key against the configured allowlist ([4571461](https://github.com/hrishikeshdkakkad/fluidbox/commit/457146188cd898e974bfb6896dc02c41cf98afbf))
+* **server:** requeue runs on provider capacity denial with bounded backoff ([251c465](https://github.com/hrishikeshdkakkad/fluidbox/commit/251c46561900433c5d306d1617e71293181d6cb6)), closes [#158](https://github.com/hrishikeshdkakkad/fluidbox/issues/158)
+* **server:** run-queue configuration knobs (inert unless cap set) ([9b21fcd](https://github.com/hrishikeshdkakkad/fluidbox/commit/9b21fcd3838eccb593b0030b52ebde7d7dbc7da2)), closes [#156](https://github.com/hrishikeshdkakkad/fluidbox/issues/156)
+* **test:** feature-gated NullProvider + hermetic queue-admission e2e ([40b143d](https://github.com/hrishikeshdkakkad/fluidbox/commit/40b143d08c723de30cfb2c7b976888189799b2d7)), closes [#160](https://github.com/hrishikeshdkakkad/fluidbox/issues/160)
+
+
+### Fixed
+
+* **chart:** migrate-job identity, LiteLLM PSA baseline, ESO api version ([5950f11](https://github.com/hrishikeshdkakkad/fluidbox/commit/5950f1126b5c970c3228f5a971c8dc9c9a151aa4))
+* **chart:** three networkGrants defects, and the precise GKE blocker ([e2ca297](https://github.com/hrishikeshdkakkad/fluidbox/commit/e2ca2970e01a1e5da6048462172b54e79ec8a97c))
+* **chart:** three real defects in the networkGrants path, and the precise reason it cannot work on GKE ([3f5beee](https://github.com/hrishikeshdkakkad/fluidbox/commit/3f5beee20b875da94abfb01dbdb01168f136ddaa))
+* **ci:** always deploy a digest built from the commit ([6bc8d0b](https://github.com/hrishikeshdkakkad/fluidbox/commit/6bc8d0b072687969350cb56fe8de88baaac9b830))
+* **ci:** build images IF ABSENT for the commit, never fall back to a live tag ([4e32b37](https://github.com/hrishikeshdkakkad/fluidbox/commit/4e32b378ade70e914b358ff841f5ebfa1c732565))
+* **ci:** gate apply on the plan JSON's change count, not on a captured exit code ([c77518e](https://github.com/hrishikeshdkakkad/fluidbox/commit/c77518eb3abdd1d6c142848ed5075caa57f174ff))
+* **ci:** helm waits for workloads and jobs, not for every custom resource ([132b77e](https://github.com/hrishikeshdkakkad/fluidbox/commit/132b77e33aea049e9d8cf4409f3865c7bfbfb9b6))
+* **ci:** pin helm, drop deprecated --atomic, add handoff doc ([83fb7c4](https://github.com/hrishikeshdkakkad/fluidbox/commit/83fb7c4bbe323a0572d75a54e89d6e287148a924))
+* **ci:** pin helm, drop the deprecated --atomic, and add the handoff doc ([2df1a16](https://github.com/hrishikeshdkakkad/fluidbox/commit/2df1a1629ce52f55b08934a7a0db057b414d182e))
+* **ci:** plan on every push to main; apply when the plan has changes ([27afa63](https://github.com/hrishikeshdkakkad/fluidbox/commit/27afa6339c4b543c3b0e7589357080c3b58b66d0))
+* **ci:** pull-request plans must not share the production deploy's concurrency group ([f832154](https://github.com/hrishikeshdkakkad/fluidbox/commit/f8321543f62a79bcb9df7f4d18e4cd49ed4dedcb))
+* **ci:** smoke needs always() — a green pipeline was verifying nothing ([11b778d](https://github.com/hrishikeshdkakkad/fluidbox/commit/11b778d2099233602165fdf92124bd111892b6e4))
+* **ci:** smoke needs always() — skips propagate transitively through needs ([29431c0](https://github.com/hrishikeshdkakkad/fluidbox/commit/29431c0fb4f3d8cc13baaf710bd64be45a707068))
+* **ci:** the deploy pipeline never tested its own gates ([12397d0](https://github.com/hrishikeshdkakkad/fluidbox/commit/12397d00f62c9aa6b8f1374d06f2948020af5431))
+* **ci:** the deploy pipeline never tested its own gates ([c1b4fd6](https://github.com/hrishikeshdkakkad/fluidbox/commit/c1b4fd6905688e3592e5430d358daf5299430a7f))
+* **ci:** WIF audience + pnpm — unblock the deploy pipeline ([9616380](https://github.com/hrishikeshdkakkad/fluidbox/commit/9616380aaf8b9a46a24c053aee301a16606055b3))
+* **ci:** WIF audience mismatch and a missing pnpm broke the first deploy run ([aa53402](https://github.com/hrishikeshdkakkad/fluidbox/commit/aa5340248dfe5f777129ca3d2110d31d8e38017c))
+* **evidence:** the verification suites were quietly verifying less than they claimed ([5c1b681](https://github.com/hrishikeshdkakkad/fluidbox/commit/5c1b681970777dddf42a30c2aa2f1dea04f5a9cd))
+* **evidence:** three ways these suites were quietly verifying less than they said ([cf0044b](https://github.com/hrishikeshdkakkad/fluidbox/commit/cf0044b20a56a4e69647d8e801b5bccc56f96724))
+* **gcp:** apply-time corrections + browser journeys, isolation checks, docs ([3db19f1](https://github.com/hrishikeshdkakkad/fluidbox/commit/3db19f1070e1c9bd491acb393b356acbe11da1eb))
+* **gcp:** cilium_mode must default to the mode actually deployed ([6151e80](https://github.com/hrishikeshdkakkad/fluidbox/commit/6151e80b8521e2437fed531e9059bb6f3f93bba9))
+* **gcp:** declare the release-namespace label Helm owns ([08c6b3a](https://github.com/hrishikeshdkakkad/fluidbox/commit/08c6b3ad9a4d551af7648fe174f58569056e2428))
+* **gcp:** ingress must use the legacy class ANNOTATION, not ingressClassName ([af771d2](https://github.com/hrishikeshdkakkad/fluidbox/commit/af771d2c27f9dd745a3c888a9a9b939567ee4118))
+* **gcp:** node pools were created EMPTY — initial_node_count, not node_count ([80c08f0](https://github.com/hrishikeshdkakkad/fluidbox/commit/80c08f0664e7acda320d35c76216cfe34494d6ad))
+* **gcp:** the Cilium startup taint deadlocked every scale-from-zero ([09061db](https://github.com/hrishikeshdkakkad/fluidbox/commit/09061dbc59722a0b983675e0188b53f15fa5a5fd))
+* **obs:** close logging review gaps ([09b209e](https://github.com/hrishikeshdkakkad/fluidbox/commit/09b209e5237c12f0096e3c6e9364a662eb38c50f))
+* **obs:** close the last unredacted path, and make a boot failure a record ([a7bc85c](https://github.com/hrishikeshdkakkad/fluidbox/commit/a7bc85c3d6cbc67060657447e1d8938153969325))
+* **provider-k8s:** the network verifier must wait for a node before it starts its clock ([3f8d412](https://github.com/hrishikeshdkakkad/fluidbox/commit/3f8d4121c04618c30bf0969d00d03a5280fcefcf))
+* **provider-k8s:** the verifier's timeout states are per poll, not carried ([a953300](https://github.com/hrishikeshdkakkad/fluidbox/commit/a9533008576a757edccce8e5f8c92e92c930d1fe))
+* **scripts:** gcp-secrets.sh refuses to rotate a key it was not told to rotate ([f83b0fe](https://github.com/hrishikeshdkakkad/fluidbox/commit/f83b0fe6b90110f8ffb55ed20496c19dad5ca0c0))
+* **security:** keep Terraform plans and state out of git ([0598386](https://github.com/hrishikeshdkakkad/fluidbox/commit/05983862ecbc23859f0cfd08e4ce008b86f9a1f4))
+* **server:** a run that fails at provisioning finalizes at once, not after a settle window ([561d2b7](https://github.com/hrishikeshdkakkad/fluidbox/commit/561d2b7b5964e675b50802197a8be8066d02965e))
+* **server:** the catalog and agent writes must respect the tenant model allowlist ([9dc225f](https://github.com/hrishikeshdkakkad/fluidbox/commit/9dc225f9c2add0a7dc623a604b6452df298d93aa))
+* **server:** the reconciler adopted sandboxes a live driver was still provisioning ([5ea62c2](https://github.com/hrishikeshdkakkad/fluidbox/commit/5ea62c2db2a6cd9d7ef75ef013f668d8272282b8))
+* **web:** logout returned 500 - the proxy put a body on a 204 ([3cf6d48](https://github.com/hrishikeshdkakkad/fluidbox/commit/3cf6d48dfa39f048681c685b99a19ca48c98ac2f))
+* **web:** unblock the Vercel build, and correct the vercel job's working dir ([6276f20](https://github.com/hrishikeshdkakkad/fluidbox/commit/6276f20749c3812e755d8974991c6249a93d8a4e))
+
+
+### Changed
+
+* **db:** one module per table family; the crate root is wiring only ([25e2191](https://github.com/hrishikeshdkakkad/fluidbox/commit/25e21916d4aa7a465e73ccbcd46e474cc3c7987d))
+
+
+### Documentation
+
+* **changelog:** refresh commit links ([d455184](https://github.com/hrishikeshdkakkad/fluidbox/commit/d455184e20b4870b5302e9423493f20137bed621))
+* consolidate developer guide and plans ([b2a3ac7](https://github.com/hrishikeshdkakkad/fluidbox/commit/b2a3ac7f71de4113bf8cb4f45ea21ba5be99235e))
+* **gcp:** a cancelled push run with no failed job is the concurrency race ([5099b21](https://github.com/hrishikeshdkakkad/fluidbox/commit/5099b21ebe13da51aeba2cdb4845c7b5b3775c7b))
+* **gcp:** correct — governed network grants are NOT possible on GKE Dataplane V2 ([66653c6](https://github.com/hrishikeshdkakkad/fluidbox/commit/66653c63510e3f506b7f5629a5f1d12403bd8a67))
+* **gcp:** correct a wrong claim — governed network grants are NOT possible on GKE DPv2 ([ccde6c0](https://github.com/hrishikeshdkakkad/fluidbox/commit/ccde6c06c9bef8e33319f82a159ae16c49c886e6))
+* **gcp:** governed sandbox egress is ENABLED, not impossible ([d71a063](https://github.com/hrishikeshdkakkad/fluidbox/commit/d71a063cafaaac322b27325b38048f832510cea5))
+* **gcp:** one-command secrets, automatic key rotation, the two-phase verifier ([4d026ef](https://github.com/hrishikeshdkakkad/fluidbox/commit/4d026ef45cb819a577cf098026d4adc2202fa77b))
+* **gcp:** record the rollback actually exercised against production ([e3d5ea1](https://github.com/hrishikeshdkakkad/fluidbox/commit/e3d5ea1bee948e4fce345b73f2b81d64fbc6e5f8))
+* **gcp:** record the verification evidence; run vercel on manual dispatch too ([581539b](https://github.com/hrishikeshdkakkad/fluidbox/commit/581539b78c9f9643edbeefcf1784f7928f7fc008))
+* **gcp:** the Cilium clusterwide flag is necessary but NOT sufficient ([8a7adb1](https://github.com/hrishikeshdkakkad/fluidbox/commit/8a7adb1b655c262b398851232ab68269bdc514de))
+* **gcp:** the cordon race behind "node(s) were unschedulable", and the settle window ([989987a](https://github.com/hrishikeshdkakkad/fluidbox/commit/989987a3cdc8ba425bc90b8da00a74d8cb890056))
+* **gcp:** the DPv2MigrationUnsupportedCNIDetected node condition is expected ([13ad956](https://github.com/hrishikeshdkakkad/fluidbox/commit/13ad95600bb98031acaf1c15136fef6a12d1f6c6))
+* **gcp:** the Secrets runbook points at gcp-secrets.sh and its --rotate guard ([9fd5bcb](https://github.com/hrishikeshdkakkad/fluidbox/commit/9fd5bcb7ab8f1c9c0bde354162f6ef2c0e9fc963))
+* **gcp:** the startup taint, the autoscaler, and the order that matters ([69575ce](https://github.com/hrishikeshdkakkad/fluidbox/commit/69575cecc7b3111d0d09c5263b3686345ffcc68f))
+* **gcp:** the tenant allowlist is the catalog; OpenAI is optional and absent ([c093401](https://github.com/hrishikeshdkakkad/fluidbox/commit/c093401e8e495862900d900e214df113f7904b89))
+* **gcp:** verification record + vercel on manual dispatch ([05616b4](https://github.com/hrishikeshdkakkad/fluidbox/commit/05616b4c8d0c447050623916a4fdfc5181231310))
+* **plans:** run admission & queueing — design + implementation plan ([614054a](https://github.com/hrishikeshdkakkad/fluidbox/commit/614054a6beb784515ce8ec05639f0ee56fb43997))
+* **web:** commit .env.example — it had never been tracked ([388979a](https://github.com/hrishikeshdkakkad/fluidbox/commit/388979ae4fc7e38fa19b351e1415a8b8ea286989))
+* **web:** commit .env.example — it had never been tracked ([57d5689](https://github.com/hrishikeshdkakkad/fluidbox/commit/57d5689dccb149421a24d3e151950e50428eac80))
+
 ## [0.8.0](https://github.com/hrishikeshdkakkad/fluidbox/compare/v0.7.0...v0.8.0) (2026-08-15)
 
 
