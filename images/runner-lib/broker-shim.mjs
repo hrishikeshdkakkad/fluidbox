@@ -190,7 +190,7 @@ function interpret(res, text) {
 const errText = (text) => ({ content: [{ type: "text", text }], isError: true });
 
 const server = new Server(
-  { name: `fluidbox-broker-${SERVER_NAME}`, version: "0.8.0" }, // x-release-please-version
+  { name: `fluidbox-broker-${SERVER_NAME}`, version: "0.9.0" }, // x-release-please-version
   { capabilities: { tools: {} } },
 );
 
