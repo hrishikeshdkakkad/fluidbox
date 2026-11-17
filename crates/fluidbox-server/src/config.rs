@@ -322,6 +322,11 @@ pub struct Config {
     /// The 32-byte static KEK (hex/base64) that wraps per-tenant DEKs. Required
     /// iff `kms_mode = Static` (validated in `build_sealer`).
     pub kms_static_kek: Option<String>,
+    /// The PREVIOUS static KEK, set only while rotating. When present, boot
+    /// re-wraps every DEK stored under it so it is wrapped under the configured
+    /// KEK, before the KEK compatibility gate runs (`kms::rewrap_previous_kek`).
+    /// Remove it once boot reports the rotation complete.
+    pub kms_previous_static_kek: Option<String>,
     /// The AWS KMS key id/ARN used to wrap per-tenant DEKs. Required iff
     /// `kms_mode = Aws`.
     pub kms_aws_key_id: Option<String>,
@@ -677,6 +682,9 @@ impl Config {
                 })?
             },
             kms_static_kek: get("FLUIDBOX_KMS_STATIC_KEK")
+                .ok()
+                .filter(|k| !k.is_empty()),
+            kms_previous_static_kek: get("FLUIDBOX_KMS_PREVIOUS_STATIC_KEK")
                 .ok()
                 .filter(|k| !k.is_empty()),
             kms_aws_key_id: get("FLUIDBOX_KMS_AWS_KEY_ID")

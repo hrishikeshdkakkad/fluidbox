@@ -82,11 +82,14 @@ const LEDGER: &[(&str, usize)] = &[
     ("crates/fluidbox-server/src/auth.rs", 1622),
     ("crates/fluidbox-server/src/bindings.rs", 2039),
     ("crates/fluidbox-server/src/broker.rs", 5317),
-    ("crates/fluidbox-server/src/config.rs", 1940),
+    // +8 (2026-11-17): FLUIDBOX_KMS_PREVIOUS_STATIC_KEK, the KEK-rotation knob - one
+    // field and its env read; there is no smaller way to add a config value.
+    ("crates/fluidbox-server/src/config.rs", 1948),
     ("crates/fluidbox-server/src/connectors/github.rs", 1917),
     ("crates/fluidbox-server/src/facade.rs", 2104),
     ("crates/fluidbox-server/src/github_app.rs", 1682),
-    ("crates/fluidbox-server/src/governor.rs", 2427),
+    // +1 (2026-11-17): its test Config literal gains kms_previous_static_kek.
+    ("crates/fluidbox-server/src/governor.rs", 2428),
     ("crates/fluidbox-server/src/internal.rs", 2685),
     ("crates/fluidbox-server/src/login.rs", 2918),
     ("crates/fluidbox-server/src/oauth.rs", 3916),

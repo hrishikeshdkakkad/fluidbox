@@ -104,7 +104,8 @@ fn ensure_kek_id(configured: &str, stored: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "this DEK was wrapped by KEK '{stored}' but the deployment is configured with KEK \
              '{configured}' — refusing to unwrap under a different KEK (restore the original \
-             KEK; there is no multi-KEK routing or re-wrap tooling yet)"
+             KEK, or rotate onto this one by booting with FLUIDBOX_KMS_PREVIOUS_STATIC_KEK set \
+             to the original)"
         );
     }
     Ok(())
@@ -531,12 +532,14 @@ fn census_verdict(configured: &str, stored: &[&str]) -> CensusVerdict {
         [one] => CensusVerdict::Refuse(format!(
             "stored per-tenant DEKs were wrapped by a DIFFERENT KEK (stored '{one}', configured \
              '{configured}'). Booting would orphan every existing tenant while new tenants minted \
-             DEKs under the configured KEK (a split-key database). Restore the original KEK"
+             DEKs under the configured KEK (a split-key database). Restore the original KEK, or \
+             ROTATE onto the configured one by setting FLUIDBOX_KMS_PREVIOUS_STATIC_KEK to the \
+             original"
         )),
         many => CensusVerdict::Refuse(format!(
-            "tenant_deks holds DEKs wrapped under {} distinct KEKs ({}) — fluidbox has no \
-             multi-KEK routing or re-wrap tooling, so serving would read some tenants and orphan \
-             others. Restore a single KEK for every stored DEK",
+            "tenant_deks holds DEKs wrapped under {} distinct KEKs ({}) — serving would read \
+             some tenants and orphan others. If a rotation was interrupted, boot again with \
+             FLUIDBOX_KMS_PREVIOUS_STATIC_KEK set to the old KEK to finish it",
             many.len(),
             many.join(", ")
         )),
@@ -556,8 +559,9 @@ fn census_verdict(configured: &str, stored: &[&str]) -> CensusVerdict {
 ///   - exactly one distinct `kek_id` → it MUST match the configured backend, and a
 ///     real unwrap must succeed (a PROBE — identity alone does not prove the AWS
 ///     grant or the key material is usable).
-///   - more than one → refuse. There is no multi-KEK routing or re-wrap tooling;
-///     serving would mean silently reading some tenants and orphaning others.
+///   - more than one → refuse. There is no multi-KEK ROUTING; serving would mean
+///     silently reading some tenants and orphaning others. (A ROTATION re-wraps
+///     every row onto one KEK before this gate runs — see `kek_rotation`.)
 ///   - zero DEK rows → nothing to PROBE, but emphatically not "nothing to do":
 ///     every replica of a fresh deployment would otherwise pass this gate under
 ///     whatever KEK it happened to hold. [`claim_deployment_kek`] settles it.

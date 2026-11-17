@@ -514,6 +514,9 @@ _spawn() {
     # KMS mode + its required key.
     export FLUIDBOX_KMS_MODE="$kms"
     if [ "$kms" = static ]; then export FLUIDBOX_KMS_STATIC_KEK="$STATIC_KEK"; fi
+    # KEK rotation (section (l)): the PREVIOUS key, set only for the boots that
+    # rotate. Independent of $kms on purpose - the KMS-off refusal is a test case.
+    if [ -n "${PREV_KEK:-}" ]; then export FLUIDBOX_KMS_PREVIOUS_STATIC_KEK="$PREV_KEK"; fi
     # Legacy sealing key — present or retired.
     if [ "$legacy" = 1 ]; then export FLUIDBOX_CREDENTIAL_KEY="$CRED_KEY"; fi
     # LLM upstream mode.
@@ -1143,6 +1146,100 @@ db "update trigger_subscriptions set callback_secret_key_version=2 where callbac
 ok "restored the straggler to key_version=2 (parity zero again)"
 
 # ═════════════════════════════════════════════════════════════════════════════
+# (l) KEK ROTATION — FLUIDBOX_KMS_PREVIOUS_STATIC_KEK re-wraps every DEK onto a
+# new KEK at boot. The witness is $V2CONN: its credential is sealed under its
+# tenant's DEK, so a refresh succeeds only if that DEK still unwraps after the
+# rotation. The DEK itself must not change, so nothing is re-sealed.
+# ═════════════════════════════════════════════════════════════════════════════
+say "(l) KEK rotation — re-wrap every DEK onto a new KEK; the old KEK is then refused"
+kek_id_of() { python3 -c "import hashlib,sys;print('static:'+hashlib.sha256(bytes.fromhex(sys.argv[1])).hexdigest()[:16])" "$1"; }
+OLD_KEK="$STATIC_KEK"
+NEW_KEK=$(openssl rand -hex 32)
+OLD_ID=$(kek_id_of "$OLD_KEK"); NEW_ID=$(kek_id_of "$NEW_KEK")
+DEKS=$(db "select count(*) from tenant_deks")
+[ "$(db "select string_agg(distinct kek_id, ',') from tenant_deks")" = "$OLD_ID" ] \
+  && ok "before: all $DEKS DEK row(s) are wrapped under the old KEK" \
+  || no "before: tenant_deks is not uniformly under the old KEK ($(db "select string_agg(distinct kek_id, ',') from tenant_deks"))"
+
+# The new KEK WITHOUT the previous one must refuse: that is the split-key boot.
+STATIC_KEK="$NEW_KEK"
+if boot_expect_refusal "p3-kek-new-only" static 0 shared 0 "$MASTER_KEY"; then
+  grep -q "DIFFERENT KEK" "$SERVER_LOG" \
+    && ok "new KEK alone → REFUSED (stored DEKs are under a different KEK)" \
+    || no "new-KEK-alone boot refused, but not for the KEK reason: $(tail -5 "$SERVER_LOG")"
+else
+  no "a new KEK booted WITHOUT FLUIDBOX_KMS_PREVIOUS_STATIC_KEK (split-key boot allowed)"
+fi
+
+# A previous KEK with KMS off must refuse: there is no configured KEK to move onto.
+PREV_KEK="$OLD_KEK"
+if boot_expect_refusal "p3-kek-prev-kms-off" off 0 shared 0 "$MASTER_KEY"; then
+  grep -q "FLUIDBOX_KMS_PREVIOUS_STATIC_KEK is set but FLUIDBOX_KMS_MODE=off" "$SERVER_LOG" \
+    && ok "previous KEK with KMS off → REFUSED, naming both variables" \
+    || no "previous-KEK + KMS-off boot refused for another reason: $(tail -5 "$SERVER_LOG")"
+else
+  no "a previous KEK with KMS off booted (the rotation would be silently skipped)"
+fi
+
+# The rotation boot.
+if boot "p3-kek-rotate" static 0 shared 0 "$MASTER_KEY"; then
+  ok "rotation boot (new KEK + previous KEK) → healthy"
+  grep -q "KEK rotation complete" "$SERVER_LOG" \
+    && ok "the boot log reports the rotation complete" \
+    || no "no rotation-complete line in the boot log"
+  [ "$(db "select string_agg(distinct kek_id, ',') from tenant_deks")" = "$NEW_ID" ] \
+    && ok "after: every DEK row is wrapped under the NEW KEK" \
+    || no "after: tenant_deks still holds $(db "select string_agg(distinct kek_id, ',') from tenant_deks")"
+  [ "$(db "select count(*) from tenant_deks")" = "$DEKS" ] \
+    && ok "no DEK row was added or lost ($DEKS)" \
+    || no "DEK row count changed: $DEKS → $(db "select count(*) from tenant_deks")"
+  AUD=$(db "select detail->>'rewrapped' from auth_audit_log where action='kms.kek_rotated' order by created_at desc limit 1")
+  [ "$AUD" = "$DEKS" ] \
+    && ok "audit: kms.kek_rotated recorded rewrapped=$AUD" \
+    || no "audit: expected kms.kek_rotated with rewrapped=$DEKS, got '${AUD:-none}'"
+  if need "${V2CONN:-}" "no v2 connection to witness the rotation"; then
+    RG_K0=$(as_field "['refresh_grants']")
+    admin_post "/v1/connections/$V2CONN/tools/refresh" '{}'
+    { [ "$CODE" = 200 ] && [ "$(as_field "['refresh_grants']")" -gt "$RG_K0" ]; } \
+      && ok "the v2 credential still unseals after the rotation (its DEK unwrapped under the new KEK)" \
+      || no "the v2 credential did not open after the rotation → $CODE: $BODY"
+  fi
+else
+  no "rotation boot failed: $(tail -20 "$SERVER_LOG")"
+fi
+stop_server
+
+# Re-running with the previous KEK still set is a no-op.
+if boot "p3-kek-rerun" static 0 shared 0 "$MASTER_KEY"; then
+  AUD2=$(db "select detail->>'rewrapped' from auth_audit_log where action='kms.kek_rotated' order by created_at desc limit 1")
+  [ "$AUD2" = "0" ] \
+    && ok "a re-run with the previous KEK still set re-wraps nothing (rewrapped=0)" \
+    || no "a re-run re-wrapped again (rewrapped=${AUD2:-none})"
+else
+  no "a re-run of the rotation failed to boot: $(tail -20 "$SERVER_LOG")"
+fi
+stop_server
+
+# Steady state: the previous KEK removed, the new KEK alone boots.
+unset PREV_KEK
+boot "p3-kek-steady" static 0 shared 0 "$MASTER_KEY" \
+  && ok "new KEK alone (previous removed) → boots healthy" \
+  || no "the new KEK alone did not boot after the rotation: $(tail -20 "$SERVER_LOG")"
+stop_server
+
+# The old KEK is now the stranger.
+STATIC_KEK="$OLD_KEK"
+if boot_expect_refusal "p3-kek-old-refused" static 0 shared 0 "$MASTER_KEY"; then
+  grep -q "DIFFERENT KEK" "$SERVER_LOG" \
+    && ok "old KEK after the rotation → REFUSED" \
+    || no "old-KEK boot refused for another reason: $(tail -5 "$SERVER_LOG")"
+else
+  no "the OLD KEK still boots after the rotation"
+fi
+# Every later phase runs on the rotated deployment.
+STATIC_KEK="$NEW_KEK"
+
+# ═════════════════════════════════════════════════════════════════════════════
 # PHASE 4 — KMS STATIC, legacy ABSENT (retired), TENANT LLM mode + fake LiteLLM.
 # This boot doubles as the retirement-gate POSITIVE (legacy absent, zero parity).
 # Section (i): per-tenant virtual keys. Section (j): RLS. Cross-tenant 404.
@@ -1408,6 +1505,7 @@ check_absent() { # label value
 }
 check_absent "FLUIDBOX_CREDENTIAL_KEY (legacy key hex)" "$CRED_KEY"
 check_absent "FLUIDBOX_KMS_STATIC_KEK (KEK hex)" "$STATIC_KEK"
+check_absent "the previous KEK of the (l) rotation" "${OLD_KEK:-}"
 check_absent "LITELLM_MASTER_KEY" "$MASTER_KEY"
 printf '%s' "$ALL_LOGS" | grep -q "BEGIN RSA PRIVATE KEY" && no "log hygiene: a private key (BEGIN RSA PRIVATE KEY) LEAKED" || ok "log hygiene: no 'BEGIN RSA PRIVATE KEY' in any log"
 printf '%s' "$ALL_LOGS" | grep -q "CLIENTSECRET" && no "log hygiene: a github-app/idp client secret LEAKED" || ok "log hygiene: no client-secret material in any log"

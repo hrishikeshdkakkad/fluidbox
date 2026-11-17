@@ -571,22 +571,24 @@ pub async fn check_retirement_gates(
         !matches!(sealer, Some(s) if s.inner.deployment_tenant != deployment_tenant),
         "the gate must claim the SAME deployment tenant Sealer::seal_token keys transit tokens under"
     );
-    match sealer.and_then(|s| s.inner.kms.as_ref()) {
-        Some(kms) => {
-            kms::check_kek_compatibility(
-                pool,
-                kms.wrapper.as_ref(),
-                Some(&kms.cache),
-                deployment_tenant,
-            )
-            .await?
-        }
-        None => {
-            if let Some(wrapper) = build_wrapper(cfg)? {
-                kms::check_kek_compatibility(pool, wrapper.as_ref(), None, deployment_tenant)
-                    .await?;
+    let previous = previous_static_kek(cfg.kms_mode, cfg.kms_previous_static_kek.as_deref())?;
+    let built;
+    let (wrapper, cache): (Option<&dyn KeyWrapper>, Option<&DekCache>) =
+        match sealer.and_then(|s| s.inner.kms.as_ref()) {
+            Some(kms) => (Some(kms.wrapper.as_ref()), Some(kms.cache.as_ref())),
+            None => {
+                built = build_wrapper(cfg)?;
+                (built.as_deref(), None)
             }
+        };
+    if let Some(wrapper) = wrapper {
+        // A KEK ROTATION runs FIRST: the compatibility gate below refuses any DEK
+        // not wrapped under the configured KEK, which is exactly the state a
+        // rotation starts from.
+        if let Some(previous) = &previous {
+            rotate_kek(pool, previous, wrapper).await?;
         }
+        kms::check_kek_compatibility(pool, wrapper, cache, deployment_tenant).await?;
     }
     let kms_on = cfg.kms_mode != KmsMode::Off;
     let legacy_present = cfg.credential_key.is_some();
@@ -597,6 +599,79 @@ pub async fn check_retirement_gates(
     if let Some(msg) = retirement_refusal(kms_on, legacy_present, &counts) {
         anyhow::bail!(msg);
     }
+    Ok(())
+}
+
+/// The previous static KEK for a rotation (`FLUIDBOX_KMS_PREVIOUS_STATIC_KEK`), or
+/// `None` when no rotation is under way. Pure, so the boot refusals are testable.
+///
+/// It requires KMS to be ON: a rotation moves DEKs onto the CONFIGURED KEK, and
+/// with KMS off there is none, so the rotation would be silently skipped and every
+/// DEK left under the key being retired.
+fn previous_static_kek(mode: KmsMode, raw: Option<&str>) -> anyhow::Result<Option<StaticKek>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if mode == KmsMode::Off {
+        anyhow::bail!(
+            "FLUIDBOX_KMS_PREVIOUS_STATIC_KEK is set but FLUIDBOX_KMS_MODE=off — a KEK rotation \
+             re-wraps DEKs onto the CONFIGURED KEK, so set FLUIDBOX_KMS_MODE (static or aws) and \
+             the new KEK, or remove FLUIDBOX_KMS_PREVIOUS_STATIC_KEK"
+        );
+    }
+    StaticKek::from_key_string(raw)
+        .map(Some)
+        .context("FLUIDBOX_KMS_PREVIOUS_STATIC_KEK is not a valid 32-byte key (hex/base64)")
+}
+
+/// Run a KEK rotation at boot and leave an audit record of it.
+async fn rotate_kek(
+    pool: &PgPool,
+    previous: &StaticKek,
+    current: &dyn KeyWrapper,
+) -> anyhow::Result<()> {
+    let report = crate::kek_rotation::rewrap_previous_kek(pool, previous, current)
+        .await
+        .context("KEK rotation failed — refusing to serve")?;
+    let detail = serde_json::json!({
+        "previous_kek_id": previous.kek_id(),
+        "current_kek_id": current.kek_id(),
+        "rewrapped": report.rewrapped,
+        "already_current": report.already_current,
+    });
+    // `tenant_id: None` takes the audited worker path, the same as the re-seal
+    // job's deployment-level rows. A failed audit insert does not undo a rotation
+    // that already committed, so it warns rather than refusing boot.
+    if let Err(e) = fluidbox_db::identity::insert_audit_standalone(
+        pool,
+        fluidbox_db::identity::AuditEntry {
+            tenant_id: None,
+            actor_kind: "system",
+            actor_id: None,
+            source_ip: None,
+            request_id: None,
+            action: "kms.kek_rotated",
+            target: None,
+            success: true,
+            detail: Some(&detail),
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %e,
+            error_kind = fluidbox_obs::field::error_kind::DB,
+            "KEK rotation audit insert failed (the rotation itself completed)"
+        );
+    }
+    tracing::warn!(
+        previous_kek_id = %previous.kek_id(),
+        current_kek_id = %current.kek_id(),
+        rewrapped = report.rewrapped,
+        already_current = report.already_current,
+        "KEK rotation complete: every DEK is wrapped under the configured KEK. Remove \
+         FLUIDBOX_KMS_PREVIOUS_STATIC_KEK and destroy the previous key"
+    );
     Ok(())
 }
 
@@ -1087,5 +1162,54 @@ mod tests {
             SealFamily::LoginPkceVerifier.to_string(),
             "login_flows.pkce_verifier_sealed"
         );
+    }
+
+    // ─── FLUIDBOX_KMS_PREVIOUS_STATIC_KEK (KEK rotation) ────────────────────
+
+    #[test]
+    fn previous_kek_is_absent_unless_configured() {
+        assert!(previous_static_kek(KmsMode::Static, None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn previous_kek_parses_in_either_kms_mode() {
+        let raw = "ab".repeat(32);
+        for mode in [KmsMode::Static, KmsMode::Aws] {
+            let k = previous_static_kek(mode, Some(&raw)).unwrap().unwrap();
+            assert_eq!(
+                k.kek_id(),
+                StaticKek::from_key_string(&raw).unwrap().kek_id()
+            );
+        }
+    }
+
+    #[test]
+    fn previous_kek_with_kms_off_refuses_naming_both_variables() {
+        // A rotation needs the NEW KEK configured. Booting with only the old one
+        // set would silently skip the rotation and leave every DEK under the
+        // retired key.
+        // `.err()`, not `.unwrap_err()`: the latter needs `StaticKek: Debug`, and
+        // a key-holding type deliberately has no Debug impl to leak through.
+        let err = previous_static_kek(KmsMode::Off, Some(&"ab".repeat(32)))
+            .err()
+            .expect("KMS off must refuse")
+            .to_string();
+        assert!(err.contains("FLUIDBOX_KMS_PREVIOUS_STATIC_KEK"), "{err}");
+        assert!(err.contains("FLUIDBOX_KMS_MODE"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_previous_kek_refuses_naming_its_own_variable() {
+        // decode_32's own message names FLUIDBOX_KMS_STATIC_KEK; an operator
+        // must be told which of the two variables is wrong.
+        let err = format!(
+            "{:#}",
+            previous_static_kek(KmsMode::Static, Some("not-a-key"))
+                .err()
+                .expect("a malformed key must refuse")
+        );
+        assert!(err.contains("FLUIDBOX_KMS_PREVIOUS_STATIC_KEK"), "{err}");
     }
 }

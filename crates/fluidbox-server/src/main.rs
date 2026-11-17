@@ -19,6 +19,7 @@ mod github_app;
 mod governor;
 mod harness;
 mod internal;
+mod kek_rotation;
 mod kms;
 mod ledger;
 mod llm_keys;
