@@ -275,6 +275,8 @@ pub async fn sweep_orphaned_upstream_sessions(
 mod tests {
     use super::*;
     use fluidbox_core::state::SessionStatus;
+    // The crate-wide guard every global-scan test shares (see `test_support`).
+    use crate::test_support::GLOBAL_SCAN;
 
     /// Every `SessionStatus` variant. The wildcard-free `match` is the point: a new
     /// variant fails to COMPILE here, which is what forces whoever adds it to decide
@@ -484,6 +486,21 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
+    }
+
+    /// The ONE call site of the global upstream-session sweep in this crate's
+    /// tests (`test_support::tenant_less_scans_go_through_the_scoped_helpers`
+    /// enforces it). Call it while holding [`GLOBAL_SCAN`], taken BEFORE your run
+    /// became sweep-eligible: without the guard a sibling test's sweep retires your
+    /// rows in the window between `make_terminal` and your own pass.
+    async fn sweep_upstream(
+        pool: &PgPool,
+        cutoff: DateTime<Utc>,
+        limit: i64,
+    ) -> Vec<SweptUpstreamSession> {
+        sweep_orphaned_upstream_sessions(pool, cutoff, limit)
+            .await
+            .unwrap()
     }
 
     async fn make_terminal(pool: &PgPool, scope: TenantScope, run: Uuid, finished_secs_ago: i64) {
@@ -860,17 +877,18 @@ mod tests {
             .await
             .unwrap();
         }
+        // Held from before any of this test's runs is sweep-eligible until the
+        // assertions are done, so no sibling sweep can retire them first.
+        let scan = GLOBAL_SCAN.lock().await;
         age_session(&pool, scope, long_run, "running", 3600).await;
         age_session(&pool, scope, winddown_run, "finalizing", 3600).await;
         make_terminal(&pool, scope, fresh_run, 0).await;
         make_terminal(&pool, scope, stale_run, 3600).await;
 
         // A tenant-LESS global scan in a shared DB: assert on OUR OWN rows only,
-        // never on the returned batch (a concurrent test's rows ride in it).
+        // never on the returned batch (a leftover row from elsewhere may ride in it).
         let cutoff = Utc::now() - chrono::Duration::seconds(900);
-        sweep_orphaned_upstream_sessions(&pool, cutoff, 200)
-            .await
-            .unwrap();
+        sweep_upstream(&pool, cutoff, 200).await;
 
         assert_eq!(
             live_upstream_sessions(&pool, scope, long_run)
@@ -911,6 +929,7 @@ mod tests {
             Some(OUTCOME_SWEPT),
             "a swept row is labelled as such — it did NOT get an upstream DELETE"
         );
+        drop(scan);
         cleanup(&pool, scope).await;
     }
 
@@ -938,41 +957,43 @@ mod tests {
             .await
             .unwrap();
         }
+        // Held from before the run is sweep-eligible: the only other sweeper test
+        // used to retire these rows between `make_terminal` and the `limit 1`
+        // pass below, which is how CI saw `left: 0`.
+        let scan = GLOBAL_SCAN.lock().await;
         make_terminal(&pool, scope, run, 3600).await;
         let cutoff = Utc::now() - chrono::Duration::seconds(900);
 
         // limit=1 ⇒ at most one row per pass, so a backlog drains over ticks
-        // instead of one pass outrunning its own period.
-        sweep_orphaned_upstream_sessions(&pool, cutoff, 1)
-            .await
-            .unwrap();
+        // instead of one pass outrunning its own period. Inside the guard nothing
+        // else sweeps, so the pass retires exactly one row.
+        let pass = sweep_upstream(&pool, cutoff, 1).await;
+        assert_eq!(pass.len(), 1, "the batch limit must bound one pass");
+        let mine = pass.iter().filter(|r| r.session_id == run).count();
         assert_eq!(
             live_upstream_sessions(&pool, scope, run)
                 .await
                 .unwrap()
                 .len(),
-            2,
-            "the batch limit must bound one pass"
+            3 - mine,
+            "this run lost exactly the rows the pass reported"
         );
         // Drain, then prove an already-retired row is not picked up again (the
         // `deleted_at is null` predicate is what keeps the scan's working set the
         // LIVE set rather than all history).
         for _ in 0..4 {
-            sweep_orphaned_upstream_sessions(&pool, cutoff, 200)
-                .await
-                .unwrap();
+            sweep_upstream(&pool, cutoff, 200).await;
         }
         assert!(live_upstream_sessions(&pool, scope, run)
             .await
             .unwrap()
             .is_empty());
-        let again = sweep_orphaned_upstream_sessions(&pool, cutoff, 200)
-            .await
-            .unwrap();
+        let again = sweep_upstream(&pool, cutoff, 200).await;
         assert!(
             !again.iter().any(|r| r.session_id == run),
             "a retired row must never be swept twice"
         );
+        drop(scan);
         cleanup(&pool, scope).await;
     }
 }

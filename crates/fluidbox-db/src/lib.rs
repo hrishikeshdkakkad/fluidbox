@@ -12,6 +12,8 @@ pub mod seed;
 pub mod system_worker;
 
 mod event_log;
+#[cfg(test)]
+mod test_support;
 
 mod agents;
 mod approvals;
@@ -116,7 +118,8 @@ mod tests {
     // inside one — which is exactly the condition under which a global scan can
     // be reasoned about locally. `tenant_less_scans_go_through_the_scoped_helpers`
     // below keeps it that way.
-    static GLOBAL_SCAN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // The guard itself lives in `test_support` so tests in every module share it.
+    use crate::test_support::GLOBAL_SCAN;
 
     /// This session's slice of a global expired-reservation sweep. The sweep and
     /// its `Utc::now()` cutoff are the real ones — only the ROWS are narrowed, so
@@ -174,41 +177,7 @@ mod tests {
             .collect()
     }
 
-    /// Source guard for the #33 class, in the shape of the #32 one above: a scan
-    /// with no tenant predicate must never be called bare from a test, because a
-    /// bare call asserts about every OTHER test's rows and races them for their
-    /// own. This is a source assertion, not a DB test — it runs without
-    /// `DATABASE_URL`, so a re-added bare caller fails immediately instead of
-    /// flaking one CI run in eight. Each needle is assembled from two halves so
-    /// the guard is not itself an occurrence.
-    #[test]
-    fn tenant_less_scans_go_through_the_scoped_helpers() {
-        let src = include_str!("lib.rs");
-        for (needle, helper) in [
-            (
-                concat!("sweep_expired_llm", "_reservations("),
-                "sweep_reservations",
-            ),
-            (
-                concat!("sweep_stale_execution", "_claims("),
-                "sweep_stale_claims",
-            ),
-            (concat!("claim_due", "_deliveries("), "claim_deliveries"),
-            (
-                concat!("expired_pending", "_approvals("),
-                "the single containment-only caller",
-            ),
-        ] {
-            let n = src.matches(needle).count();
-            assert_eq!(
-                n, 1,
-                "`{needle}` must appear exactly ONCE in fluidbox-db — inside {helper} — \
-                 found {n}. Route the new call through that helper and hold GLOBAL_SCAN \
-                 from the moment your rows become scannable: a bare call counts every \
-                 other test's rows into your batch and converts/claims them out of theirs."
-            );
-        }
-    }
+    // The #33 source guard lives in `test_support`, where it reads every module.
 
     /// The durable-finalizer DB contract (PR #47 fix batch 2 — H3/H5):
     /// single-winner intent under the session row lock, quiesce computed from
