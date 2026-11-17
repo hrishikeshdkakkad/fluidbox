@@ -410,6 +410,18 @@ jobs:
         with:
           command: check
 
+  # Terraform plan/state guard. Three production plan files were committed
+  # under names the old ignore rule did not match, and each carried a full
+  # state snapshot with every generated secret in plaintext. This refuses any
+  # tracked plan or state by name OR by content (a zip with a tfstate member),
+  # so `git add -f` and a renamed `-out=` file are caught too. Seconds, no
+  # network.
+  no-terraform-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash scripts/check-no-terraform-artifacts.sh
+
   # Version drift guard. Every in-repo version field sat at 0.1.0 through TWO
   # releases because release.yml derived the published version from the git
   # tag — the artifacts were right, so nothing ever failed. This is the

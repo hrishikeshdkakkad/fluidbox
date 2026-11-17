@@ -180,9 +180,13 @@ docs-build:
 docs-sync:
     cd apps/web && node scripts/sync-developer-docs.mjs
 
-check: fmt lint test version-check
+check: no-terraform-artifacts fmt lint test version-check
     cd apps/web && pnpm test
     cd apps/web && pnpm build
+
+# Refuse any tracked Terraform plan/state (they carry plaintext secrets).
+no-terraform-artifacts:
+    bash scripts/check-no-terraform-artifacts.sh
 
 # ── E2E acceptance ───────────────────────────────────────────────────────
 
