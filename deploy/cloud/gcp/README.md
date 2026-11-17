@@ -14,7 +14,7 @@ Day-two procedures: [`docs/hosted/gcp-operations.md`](../../../docs/hosted/gcp-o
 |---|-------|----------|--------------|
 | 0 | `bootstrap` | project **Owner**, once | API enablement, the remote-state bucket, the Workload Identity Federation pool, the two CI service accounts, the billing budget |
 | 1 | `platform` | `fbx-deployer` | VPC + Cloud NAT, GKE (zonal, legacy datapath — see `cilium_mode`), node pools, Cloud SQL, Artifact Registry, Cloud KMS, Secret Manager, the archive bucket, observability |
-| 2 | `app` | `fbx-deployer` | self-managed Cilium (`cilium_mode = upstream`), PriorityClasses, the External Secrets operator, the release namespace |
+| 2 | `app` | `fbx-deployer` | self-managed Cilium (`cilium_mode = upstream`), PriorityClasses, the External Secrets operator, the release namespace. **The deploy pipeline plans and applies it on every deploy**, so a re-created cluster gets these back before the chart installs |
 | 3 | the chart | `fbx-deployer` | `helm upgrade --install` — **not** Terraform (see below) |
 
 `bootstrap` is the only stack that runs as Owner, because enabling an API grants
@@ -111,7 +111,9 @@ scripts/cloud/gcp-secrets.sh --prompt                  # or paste, with hidden i
 #    refused unless you pass --rotate - a dotenv can carry a different key than
 #    the one production runs on.
 
-# 3. Cluster prerequisites.
+# 3. Cluster prerequisites. The pipeline's `app` job does this on every deploy
+#    (a rebuilt cluster with no Cilium cannot install the chart); run it by hand
+#    only for a first install or to inspect a plan.
 cd ../app
 terraform init \
   -backend-config="bucket=fluidbox-506603-tfstate" -backend-config="prefix=app"

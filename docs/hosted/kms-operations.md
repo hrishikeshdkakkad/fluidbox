@@ -102,19 +102,20 @@ open what is stored (v1 needs the legacy key, v2 needs KMS). They cannot see
 a re-generated `FLUIDBOX_KMS_STATIC_KEK`, a different AWS key ARN, a restored
 environment pointed at the wrong secret — used to boot happily and produce
 **split-key custody**: every existing tenant silently failed to unwrap, while
-every new tenant minted a DEK under the wrong KEK. There is no recovery from that
-state and no re-wrap tooling. Boot now refuses instead:
+every new tenant minted a DEK under the wrong KEK. A split database cannot be
+repaired by guessing at keys, so boot refuses instead:
 
 | `tenant_deks` state | Boot behavior |
 |---|---|
 | **zero DEK rows** | OK — nothing to prove; the configured KEK wraps the first DEK. |
 | **one distinct `kek_id`, matching + unwrappable** | OK — logged as `KEK compatibility probe passed`. |
-| **one distinct `kek_id`, not the configured one** | **REFUSES** — *"stored per-tenant DEKs were wrapped by a DIFFERENT KEK… Restore the original KEK."* |
+| **one distinct `kek_id`, not the configured one** | **REFUSES** — *"stored per-tenant DEKs were wrapped by a DIFFERENT KEK… Restore the original KEK, or ROTATE…"* To move onto the configured KEK on purpose, see §4. |
 | **id matches but the unwrap FAILS** | **REFUSES** — the probe is a real `Decrypt`, so a missing IAM grant, a disabled/deleted key, or a format change is caught here, not on the first user request. |
-| **two or more distinct `kek_id`s** | **REFUSES** — fluidbox has no multi-KEK routing or re-wrap tooling, so serving would read some tenants and orphan others. Restore a single KEK. |
+| **two or more distinct `kek_id`s** | **REFUSES** — there is no multi-KEK *routing*, so serving would read some tenants and orphan others. If a §4 rotation was interrupted, boot again with `FLUIDBOX_KMS_PREVIOUS_STATIC_KEK` set to finish it. |
 
-The remedy is always to restore the KEK the data was written under — never to
-"clear `tenant_deks` and let it re-mint" (that orphans every v2 blob). The probe
+The remedy is to restore the KEK the data was written under, or to rotate off it
+deliberately (§4) — never to "clear `tenant_deks` and let it re-mint" (that
+orphans every v2 blob). The probe
 reads `tenant_deks` through the audited `system_worker` lens on purpose: without
 that GUC, `FORCE` RLS would return zero rows and the gate would read "no DEKs
 stored" and **fail open**.
@@ -160,24 +161,52 @@ LLM facade and git fetch).
 
 ## 4. KEK rotation
 
-v1 code mints exactly **one active DEK version** per tenant (`DEK_VERSION = 1`);
-`tenant_deks` already carries `(tenant, version)` + `kek_id` + `retired_at` so a
-future multi-version rotation can route, but the automated re-wrap is not built
-yet. Be honest about what rotation means today:
+Rotating a KEK never touches a sealed credential. Blobs are sealed under
+per-tenant DEKs; the KEK only wraps those DEKs in `tenant_deks`. A rotation
+unwraps each row under the OLD KEK and re-wraps the SAME DEK under the NEW one.
 
-- **`aws` + AWS-managed key rotation (recommended):** enable automatic rotation on
-  the KMS key. AWS rotates the key's backing material transparently and retains old
-  material for decrypt, so existing `wrapped_dek` blobs keep unwrapping and new
-  wraps use fresh material. `kek_id` (the key ARN) is unchanged — **no fluidbox
-  action, no re-wrap, no re-seal.**
-- **`static` KEK rotation:** changing `FLUIDBOX_KMS_STATIC_KEK` invalidates every
-  existing `wrapped_dek` (they were wrapped under the old KEK and fail to unwrap
-  under the new one). There is **no automated static-KEK re-wrap in v1** — treat
-  the static KEK as fixed per deployment (it exists for local/CI). Use `aws` for
-  any deployment that needs rotation.
-- **Manual DEK re-wrap under a new KEK** (decrypt-wrapped-DEK-under-old →
-  encrypt-under-new for every `tenant_deks` row) is **future work**. The schema
-  supports it; the runbook tooling does not exist yet.
+- **`aws` + AWS-managed key rotation:** enable automatic rotation on the KMS key.
+  AWS keeps old material for decrypt, so existing `wrapped_dek` blobs keep
+  unwrapping and `kek_id` (the key ARN) is unchanged — **no fluidbox action.**
+- **`static` KEK rotation** (and `static` → `aws`): boot with the NEW key as the
+  configured KEK and the OLD one in **`FLUIDBOX_KMS_PREVIOUS_STATIC_KEK`**.
+  Before the compatibility gate runs, boot re-wraps every DEK stored under the
+  old key (`crates/fluidbox-server/src/kek_rotation.rs`), then logs
+  **`KEK rotation complete`** and writes a `kms.kek_rotated` audit row with the
+  counts. Then remove the variable.
+
+What the rotation guarantees:
+
+| Situation | Behavior |
+|---|---|
+| a DEK under any THIRD KEK | refuses before unwrapping anything; nothing changes |
+| a row the old KEK cannot open | refuses; every new wrapping is proven for EVERY row before ANY is written, so nothing changes |
+| two replicas rotating at once | each write is a compare-and-swap on the exact wrapping read; they converge |
+| crash part-way | rows sit under the old or the new KEK; boot again with the variable still set to finish |
+| boot again after it finished | no-op (`rewrapped=0`) |
+| previous == configured, or KMS off | refuses boot, naming the variable |
+
+**Run it with the old binary/KEK stopped.** A replica still serving under the old
+KEK could mint a new tenant's DEK under it after the rotation passed; the next boot
+would then refuse on two KEKs (finish it by booting once more with the variable
+set). On Kubernetes, deploy the rotation with the server scaled to zero first, or
+accept that one extra boot.
+
+**GCP:** `scripts/cloud/gcp-rotate-credentials.sh --rotate kek --apply` copies the
+current KEK into `fluidbox-kms-previous-static-kek` and adds a new version of
+`fluidbox-kms-static-kek`. Run the deploy workflow by hand with
+`kek_rotation_previous_ref=fluidbox-kms-previous-static-kek` (it becomes
+`--set kekRotation.previousKekRemoteRef=…`; pushes never set it), confirm
+the log line and the audit row, then `--finish-kek --apply` destroys the copy and
+**disables** (does not destroy) the old KEK version, and the next deploy drops
+`kekRotation`. Destroy the old version by hand once you are sure.
+
+**What a rotation does NOT do:** the DEKs themselves are unchanged. Anyone holding
+the OLD KEK *and* a copy of `tenant_deks` from before the rotation (a database
+backup, a dump) can still unwrap those DEKs and open every blob sealed under them.
+If that combination may exist, also rotate the upstream credentials themselves
+(reconnect the connections, regenerate the GitHub App key), which is the only
+thing that makes the old blobs worthless.
 
 > Rotating the DEKs themselves (not the KEK) — minting DEK version 2 and re-sealing
 > custody under it — reuses the exact same machinery as the legacy→KMS re-seal

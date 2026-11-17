@@ -48,6 +48,10 @@ on:
         description: "Helm revision to roll back to. Set this to run a rollback INSTEAD of a deploy."
         type: string
         default: ""
+      kek_rotation_previous_ref:
+        description: "KEK rotation ONLY: the Secret Manager id of the PREVIOUS KEK (fluidbox-kms-previous-static-kek). Boot re-wraps every DEK onto the current KEK. Leave empty otherwise - pushes never set it."
+        type: string
+        default: ""
 
 # One production deploy at a time, and NEVER cancel one in flight: a terraform
 # apply or a helm upgrade killed halfway leaves state that is harder to reason
@@ -266,6 +270,99 @@ jobs:
       - name: apply the REVIEWED plan
         run: terraform -chdir=deploy/cloud/gcp/platform apply -auto-approve tfplan
 
+  # ── Cluster prerequisites: the `app` stack ─────────────────────────────────
+  #
+  # Self-managed Cilium, the PriorityClasses, External Secrets and the release
+  # namespace. The chart cannot install without them: no Cilium means no
+  # cilium.io CRDs (the chart's CiliumClusterwideNetworkPolicy fails to map) and
+  # nodes that keep the not-ready taint forever, so nothing schedules.
+  #
+  # This stack used to be applied BY HAND only. When the platform stack re-created
+  # the cluster, nothing put these back: the next deploy failed at `helm upgrade`
+  # and the control plane stayed down. Planning it on every deploy makes a rebuilt
+  # cluster heal on its next run. A plan is idempotent, and "No changes" is the
+  # normal answer.
+  #
+  # Pushes and manual deploys only. A pull request would plan as the read-only
+  # identity, which cannot read the cluster this stack's providers connect to.
+  app:
+    needs: [changes, apply]
+    if: |
+      always() && github.event_name != 'pull_request' && inputs.rollback_to == ''
+      && (needs.apply.result == 'success' || needs.apply.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.5
+          # The wrapper adds lines to captured stdout, which would corrupt the
+          # `terraform output -raw` values this job passes to the plan.
+          terraform_wrapper: false
+      - name: platform outputs (this stack's inputs)
+        id: platform
+        run: |
+          set -euo pipefail
+          terraform -chdir=deploy/cloud/gcp/platform init \
+            -backend-config="bucket=${{ vars.GCP_TF_STATE_BUCKET }}" \
+            -backend-config="prefix=platform"
+          # Fed from the platform state, never retyped: a taint key that drifts
+          # from the node pools' leaves every new node tainted NoExecute forever.
+          esa="$(terraform -chdir=deploy/cloud/gcp/platform output -raw external_secrets_service_account)"
+          taint="$(terraform -chdir=deploy/cloud/gcp/platform output -raw cilium_agent_not_ready_taint_key)"
+          [ -n "$esa" ] && [ -n "$taint" ] || { echo "::error::platform outputs are empty"; exit 1; }
+          echo "external_secrets_sa=$esa" >> "$GITHUB_OUTPUT"
+          echo "taint_key=$taint" >> "$GITHUB_OUTPUT"
+      - name: init
+        run: |
+          terraform -chdir=deploy/cloud/gcp/app init \
+            -backend-config="bucket=${{ vars.GCP_TF_STATE_BUCKET }}" \
+            -backend-config="prefix=app"
+      - name: plan
+        run: |
+          terraform -chdir=deploy/cloud/gcp/app plan -out=tfplan \
+            -var "external_secrets_sa=${{ steps.platform.outputs.external_secrets_sa }}" \
+            -var "cilium_agent_not_ready_taint_key=${{ steps.platform.outputs.taint_key }}"
+      - name: inspect plan for destructive actions
+        id: inspect
+        run: |
+          set -euo pipefail
+          terraform -chdir=deploy/cloud/gcp/app show -json tfplan > app-plan.json
+          DESTRUCTIVE=$(jq '[.resource_changes[]?
+            | select(.change.actions | index("delete"))] | length' app-plan.json)
+          CHANGES=$(jq '[.resource_changes[]?
+            | select(.change.actions != ["no-op"])] | length' app-plan.json)
+          echo "destructive=$DESTRUCTIVE" >> "$GITHUB_OUTPUT"
+          echo "changes=$CHANGES" >> "$GITHUB_OUTPUT"
+          echo "app plan: $CHANGES resource change(s), $DESTRUCTIVE destructive"
+          jq -r '.resource_changes[]? | select(.change.actions != ["no-op"])
+            | "  \(.change.actions|join("+"))  \(.address)"' app-plan.json
+          {
+            echo "### Terraform plan (app stack)"
+            echo '```'
+            terraform -chdir=deploy/cloud/gcp/app show -no-color tfplan | tail -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: refuse an unreviewed destructive plan
+        # A delete here can mean UNINSTALLING THE CNI (helm_release.cilium) from a
+        # running cluster - e.g. if cilium_mode stopped matching the deployment.
+        if: steps.inspect.outputs.destructive != '0' && inputs.allow_destroy != true
+        run: |
+          echo "The app-stack plan destroys or replaces ${{ steps.inspect.outputs.destructive }} resource(s)."
+          echo "A delete of helm_release.cilium uninstalls the cluster's CNI."
+          echo "Review the plan above, then re-run manually with allow_destroy=true."
+          exit 1
+      - name: apply the reviewed plan
+        # The plan file from the step above, in the same job: what is applied is
+        # exactly what was inspected.
+        if: steps.inspect.outputs.changes != '0'
+        run: terraform -chdir=deploy/cloud/gcp/app apply -auto-approve tfplan
+
   # ── Images: built per commit, deployed by DIGEST ──────────────────────────
   images:
     needs: [changes, verify]
@@ -358,14 +455,17 @@ jobs:
 
   # ── Helm release ─────────────────────────────────────────────────────────
   deploy:
-    needs: [changes, images, apply]
+    needs: [changes, images, apply, app]
     # `always()` + explicit result checks: `apply` is SKIPPED when no
     # infrastructure changed, and a skipped need would otherwise skip this job
-    # too - so an application-only commit would never deploy.
+    # too - so an application-only commit would never deploy. `app` must have
+    # SUCCEEDED: installing the chart onto a cluster without its prerequisites is
+    # exactly the failure that job exists to prevent.
     if: |
       always() && github.event_name != 'pull_request' && inputs.rollback_to == ''
       && needs.images.result == 'success'
       && (needs.apply.result == 'success' || needs.apply.result == 'skipped')
+      && needs.app.result == 'success'
     runs-on: ubuntu-latest
     environment: Production
     outputs:
@@ -402,6 +502,12 @@ jobs:
             --set images.server.digest="${{ needs.images.outputs.server }}"
             --set images.collector="$AR/fluidbox-workspaced@${{ needs.images.outputs.workspaced }}"
           )
+          # A one-off KEK rotation deploy (docs/hosted/kms-operations.md section 4).
+          # A dispatch input, not a values change: the next push deploys without
+          # it, so the previous key cannot linger in the release by accident.
+          if [ -n "${{ inputs.kek_rotation_previous_ref }}" ]; then
+            ARGS+=(--set kekRotation.previousKekRemoteRef="${{ inputs.kek_rotation_previous_ref }}")
+          fi
           helm upgrade --install fluidbox deploy/helm/fluidbox \
             --namespace fluidbox \
             -f deploy/helm/fluidbox/values/gke.yaml \

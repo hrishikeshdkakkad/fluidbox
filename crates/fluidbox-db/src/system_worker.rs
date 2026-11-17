@@ -70,7 +70,8 @@
 //!     this crate (sealed bytes out, sealed bytes back in). [`dek_kek_census`] is
 //!     the same category for KEK custody: which KEK(s) wrapped the stored DEKs is
 //!     a deployment-wide question, and a GUC-less read of it would return zero
-//!     rows and make the boot gate FAIL OPEN.
+//!     rows and make the boot gate FAIL OPEN. So is KEK rotation's pair,
+//!     [`tenant_deks_for_rewrap`] + [`swap_tenant_dek_wrapping`] (wrapped bytes only).
 //!
 //! (d) **Nothing else.** A request handler that carries a principal MUST use the
 //!     scoped repositories (`get_session`, `get_connection`, … with a
@@ -1167,6 +1168,40 @@ pub async fn dek_kek_census(pool: &PgPool) -> sqlx::Result<Vec<DekKekSample>> {
     .await?;
     tx.commit().await?;
     Ok(out)
+}
+
+/// Every stored DEK row (all tenants, all versions) for a KEK rotation. A GUC-less
+/// read would see zero rows and report "nothing to rotate" — failing OPEN.
+pub async fn tenant_deks_for_rewrap(pool: &PgPool) -> sqlx::Result<Vec<crate::TenantDekRow>> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let rows = sqlx::query_as("select tenant_id, version, kek_id, wrapped_dek, created_at, retired_at from tenant_deks order by tenant_id, version")
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Swap `old`'s wrapping only while the row still holds exactly that `kek_id` and
+/// those bytes (`false` = it changed first), so concurrent rotations converge.
+pub async fn swap_tenant_dek_wrapping(
+    pool: &PgPool,
+    old: &crate::TenantDekRow,
+    new_kek_id: &str,
+    new_wrapped: &[u8],
+) -> sqlx::Result<bool> {
+    let mut tx = crate::worker_tx(pool).await?;
+    let swapped = sqlx::query("update tenant_deks set kek_id = $5, wrapped_dek = $6 where tenant_id = $1 and version = $2 and kek_id = $3 and wrapped_dek = $4")
+        .bind(old.tenant_id)
+        .bind(old.version)
+        .bind(&old.kek_id)
+        .bind(&old.wrapped_dek)
+        .bind(new_kek_id)
+        .bind(new_wrapped)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(swapped == 1)
 }
 
 // ─── Re-seal migration parity (Phase D, #32; category (d) above) ────────────

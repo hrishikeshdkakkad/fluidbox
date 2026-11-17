@@ -114,6 +114,13 @@ resource "google_sql_user" "fluidbox" {
   name     = "fluidbox"
   instance = google_sql_database_instance.fluidbox.name
   password = random_password.sql.result
+  # The INITIAL password only. Rotation is scripts/cloud/gcp-rotate-credentials.sh,
+  # which sets the user's password and the matching DATABASE_URL secret version
+  # together. Without this, the next pipeline apply would reset the user to the
+  # value in Terraform state - the very value a rotation is retiring.
+  lifecycle {
+    ignore_changes = [password]
+  }
 }
 
 # ── LiteLLM's own database ───────────────────────────────────────────────────
@@ -149,4 +156,11 @@ resource "google_sql_user" "litellm" {
   name     = "litellm"
   instance = google_sql_database_instance.fluidbox.name
   password = random_password.litellm_sql.result
+  # The INITIAL password only. Rotation is scripts/cloud/gcp-rotate-credentials.sh,
+  # which sets the user's password and the matching DATABASE_URL secret version
+  # together. Without this, the next pipeline apply would reset the user to the
+  # value in Terraform state - the very value a rotation is retiring.
+  lifecycle {
+    ignore_changes = [password]
+  }
 }

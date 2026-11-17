@@ -1958,6 +1958,7 @@ mod tests {
             credential_key: None,
             kms_mode: crate::config::KmsMode::Off,
             kms_static_kek: None,
+            kms_previous_static_kek: None,
             kms_aws_key_id: None,
             kms_aws_endpoint: None,
             github_api_url: String::new(),

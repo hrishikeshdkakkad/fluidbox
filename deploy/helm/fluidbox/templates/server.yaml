@@ -274,6 +274,13 @@
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.credentialKey | quote }} } }
             - name: LITELLM_MASTER_KEY
               valueFrom: { secretKeyRef: { name: {{ .Values.existingSecret | quote }}, key: {{ .Values.secretKeys.litellmMasterKey | quote }} } }
+            {{- if .Values.kekRotation.previousKekRemoteRef }}
+            # KEK rotation in progress: boot re-wraps every DEK from this key onto
+            # FLUIDBOX_KMS_STATIC_KEK. Not optional - a missing Secret must stop the
+            # pod with that cause, not boot into the split-key refusal.
+            - name: FLUIDBOX_KMS_PREVIOUS_STATIC_KEK
+              valueFrom: { secretKeyRef: { name: {{ printf "%s-kek-rotation" .Values.existingSecret | quote }}, key: FLUIDBOX_KMS_PREVIOUS_STATIC_KEK } }
+            {{- end }}
             {{- with .Values.server.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
