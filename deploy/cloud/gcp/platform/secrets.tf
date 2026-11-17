@@ -71,6 +71,11 @@ locals {
     # (an ExternalSecret entry pointing at a versionless secret fails the whole
     # sync). README step 2 adds the version; production.yaml then opts in.
     "openai-api-key" = "OpenAI key for the LiteLLM gateway (the codex harness). The control plane never holds it."
+    # Holds a version ONLY while a KEK rotation is in progress: the previous
+    # static KEK, read at boot through the chart's kekRotation value. Versions are
+    # added and destroyed by scripts/cloud/gcp-rotate-credentials.sh; Terraform
+    # owns the container, its CMEK and its single reader.
+    "fluidbox-kms-previous-static-kek" = "The PREVIOUS static KEK during a rotation only. Empty otherwise."
   }
 }
 
@@ -129,8 +134,9 @@ resource "google_secret_manager_secret_version" "generated" {
   lifecycle {
     prevent_destroy = true
     # Re-applying must NEVER mint a new sealing key. Rotation is a deliberate,
-    # documented procedure (docs/hosted/kms-operations.md), not a side effect
-    # of a plan that happened to see a different random value.
+    # documented procedure (docs/hosted/kms-operations.md, and
+    # scripts/cloud/gcp-rotate-credentials.sh which adds the NEW versions), not a
+    # side effect of a plan that happened to see a different random value.
     ignore_changes = [secret_data]
   }
 }

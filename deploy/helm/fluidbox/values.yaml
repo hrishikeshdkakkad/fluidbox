@@ -685,6 +685,21 @@ externalSecrets:
     # - secretKey: DATABASE_URL
     #   remoteRef: fluidbox-database-url
 
+# ── KEK rotation (set ONLY while rotating) ──────────────────────────────────
+#
+# The Secret Manager id holding the PREVIOUS static KEK. When set, the server
+# re-wraps every per-tenant DEK from that key onto the current
+# FLUIDBOX_KMS_STATIC_KEK at boot, then serves (FLUIDBOX_KMS_PREVIOUS_STATIC_KEK;
+# docs/hosted/kms-operations.md section 4). Unset it in the next deploy: once the
+# rotation is done the previous key is just leaked key material.
+#
+# With externalSecrets enabled it syncs through its OWN ExternalSecret into
+# "<existingSecret>-kek-rotation", so a missing remote secret fails only that
+# object. Without External Secrets, create that Secret (key
+# FLUIDBOX_KMS_PREVIOUS_STATIC_KEK) yourself.
+kekRotation:
+  previousKekRemoteRef: ""
+
 # ── Pre-upgrade migration gate ──────────────────────────────────────────────
 #
 # Runs the NEW server image with FLUIDBOX_MIGRATE_ONLY=1 as a Helm pre-upgrade

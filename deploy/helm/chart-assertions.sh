@@ -287,4 +287,23 @@ helm lint "$CHART" --set networkGrants.enabled=true \
   --set networkGrants.dnsClusterIP=10.24.15.53 >/dev/null \
   || fail "helm lint fails with networkGrants enabled (check netgrant.yaml document separators)"
 
+# KEK rotation: the PREVIOUS KEK reaches the server only while rotating, and from
+# its OWN ExternalSecret. Sharing the optional one would couple it to provider keys:
+# ESO fails a whole object on one unreadable remote key, so a missing previous-KEK
+# secret would also stop OPENAI_API_KEY from syncing.
+eso=(--set externalSecrets.enabled=true --set externalSecrets.projectID=p
+  --set 'externalSecrets.data[0].secretKey=DATABASE_URL'
+  --set 'externalSecrets.data[0].remoteRef=fluidbox-database-url')
+rot="$(render "${eso[@]}" --set kekRotation.previousKekRemoteRef=fluidbox-kms-previous-static-kek)"
+grep -qF 'name: FLUIDBOX_KMS_PREVIOUS_STATIC_KEK' <<<"$rot" \
+  || fail "kekRotation.previousKekRemoteRef must wire FLUIDBOX_KMS_PREVIOUS_STATIC_KEK into the server"
+grep -qF 'name: fluidbox-secrets-kek-rotation' <<<"$rot" \
+  || fail "the previous KEK must come from its own Secret (<existingSecret>-kek-rotation)"
+grep -qF 'key: "fluidbox-kms-previous-static-kek"' <<<"$rot" \
+  || fail "the kek-rotation ExternalSecret must read the configured remote secret"
+norot="$(render "${eso[@]}")"
+if grep -qF 'FLUIDBOX_KMS_PREVIOUS_STATIC_KEK' <<<"$norot"; then
+  fail "with kekRotation unset, no previous KEK may be rendered (it is leaked key material once the rotation is done)"
+fi
+
 echo "chart assertions: OK"
