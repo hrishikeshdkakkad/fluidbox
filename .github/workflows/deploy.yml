@@ -134,7 +134,7 @@ jobs:
           helm template fluidbox deploy/helm/fluidbox \
             -f deploy/helm/fluidbox/values/gke.yaml \
             -f deploy/cloud/gcp/values/production.yaml > /dev/null
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.14.5
       - name: terraform fmt + validate (all stacks)
@@ -175,7 +175,7 @@ jobs:
           # PRs plan as the READ-ONLY identity. This is the control that makes
           # "run terraform from a pull request" safe at all.
           service_account: ${{ github.event_name == 'pull_request' && vars.GCP_PLANNER_SA || vars.GCP_DEPLOYER_SA }}
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.14.5
       - name: init
@@ -251,7 +251,7 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOYER_SA }}
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.14.5
       - uses: actions/download-artifact@v8
